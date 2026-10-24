@@ -1,0 +1,70 @@
+{
+  "name": "dsh-get-it-for-free",
+  "version": "2.0.2",
+  "private": false,
+  "type": "module",
+  "description": "把华为云 CodeArts、腾讯 CodeBuddy / WorkBuddy、Qoder、TRAE、Raccoon、LobsterAI、MiniMax、ZCode 等免费/签到型账号渠道接入 DeepSeek Harness：账号登录、每日签到、模型池同步、本机用量看板。纯本地运行，无遥测、无自动更新。",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "adapter",
+    "src",
+    "vendor/channel-pack/pack.js",
+    "vendor/channel-pack/qoder-auth-wasm.wasm",
+    "vendor/channel-pack/NOTICE.md",
+    "vendor/channel-pack/LICENSE",
+    "locale",
+    "icon.svg",
+    "cordis.patch.yml",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "free-model",
+    "llm-provider",
+    "codearts",
+    "codebuddy",
+    "qoder",
+    "trae",
+    "raccoon"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-commands": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
+    "@deepseek-ai/dsh-credentials": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.4"
+  },
+  "author": "hulibuld",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hulibuld/dsh-get-it-for-free.git"
+  },
+  "homepage": "https://github.com/hulibuld/dsh-get-it-for-free#readme",
+  "bugs": {
+    "url": "https://github.com/hulibuld/dsh-get-it-for-free/issues"
+  }
+}

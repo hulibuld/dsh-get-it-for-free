@@ -1,0 +1,15 @@
+node_modules/
+*.tgz
+.DS_Store
+._*
+*.log
+
+# 由 DSH 上传流程补充
+Thumbs.db
+desktop.ini
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.local
+.env.*.local
