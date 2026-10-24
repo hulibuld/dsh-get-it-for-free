@@ -1024,6 +1024,8 @@ export function apply(ctx, config) {
    * instead of showing nothing.
    */
   let channelPack = { state: 'pending', error: '' }
+  /** 动态 import 进来的 channel-pack 模块——每日刷新模型目录时直接用它，比绕宿主 RPC 可靠。 */
+  let channelPackModule
   ctx.inject(['credentials', 'commands', 'llm'], scoped => {
     let stopped = false
     scoped.effect(() => () => { stopped = true }, 'get-it-for-free: channel pack')
@@ -1034,6 +1036,7 @@ export function apply(ctx, config) {
     // release manifest stays inside its file cap.
     void import('./vendor/channel-pack/pack.js').then(pack => {
       if (stopped) return
+      channelPackModule = pack
       pack.apply(scoped, {
         disableOpencode: true,
         outlet: { active: egressActive, fetch: egressFetch, fetchSigned: (input, init, send) => egressFetch(input, init, send) },
@@ -1516,6 +1519,86 @@ export function apply(ctx, config) {
       await refreshCatalog({ probe: true })
     })().catch(error => logger.warn?.(`get-it-for-free: periodic refresh failed (${error?.message ?? error})`))
   }, () => positiveOr(settings.get().probeIntervalMinutes, 15, 1) * 60_000)
+  // ── 每天 12:00 重新拉取各渠道的可用模型 ────────────────────────────────────
+  // 每个渠道适配器都把远端模型目录缓存进进程内存（`remoteModels`，一个进程只拉
+  // 一次），所以上游悄悄上了新模型（例如 Qoder 那边多出 Kimi K3 Pro）时，不重启
+  // 就永远看不到。这里每天本地时间 12:00 让 channel-pack 清掉缓存重拉一次。
+  //
+  // 「过了 12 点才开机」和「昨天中午没刷」都靠 settings.lastModelRefreshAt 判断：
+  // 只要上次成功刷新早于今天的 12:00，启动后就立刻补一次，不必等到明天。
+  const MODEL_REFRESH_HOUR = 12
+  const noonAt = at => {
+    const when = new Date(at)
+    when.setHours(MODEL_REFRESH_HOUR, 0, 0, 0)
+    return when.getTime()
+  }
+  let modelRefreshTimer
+  async function refreshChannelModels(reason) {
+    // 首选：直接调 pack 的刷新函数（清进程内缓存 + 广播目录变更 + 预拉一次目录）。
+    // 桌面端宿主侧没有稳定的 RPC 对端，直调是唯一不依赖 connection 的可靠路径。
+    const direct = channelPackModule?.refreshModelCatalog
+    if (typeof direct === 'function') {
+      try {
+        const refreshed = direct()
+        emitTopology()
+        settings.update({ lastModelRefreshAt: Date.now() })
+        logger.info?.(`get-it-for-free: 已刷新 ${refreshed.length} 个渠道的模型目录（${reason}）`)
+        // 清完缓存后立刻把目录拉一遍：适配器是懒加载的，不主动拉就只是「缓存空了」，
+        // 用户打开选择器那一刻才去请求，会看到空/旧列表。失败无所谓（适配器自己会兜底）。
+        for (const provider of refreshed) {
+          void Promise.resolve(ctx.llm?.listModels?.(provider)).catch(() => {})
+        }
+        return true
+      } catch (error) {
+        logger.warn?.(`get-it-for-free: 进程内刷新失败，改走 RPC（${error?.message ?? error}）`)
+      }
+    }
+    const call = optional('connection')?.rpc?.call
+    if (typeof call !== 'function') {
+      logger.warn?.(`get-it-for-free: 渠道模型刷新跳过（既没有 pack 句柄，也没有 connection.rpc：${reason}）`)
+      return false
+    }
+    try {
+      const reply = await call('/api', 'channel-pack', { method: 'model.refresh', payload: {} })
+      if (reply !== undefined && reply?.ok === false) {
+        throw new Error(reply?.error?.message ?? 'model.refresh rejected')
+      }
+      settings.update({ lastModelRefreshAt: Date.now() })
+      const providers = Array.isArray(reply?.value?.refreshed) ? reply.value.refreshed.length : 0
+      logger.info?.(`get-it-for-free: 已刷新 ${providers} 个渠道的模型目录（${reason}）`)
+      return true
+    } catch (error) {
+      logger.warn?.(`get-it-for-free: 渠道模型刷新失败（${reason}）：${error?.message ?? error}`)
+      return false
+    }
+  }
+  function armModelRefresh(delayMs) {
+    if (disposed) return
+    clearTimeout(modelRefreshTimer)
+    let delay = delayMs
+    if (delay === undefined) {
+      const now = Date.now()
+      const todayNoon = noonAt(now)
+      const last = Number(settings.get().lastModelRefreshAt ?? 0)
+      if (now >= todayNoon && last < todayNoon) {
+        delay = 1500 // 让宿主先把适配器挂完，再补这个「今天的」刷新
+      } else {
+        const target = now < todayNoon ? todayNoon : noonAt(now + 24 * 60 * 60_000)
+        delay = Math.max(1000, target - now)
+      }
+    }
+    modelRefreshTimer = setTimeout(() => {
+      if (disposed) return
+      const reason = delayMs === undefined ? '每日 12:00' : '补刷新'
+      void refreshChannelModels(reason).then(ok => {
+        // 失败 15 分钟后再试（网络抖动不至于要等到明天）；成功则对准下一个 12:00
+        armModelRefresh(ok ? undefined : 15 * 60_000)
+      })
+    }, delay)
+    modelRefreshTimer.unref?.()
+  }
+  armModelRefresh()
+  ctx.effect(() => () => clearTimeout(modelRefreshTimer), 'get-it-for-free: model refresh')
   // A failing egress watch means the network is down, which is worth one line —
   // and only the first of a streak, or a dead link would write every two minutes
   // until the next restart. A success resets the flag for the next outage.

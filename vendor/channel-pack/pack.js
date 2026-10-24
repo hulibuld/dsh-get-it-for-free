@@ -60990,6 +60990,43 @@ function registerChannelPackRpc(ctx, pool, codearts, buddy, workbuddy, lobsterai
     );
   });
 }
+/**
+ * 进程内的「provider → 适配器实例」注册表：`apply()` 组好 `modelAdapters` 后填进来。
+ *
+ * 存在的意义：本插件自己的宿主半身（`index.js`）每天 12:00 要强制各渠道重拉模型
+ * 目录，它手里有 pack 模块引用，直接调 `refreshModelCatalog()` 比绕一层宿主 RPC
+ * 更可靠（桌面端 `connection.rpc` 在宿主侧并不总有对端）。
+ */
+const MODEL_ADAPTERS_BY_PROVIDER = /* @__PURE__ */ new Map()
+/** 各适配器缓存远端目录的字段名（不同适配器用的字段不一致，凡存在都清）。 */
+const MODEL_CACHE_FIELDS = ["remoteModels", "remoteMeta", "remoteCatalog", "modelsDev"]
+/**
+ * 清掉各渠道的远端模型目录缓存，让下一次 `listModels` / `resolveModel` 重新拉取。
+ *
+ * 为什么需要：适配器的 `ensureRemoteModels()` 开头是「有值直接返回」，等于一个进程
+ * 只拉一次；上游新增模型（例如 Qoder 上线 Kimi K3 Pro）后，不重启就永远看不到。
+ * 清缓存是安全的——拉取失败会退回适配器自带的兜底表，且下一次会再试。
+ *
+ * @param {string} [provider] 只刷新某个渠道；省略则刷新全部。
+ * @returns {string[]} 实际清过缓存的 provider 列表。
+ */
+function refreshModelCatalog(provider) {
+  const targets = typeof provider === "string" && provider.length > 0 ? [provider] : [...MODEL_ADAPTERS_BY_PROVIDER.keys()];
+  const refreshed = [];
+  for (const id of targets) {
+    const adapter = MODEL_ADAPTERS_BY_PROVIDER.get(id);
+    if (adapter === void 0 || adapter === null) continue;
+    for (const field of MODEL_CACHE_FIELDS) {
+      try {
+        if (field in adapter) adapter[field] = void 0;
+      } catch (error) {
+        void error;
+      }
+    }
+    refreshed.push(id);
+  }
+  return refreshed;
+}
 function broadcastCatalogChanged(ctx) {
   try {
     ctx.emit("llm/adapters-updated");
@@ -62910,6 +62947,27 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
           disabledModels: pool.listDisabledModels(req.provider)
         };
         return { ok: true, value };
+      }
+      /**
+       * 强制重新拉取远端模型目录（每日 12:00 的自动刷新走这里）。
+       *
+       * 为什么需要：各适配器把远端目录缓存在 `remoteModels`，**每个进程只拉一次**
+       * （见各 `ensureRemoteModels()` 开头的 `if (this.remoteModels !== void 0) return`），
+       * 上游新增模型后不重启就永远看不到。这里把缓存清空，下一次 `listModels` /
+       * `resolveModel` 会重新拉取；随后广播一次目录变更，让打开着的选择器重建。
+       *
+       * 失败方向：清空后拉取失败会退回各适配器的本地兜底表（不会变成空目录），
+       * 且下次调用会再试，所以这个动作本身是安全的。
+       */
+      case "model.refresh": {
+        const req = payload ?? {};
+        if (req.provider !== void 0 && (typeof req.provider !== "string" || req.provider.length === 0)) {
+          return { ok: false, error: { code: "bad-request", message: "provider \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32\u6216\u7701\u7565" } };
+        }
+        const refreshed = refreshModelCatalog(req.provider);
+        broadcastCatalogChanged(ctx);
+        ctx.logger.info(`[channel-pack] \u5DF2\u6E05\u7A7A\u6A21\u578B\u76EE\u5F55\u7F13\u5B58\uFF1A${refreshed.join(", ") || "\u65E0"}`);
+        return { ok: true, value: { refreshed } };
       }
       /**
        * 读取多个供应商的汇总状态（Channel Pack 左侧导航分组 + 一键开关据此渲染）。
@@ -69397,6 +69455,9 @@ function apply(ctx, config = {}) {
     zcode: pruned(ZCODE.id, zcodeAdapter),
     ...opencodeAdapter === void 0 ? {} : { opencode: pruned(OPENCODE.id, opencodeAdapter) }
   };
+  // 登记给 refreshModelCatalog()：宿主半身（本插件的 index.js）每日 12:00 直接调它。
+  MODEL_ADAPTERS_BY_PROVIDER.clear();
+  for (const [providerId, adapter] of Object.entries(modelAdapters)) MODEL_ADAPTERS_BY_PROVIDER.set(providerId, adapter);
   ctx.effect(() => () => {
     void geminiSigStore.flush().catch(() => {
     });
@@ -69422,5 +69483,6 @@ export {
   makeReadImage,
   makeReadImageRequest,
   name,
-  parseWindowsProxy
+  parseWindowsProxy,
+  refreshModelCatalog
 };

@@ -167,6 +167,9 @@ export const SETTINGS_INITIAL = {
    *  只做「各公司账号池 → 模型」，不往选择器里塞免费模型。 */
   freeChannelsEnabled: false,
   hideAllModels: true,
+  /** 上次成功刷新「各渠道可用模型」的时间戳（毫秒）。每日 12:00 的刷新用它
+   *  判断今天是否已经刷过：上一次早于今天 12:00 就在启动后立刻补一次。 */
+  lastModelRefreshAt: 0,
   /** Minutes between background availability re-probes. */
   probeIntervalMinutes: 15,
   /** Serve the OpenAI-compatible forward listener for other local harnesses. */
