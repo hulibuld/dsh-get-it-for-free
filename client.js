@@ -1445,7 +1445,6 @@ window.__ModuleLoader__.load({
    动效约定：transform/opacity 优先；常规 150–300ms、覆盖层 300–400ms。
    ═══════════════════════════════════════════════════════════════════════ */
 .ofm_root{--ease-instrument:cubic-bezier(.16,1,.3,1);--ease-settle:cubic-bezier(.34,1.4,.4,1);--gap:14px;display:flex;flex-direction:column;gap:calc(var(--gap)*1.4);max-width:1080px;font-size:13px;line-height:1.55;color:var(--dsw-alias-label-primary);-webkit-font-smoothing:antialiased}
-.ofm_root::before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.022;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='180' height='180' filter='url(%23n)'/%3E%3C/svg%3E")}
 .ofm_root>*{position:relative;z-index:1}
 .ofm_root *{box-sizing:border-box}
 .ofm_root ::-webkit-scrollbar{width:10px;height:10px}
@@ -1470,8 +1469,7 @@ window.__ModuleLoader__.load({
 .ofm_pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;border:1px solid var(--dsw-alias-border-l1);background:color-mix(in srgb,var(--dsw-alias-bg-layer-2) 78%,transparent);box-shadow:inset 0 1px 0 rgb(255 255 255 / 4%);font-size:11.5px;color:var(--dsw-alias-label-secondary);white-space:nowrap;transition:border-color .16s ease,color .16s ease}
 .ofm_pill.strong{color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-border-l2)}
 .ofm_dot{width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-label-tertiary);flex:none}
-@keyframes ofm-dot-breathe{0%,100%{opacity:1}50%{opacity:.55}}
-.ofm_dot.ok{background:var(--dsw-alias-state-success-primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-state-success-primary) 18%,transparent);animation:ofm-dot-breathe 2.6s ease-in-out infinite}
+.ofm_dot.ok{background:var(--dsw-alias-state-success-primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-state-success-primary) 18%,transparent)}
 .ofm_dot.warn{background:var(--dsw-alias-state-warning-primary,#f0a441);box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-state-warning-primary,#f0a441) 18%,transparent)}
 .ofm_dot.err{background:var(--dsw-alias-state-error-primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-state-error-primary) 18%,transparent)}
 /* ══ 区块与分节 ════════════════════════════════════════════════════════ */
@@ -2534,6 +2532,22 @@ window.__ModuleLoader__.load({
 .ofm_root .ofm_dot.ok{background:#2ea043!important;box-shadow:0 0 0 3px rgb(46 160 67 / 18%)!important;opacity:1!important}
 .ofm_root .ofm_pill .ofm_dot.ok{background:#2ea043!important}
 .ofm_root .ofm_pill.ok{border-color:rgb(46 160 67 / 45%)!important;color:#2ea043!important}
+/* ══ 紧凑模式：行距、卡片内距压小，渐变/投影/悬浮位移压平 ══════ */
+.ofm_root{--gap:7px;gap:10px;line-height:1.45}
+.ofm_root .ofm_hero{padding:14px 16px;gap:8px;border-radius:12px;background:var(--dsw-alias-bg-layer-2)}
+.ofm_root .ofm_pagetitle h2{font-size:19px;letter-spacing:-.3px;background:none;-webkit-text-fill-color:currentColor;color:var(--dsw-alias-label-primary)}
+.ofm_root .ofm_panel{padding:12px;gap:8px;border-radius:10px;box-shadow:none}
+.ofm_root .ofm_card{padding:10px 11px;gap:6px;border-radius:10px;box-shadow:none;background:var(--dsw-alias-bg-layer-2)}
+.ofm_root .ofm_card:hover{transform:none;box-shadow:none}
+.ofm_root .ofm_chanwrap{gap:10px;grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}
+.ofm_root .ofm_chan{padding:12px 13px;gap:8px;border-radius:12px;box-shadow:none;background:var(--dsw-alias-bg-layer-2)}
+.ofm_root .ofm_chan:hover{transform:none;box-shadow:none}
+.ofm_root .ofm_pill{padding:2px 8px;font-size:11px;box-shadow:none}
+.ofm_root .ofm_dot.ok{box-shadow:none}
+.ofm_root .ofm_btn{padding:5px 11px;font-size:11.5px;box-shadow:none;background:var(--dsw-alias-bg-layer-3)}
+.ofm_root .ofm_btn:hover:not(:disabled){transform:none;box-shadow:none}
+.ofm_root .ofm_seg{padding:2px;box-shadow:none}
+.ofm_root .ofm_row{gap:6px}
 
 `
 
@@ -3213,8 +3227,6 @@ window.__ModuleLoader__.load({
       { id: 'lobsterai', name: 'LobsterAI', org: '有道', accent: '#FF6A00', note: '龙虾 · 每日签到积分', login: 'browser' },
       { id: 'qodercn', name: 'Qoder 中国版', org: '阿里系', accent: '#7A6CF0', note: '中国版端点与模型池', login: 'browser' },
       { id: 'trae', name: 'TRAE', org: '字节', accent: '#00BFA6', note: '手机号登录', login: 'browser' },
-      { id: 'cline', name: 'Cline', org: 'Cline', accent: '#5B5BD6', note: 'Cline 账号免费额度', login: 'browser' },
-      { id: 'loomy', name: 'Loomy', org: '讯飞', accent: '#2F6BFF', note: '微信扫码，或短信验证码备用', login: 'browser+sms' },
       { id: 'raccoon', name: 'Raccoon', org: '商汤', accent: '#00A6A6', note: '手机号登录', login: 'browser' },
       { id: 'minimax', name: 'MiniMax Code', org: 'MiniMax', accent: '#E4007F', note: '设备码 + PKCE，每日签到', login: 'browser' },
       { id: 'zcode', name: 'ZCode', org: '智谱', accent: '#3B6EF6', note: '浏览器登录（需本机可开浏览器）', login: 'browser' },

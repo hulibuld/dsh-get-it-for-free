@@ -18,7 +18,6 @@
 | LobsterAI | 浏览器授权 | — |
 | MiniMax | 浏览器授权 | — |
 | ZCode | 浏览器授权 | — |
-| Cline / Loomy / Gemini 等 | 视渠道而定 | 见设置页 |
 
 ## 功能
 
