@@ -2542,6 +2542,26 @@ window.__ModuleLoader__.load({
 .ofm_root .ofm_btn:hover:not(:disabled){transform:none;box-shadow:none}
 .ofm_root .ofm_seg{padding:2px;box-shadow:none}
 .ofm_root .ofm_row{gap:6px}
+/* ── 风险告知弹窗 ─────────────────────────────────────────────── */
+.ofm_risk{width:min(560px,94vw);max-height:88vh;border-radius:16px;border:1px solid #8a2020;background:#12100f;color:#e8e2dc;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 30px 90px rgb(0 0 0 / 62%)}
+.ofm_risk_head{padding:22px 24px 16px;text-align:center;border-bottom:1px solid #3a1c1c;background:#1a0f0f}
+.ofm_risk_head h2{margin:0;font-size:26px;line-height:1.25;font-weight:800;letter-spacing:.16em;color:#ff2f2f}
+.ofm_risk_sub{margin:8px 0 0;font-size:11.5px;letter-spacing:.24em;color:#9a7b7b}
+.ofm_risk_title{margin:0 0 4px;font-size:clamp(26px,4.2vw,40px);font-weight:900;letter-spacing:.16em;line-height:1.2;text-align:center;color:#f5f5f5;white-space:nowrap}
+.ofm_risk_body{padding:16px 24px;overflow:auto;font-size:12.5px;line-height:1.85;color:#cfc4bc}
+.ofm_risk_body p{margin:0 0 9px}
+.ofm_risk_body b{color:#ff6b5e}
+.ofm_risk_body ol{margin:0 0 10px;padding-left:18px}
+.ofm_risk_body li{margin-bottom:6px}
+.ofm_risk_warn{margin-top:12px;padding:10px 12px;border-radius:6px;border:1px solid #6b2020;background:#1c1111;color:#ff9b8f;font-size:12px}
+.ofm_risk_foot{position:relative;padding:20px 24px 30px;display:flex;flex-direction:column;align-items:center;gap:22px;border-top:1px solid #3a1c1c}
+.ofm_risk_delete{display:block;width:min(420px,100%);margin:0 auto;padding:20px 24px;border-radius:6px;border:2px solid #ff1f1f;background:#8b0000;color:#fff;font-size:19px;font-weight:900;line-height:1.35;letter-spacing:.12em;text-align:center;cursor:pointer;white-space:nowrap;text-shadow:0 1px 2px rgb(0 0 0 / 55%);box-shadow:0 0 0 1px rgb(255 31 31 / 45%),0 0 30px rgb(160 0 0 / 60%),0 12px 34px rgb(0 0 0 / 45%);animation:ofm-risk-pulse 1.8s ease-in-out infinite}
+.ofm_risk_delete:hover{background:#a30000;border-color:#ff4d4d}
+.ofm_risk_delete[disabled]{cursor:progress;opacity:.75;animation:none}
+@keyframes ofm-risk-pulse{0%,100%{box-shadow:0 0 0 1px rgb(255 31 31 / 40%),0 0 22px rgb(160 0 0 / 45%),0 10px 28px rgb(0 0 0 / 40%)}50%{box-shadow:0 0 0 2px rgb(255 31 31 / 62%),0 0 42px rgb(160 0 0 / 72%),0 14px 38px rgb(0 0 0 / 50%)}}
+.ofm_risk_ignore{align-self:flex-end;margin-top:-8px;padding:3px 6px;border:0;background:transparent;color:#3a3230;font-size:10.5px;line-height:1.4;cursor:pointer;opacity:.5;transition:opacity .2s ease,color .2s ease}
+.ofm_risk_ignore:hover{opacity:.85;color:#6b5a55}
+.ofm_risk_done{padding:10px 12px;border-radius:6px;border:1px solid #6b2020;background:#1c1111;color:#ffb3a8;font-size:12px;line-height:1.7;text-align:center}
 
 `
 
@@ -3909,6 +3929,105 @@ window.__ModuleLoader__.load({
           }, busy ? '…' : '刷新额度')))
     }
 
+
+    /**
+     * The CodeBuddy CLI lane's card.
+     *
+     * Same company, second route: instead of this plugin building HTTP requests
+     * that only pretend to be the vendor's IDE, it drives the official CLI the
+     * user already signed into. That traffic looks like any other CLI user's,
+     * which is why it lasts longer — at the cost of answering in one batch
+     * instead of streaming.
+     *
+     * Nothing here installs anything: when no CLI is found the card just says so
+     * and the route never appears in the model picker.
+     */
+    function CliLaneCard(props) {
+      const { t } = props
+      const [state, setState] = useState(undefined)
+      const [busy, setBusy] = useState(false)
+      const load = useCallback(async force => {
+        try { setState(await api(`/cli-lane/status${force ? '?refresh=1' : ''}`, { timeout: 25_000 })) }
+        catch (error) { setState({ installed: false, error: String(error?.message ?? error) }) }
+      }, [])
+      useEffect(() => { void load(false) }, [load])
+      const installed = state?.installed === true
+      const models = Array.isArray(state?.models) ? state.models.length : 0
+      const version = typeof state?.version === 'string' ? state.version : ''
+      return h('div', {
+        className: `ofm_chan ofm_glass${installed ? '' : ' off'}`,
+        'data-state': installed ? 'on' : 'off',
+      },
+        h('div', { className: 'ofm_chanhead' },
+          h('span', { className: 'ofm_chanid' },
+            h('b', null, 'CodeBuddy CLI'),
+            h('span', null, '腾讯 · 官方客户端通道')),
+          h('span', { className: 'ofm_chanstate' },
+            h('span', { className: `ofm_dot ${installed ? 'ok' : ''}` }),
+            state === undefined ? '…' : installed ? '已找到 CLI' : '未安装'))),
+        h('div', { className: 'ofm_chanmeta' },
+          h('span', null, `版本 `, h('b', null, state === undefined ? '…' : version === '' ? '—' : version)),
+          h('span', null, `${t('chan.meta.models')} `, h('b', null, state === undefined ? '…' : String(models)))),
+        typeof state?.error === 'string' && state.error !== ''
+          ? h('p', { className: 'ofm_note' }, `检测失败：${state.error}（刚升级完插件的话，需要重启 DSH 让后端接口生效）`)
+          : installed || state === undefined ? null : h('p', { className: 'ofm_note' },
+            '想在 DSH 里用官方客户端通道，先在终端里装好并登录 codebuddy（npm 包 @tencent-ai/codebuddy-code）。装好后这条通道会自己出现在模型选择器里，和现有渠道并存。'),
+        h('div', { className: 'ofm_chanacts' },
+          h('button', {
+            type: 'button', className: 'ofm_btn', disabled: busy,
+            'aria-busy': busy ? 'true' : undefined,
+            onClick: () => { setBusy(true); void load(true).finally(() => setBusy(false)) },
+          }, busy ? '…' : '重新检测'))
+    }
+
+
+    /**
+     * 首次使用前的风险告知。
+     *
+     * 这是一个必须显式越过的门：主按钮是「删除该插件并退出」，只有右下角
+     * 那个几乎看不见的次要按钮表示「我知道后果，继续用」。
+     *
+     * 文案写的是**必然发生**的后果，不是编造的恐吓：这些渠道用的是厂商给
+     * 自己客户端的免费额度，用第三方插件调用本来就不在授权范围内，封号、
+     * 限流、随时断供都是这条路的固有风险。把话说死，是为了让不接受的人
+     * 现在就退出——留在这里的人，至少是知情之后自己选的。
+     */
+    const RISK_LINES = [
+      '官方从不支持代理链接行为，随时可判定违规并永久封禁相关账号。软件内部余额、会员权益全部清空，不会保留。',
+      '同时也可能会对相关使用者进行进一步的追究（本插件完全开源，作者不负任何责任）。',
+      '若在使用本插件过程中相关损失实有发生，损失应由使用者全权承担。',
+    ]
+
+    function RiskNotice(props) {
+      const { onAccept } = props
+      const [busy, setBusy] = useState(false)
+      const remove = async () => {
+        if (busy) return
+        setBusy(true)
+        try {
+          await post('/uninstall', {})
+        } catch (error) {
+          setBusy(false)
+          void error
+          return
+        }
+      }
+      return h('div', { className: 'ofm_scrim' },
+        h('div', { className: 'ofm_risk', role: 'dialog', 'aria-modal': 'true', 'aria-label': '使用前必读' },
+          h('h2', { className: 'ofm_risk_title' }, '贪生怕死勿入斯门'),
+          h('div', { className: 'ofm_risk_body' },
+            RISK_LINES.map((line, i) => h('p', { key: i }, line))),
+          h('div', { className: 'ofm_risk_foot' },
+            h('button', {
+              type: 'button', className: 'ofm_risk_delete', disabled: busy,
+              onClick: remove,
+            }, busy ? '正在删除…' : '删除该插件并退出'),
+            h('button', {
+              type: 'button', className: 'ofm_risk_ignore',
+              onClick: onAccept,
+            }, '无视风险继续使用。'))))
+    }
+
     function ChannelsPage(props) {
       const { t, ctx, summary } = props
       const { available, rpc } = useChannelRpc(ctx)
@@ -4005,6 +4124,22 @@ window.__ModuleLoader__.load({
       const connected = statuses === undefined ? 0 : CHANNEL_PROVIDERS.filter(row => (statuses[row.id]?.accounts?.enabled ?? 0) > 0).length
       const failed = !ready && pack.state === 'failed'
 
+      // 风险告知：没接受过就先把整页挡住。接受后写进设置，之后不再打扰。
+      const [riskAccepted, setRiskAccepted] = useState(undefined)
+      useEffect(() => {
+        let alive = true
+        api('/summary').then(data => { if (alive) setRiskAccepted(data?.settings?.riskAccepted === true) })
+          .catch(() => { if (alive) setRiskAccepted(true) })  // 读不到就别拦人，界面本来就有错误提示
+        return () => { alive = false }
+      }, [])
+      const acceptRisk = useCallback(() => {
+        setRiskAccepted(true)
+        void post('/settings', { riskAccepted: true }).catch(() => {})
+      }, [])
+
+      if (riskAccepted === false) {
+        return h('div', { className: 'ofm_page' }, h(RiskNotice, { onAccept: acceptRisk }))
+      }
       return h('div', { className: 'ofm_page' },
         h('header', { className: 'ofm_hero ofm_glass' },
           h('div', { className: 'ofm_pagehead' },
@@ -4025,7 +4160,7 @@ window.__ModuleLoader__.load({
         !available ? h('div', { className: 'ofm_callout' }, h('div', null, t('chan.rpc.unavailable'))) : null,
         !ready && available ? h('div', { className: 'ofm_chanwrap' },
           [0, 1, 2].map(index => h('div', { className: 'ofm_skel', key: index, style: { minHeight: 168 } }))) : null,
-        ready ? h('div', { className: 'ofm_chanwrap' }, [h(MiMoCard, { key: 'mimo', t }), ...CHANNEL_PROVIDERS.map(channel => h(ChannelCard, {
+        ready ? h('div', { className: 'ofm_chanwrap' }, [h(MiMoCard, { key: 'mimo', t }), h(CliLaneCard, { key: 'cli-lane', t }), ...CHANNEL_PROVIDERS.map(channel => h(ChannelCard, {
           key: channel.id,
           channel,
           status: statuses?.[channel.id],

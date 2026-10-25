@@ -58,6 +58,8 @@ import { CAVEMAN_LEVELS, PONYTAIL_LEVELS } from './src/token-saver/prompts.js'
 import { OPTIMIZATIONS } from './src/local-optimize.js'
 import { createModelRuntime, createRuntimeStores } from './src/core/runtime.js'
 import { createMiMo, MIMO_PROVIDER } from './src/mimo/provider.js'
+import { createCliLane, CLI_ROUTE } from './src/cli-lane.js'
+import { uninstallPlugin, spawnDetachedRemoval } from './src/uninstall.js'
 
 export { fromOpenAiMessages } from './src/core/completion.js'
 import { buildStats } from './src/core/stats.js'
@@ -473,6 +475,22 @@ export function apply(ctx, config) {
     mimoBridge = { status: patch => mimo.status(patch ?? {}) }
   } catch (error) {
     logger.warn?.(`get-it-for-free: MiMo 通道未挂载（${error?.message ?? error}）`)
+  }
+
+  // ── CodeBuddy CLI 通道 ──────────────────────────────────────────────────────
+  // 同一家厂商的第二条路：不在插件里手搓 HTTP（那种流量迟早被当成滥用），
+  // 而是驱动用户自己装好、自己登录的官方 CLI。官方客户端发什么它就发什么。
+  // 没装 CLI 时这条路由一条模型都不投放，选择器里直接看不到，不影响现有渠道。
+  let cliLane = {
+    status: async () => ({ provider: CLI_ROUTE, installed: false, path: '', version: '', models: [] }),
+  }
+  try {
+    const lane = createCliLane({ logger })
+    ctx.llm.registerAdapter([CLI_ROUTE], lane.adapter)
+    ctx.effect(() => () => { lane.dispose() }, 'get-it-for-free: codebuddy cli lane')
+    cliLane = { status: patch => lane.status(patch ?? {}) }
+  } catch (error) {
+    logger.warn?.(`get-it-for-free: CodeBuddy CLI 通道未挂载（${error?.message ?? error}）`)
   }
 
   /**
@@ -1082,6 +1100,8 @@ export function apply(ctx, config) {
     picks,
     // MiMo 没有账号池，卡片只需要一个只读状态：是否已从桌面端拿到凭证 + 剩余额度。
     mimo: mimoBridge,
+    // CLI 通道的状态：是否装了官方 CLI、什么版本、能出哪些模型。
+    cliLane,
     // ── the aggregate lane's settings surface ────────────────────────────────
     // The registry is static data; the configured half is the settings file with
     // every key masked. Writing one provider rebuilds the catalog and re-emits
@@ -1784,6 +1804,21 @@ export function createApiRoutes(deps) {
       if (method === 'GET' && routePath === '/summary') {
         return send(200, buildSummary(deps))
       }
+      // 用户在风险告知页按了「删除该插件并退出」：把本插件从这台机器上摘掉。
+      // 先改清单（同步、可回滚），再回一个 200，然后交给一个 detach 的 shell
+      // 去删目录并退出 App——删自己的目录不能在请求处理中做，模块还在内存里。
+      if (method === 'POST' && routePath === '/uninstall') {
+        const result = uninstallPlugin({ packageDir: PKG_DIR })
+        if (result.ok !== true) return send(500, result)
+        setTimeout(() => {
+          try {
+            spawnDetachedRemoval({ packageDir: PKG_DIR }).catch(() => {})
+          } catch (error) {
+            logger.warn?.(`get-it-for-free: 卸载收尾失败 (${error?.message ?? error})`)
+          }
+        }, 900)
+        return send(200, { ok: true, removed: result.removed, dataKept: result.dataKept })
+      }
       // 宿主 RPC 的进程内桥：页面里的 connection.rpc 在桌面端挂起，但插件宿主
       // 自己的 ctx.connection 还能发同样的调用。按钮类动作统一从这里过。
       if (method === 'POST' && routePath === '/rpc') {
@@ -1806,6 +1841,15 @@ export function createApiRoutes(deps) {
         return send(200, buildStats(deps.stats.get(), deps.catalog()))
       }
       // ── MiMo（小米桌面端额度）────────────────────────────────────────────────
+      // ── CodeBuddy CLI 通道 ───────────────────────────────────────────────────
+      if (routePath === '/cli-lane/status') {
+        const force = url.searchParams.get('refresh') === '1'
+        try {
+          return send(200, await deps.cliLane.status({ force }))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
       if (routePath === '/mimo/status') {
         const force = url.searchParams.get('refresh') === '1'
         try {
@@ -1983,7 +2027,7 @@ export function createApiRoutes(deps) {
         const patch = await readJson(req)
         const visibility = validateModelVisibility(patch)
         const current = deps.settings.get()
-        const next = sanitizeSettings({ ...current, ...pick(patch, ['enabled', 'exposeRegionModels', 'probeIntervalMinutes', 'defaultMaxTokens', 'announcementAck', 'feedUrl', 'feedPollMinutes', 'notifyOs', 'updateCheckHours', 'autoReloadWatch']), ...visibility }, current)
+        const next = sanitizeSettings({ ...current, ...pick(patch, ['enabled', 'exposeRegionModels', 'probeIntervalMinutes', 'defaultMaxTokens', 'announcementAck', 'feedUrl', 'feedPollMinutes', 'notifyOs', 'updateCheckHours', 'autoReloadWatch', 'riskAccepted']), ...visibility }, current)
         if (patch.forward !== undefined) {
           const forward = { ...(current.forward ?? {}), ...pick(patch.forward, ['enabled', 'host', 'port']) }
           // The listener spends this machine's lane, and a routable bind address
@@ -2367,6 +2411,7 @@ function publicSettings(settings, forwardInfo, egressInfo) {
     probeIntervalMinutes: settings.probeIntervalMinutes ?? 15,
     defaultMaxTokens: settings.defaultMaxTokens ?? 32768,
     announcementAck: settings.announcementAck ?? '',
+    riskAccepted: settings.riskAccepted === true,
     feedUrl: typeof settings.feedUrl === 'string' ? settings.feedUrl : '',
     feedPollMinutes: settings.feedPollMinutes ?? 30,
     notifyOs: settings.notifyOs === true,

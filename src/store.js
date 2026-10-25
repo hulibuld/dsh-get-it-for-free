@@ -234,6 +234,8 @@ export const SETTINGS_INITIAL = {
   localOptimize: { enabled: true, quota: true, prefix: true, title: true, suggestion: true, filepath: true },
   /** Acknowledged announcement copy version. */
   announcementAck: '',
+  /** 风险告知是否已被用户明确接受（首次打开设置页时弹窗，同意了才记住）。 */
+  riskAccepted: false,
   /** Last full catalog refresh timestamp. */
   catalogSyncedAt: 0,
   /** Owner override for the announcement/update feed location. `{repo}` expands
