@@ -57,6 +57,7 @@ import { addSavings, describeSavingsTotal, emptySavings, saverConfig, savingsPer
 import { CAVEMAN_LEVELS, PONYTAIL_LEVELS } from './src/token-saver/prompts.js'
 import { OPTIMIZATIONS } from './src/local-optimize.js'
 import { createModelRuntime, createRuntimeStores } from './src/core/runtime.js'
+import { createMiMo, MIMO_PROVIDER } from './src/mimo/provider.js'
 
 export { fromOpenAiMessages } from './src/core/completion.js'
 import { buildStats } from './src/core/stats.js'
@@ -456,6 +457,23 @@ export function apply(ctx, config) {
   ctx.on?.('loader/volatile-update', () => {
     registration.replace(routes())
   })
+
+  // ── MiMo（小米桌面端额度）───────────────────────────────────────────────────
+  // 凭证来自小米 MiMo 桌面端已登录的 cookie（只读），所以这里不需要账号池：
+  // 有桌面端登录就出现 MiMo 分组，没有就一条模型都不投放。
+  // MiMo 是可选通道：任何装配异常都只让它自己缺席，绝不能把整个插件带下水
+  // （免费车道与各渠道适配器都在它之后挂载）。
+  let mimoBridge = {
+    status: async () => ({ signedIn: false, provider: MIMO_PROVIDER, reason: 'MiMo 通道未挂载' }),
+  }
+  try {
+    const mimo = createMiMo({ logger, onTopology: () => emitTopology() })
+    ctx.llm.registerAdapter([MIMO_PROVIDER], mimo.adapter)
+    ctx.effect(() => () => { mimo.dispose() }, 'get-it-for-free: mimo channel')
+    mimoBridge = { status: patch => mimo.status(patch ?? {}) }
+  } catch (error) {
+    logger.warn?.(`get-it-for-free: MiMo 通道未挂载（${error?.message ?? error}）`)
+  }
 
   /**
    * A freshly started outlet needs a moment before its nodes carry traffic: the
@@ -1062,6 +1080,8 @@ export function apply(ctx, config) {
     pool: fetchPoolSnapshot,
     eacAuth,
     picks,
+    // MiMo 没有账号池，卡片只需要一个只读状态：是否已从桌面端拿到凭证 + 剩余额度。
+    mimo: mimoBridge,
     // ── the aggregate lane's settings surface ────────────────────────────────
     // The registry is static data; the configured half is the settings file with
     // every key masked. Writing one provider rebuilds the catalog and re-emits
@@ -1784,6 +1804,15 @@ export function createApiRoutes(deps) {
       }
       if (method === 'GET' && routePath === '/stats') {
         return send(200, buildStats(deps.stats.get(), deps.catalog()))
+      }
+      // ── MiMo（小米桌面端额度）────────────────────────────────────────────────
+      if (routePath === '/mimo/status') {
+        const force = url.searchParams.get('refresh') === '1'
+        try {
+          return send(200, await deps.mimo.status({ force }))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
       }
       if (method === 'GET' && routePath === '/outlet') {
         return send(200, await deps.outletStatus())

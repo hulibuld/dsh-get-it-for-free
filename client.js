@@ -405,7 +405,6 @@ window.__ModuleLoader__.load({
         'chan.meta.accounts': '账号',
         'chan.meta.models': '模型',
         'chan.act.add': '添加账号',
-        'chan.zcode.provider': '登录渠道',
         'chan.zcode.bigmodel': 'bigmodel.cn',
         'chan.zcode.zai': 'z.ai 国际版',
         'chan.act.refresh': '续期',
@@ -1100,7 +1099,6 @@ window.__ModuleLoader__.load({
         'chan.meta.accounts': 'Accounts',
         'chan.meta.models': 'Models',
         'chan.act.add': 'Add account',
-        'chan.zcode.provider': 'Sign-in route',
         'chan.zcode.bigmodel': 'bigmodel.cn',
         'chan.zcode.zai': 'z.ai international',
         'chan.act.refresh': 'Refresh',
@@ -1518,10 +1516,6 @@ window.__ModuleLoader__.load({
 .ofm_scale{display:flex;align-items:center;gap:4px;font-size:10.5px;color:var(--dsw-alias-label-tertiary);margin-left:auto}
 .ofm_scale .ofm_cell{width:10px;height:10px}
 /* ══ 分段选择器 ════════════════════════════════════════════════════════ */
-.ofm_seg{display:inline-flex;padding:3px;border-radius:10px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);gap:2px;box-shadow:inset 0 1px 2px rgb(0 0 0 / 5%)}
-.ofm_seg button{border:0;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:11.5px;font-weight:550;padding:3px 11px;border-radius:8px;cursor:pointer;transition:color .16s ease,background .16s ease,box-shadow .16s ease}
-.ofm_seg button:hover{color:var(--dsw-alias-label-primary)}
-.ofm_seg button[aria-pressed="true"]{background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-primary);box-shadow:0 1px 3px rgb(0 0 0 / 12%),inset 0 1px 0 rgb(255 255 255 / 6%)}
 .ofm_svg{display:block;width:100%;height:auto;overflow:visible}
 /* ══ 筛选 chips ════════════════════════════════════════════════════════ */
 .ofm_chips{display:flex;gap:6px;flex-wrap:wrap}
@@ -3221,15 +3215,15 @@ window.__ModuleLoader__.load({
      * and logo tile; `login` picks the flow the card offers.
      */
     const CHANNEL_PROVIDERS = [
-      { id: 'codearts', name: 'CodeArts', org: '华为云', accent: '#C7000B', note: 'DeepSeek · GLM · openPangu，每日免费额度', login: 'browser' },
-      { id: 'buddy', name: 'WorkBuddy 国内版', org: '腾讯 · copilot.tencent.com', accent: '#0A7AFF', note: 'CodeBuddy 同一端点：DeepSeek · Kimi · GLM 免费线，每日积分', login: 'browser' },
-      { id: 'workbuddy', name: 'WorkBuddy 国际版', org: '腾讯 · workbuddy.ai', accent: '#0B63CE', note: '国际版端点：独立账号与积分体系', login: 'browser' },
-      { id: 'lobsterai', name: 'LobsterAI', org: '有道', accent: '#FF6A00', note: '龙虾 · 每日签到积分', login: 'browser' },
-      { id: 'qodercn', name: 'Qoder 中国版', org: '阿里系', accent: '#7A6CF0', note: '中国版端点与模型池', login: 'browser' },
-      { id: 'trae', name: 'TRAE', org: '字节', accent: '#00BFA6', note: '手机号登录', login: 'browser' },
-      { id: 'raccoon', name: 'Raccoon', org: '商汤', accent: '#00A6A6', note: '手机号登录', login: 'browser' },
-      { id: 'minimax', name: 'MiniMax Code', org: 'MiniMax', accent: '#E4007F', note: '设备码 + PKCE，每日签到', login: 'browser' },
-      { id: 'zcode', name: 'ZCode', org: '智谱', accent: '#3B6EF6', note: '浏览器登录（需本机可开浏览器）', login: 'browser' },
+      { id: 'codearts', name: 'CodeArts', org: '华为云', accent: '#C7000B', login: 'browser' },
+      { id: 'buddy', name: 'WorkBuddy 国内版', org: '腾讯 · copilot.tencent.com', accent: '#0A7AFF', login: 'browser' },
+      { id: 'workbuddy', name: 'WorkBuddy 国际版', org: '腾讯 · workbuddy.ai', accent: '#0B63CE', login: 'browser' },
+      { id: 'lobsterai', name: 'LobsterAI', org: '有道', accent: '#FF6A00', login: 'browser' },
+      { id: 'qodercn', name: 'Qoder 中国版', org: '阿里系', accent: '#7A6CF0', login: 'browser' },
+      { id: 'trae', name: 'TRAE', org: '字节', accent: '#00BFA6', login: 'browser' },
+      { id: 'raccoon', name: 'Raccoon', org: '商汤', accent: '#00A6A6', login: 'browser' },
+      { id: 'minimax', name: 'MiniMax Code', org: 'MiniMax', accent: '#E4007F', login: 'browser' },
+      { id: 'zcode', name: 'ZCode', org: '智谱', accent: '#3B6EF6', login: 'browser' },
     ]
 
     /** 与现有 RPC 的能力对应：余额、每日领取及独立签到状态分别判断。 */
@@ -3379,7 +3373,6 @@ window.__ModuleLoader__.load({
     let lastRaw = ''
     let diagMounts = 0
     let diagApplies = 0
-    const ZCODE_PROVIDER_KEY = 'ofm:zcode:login-provider'
     function closeLoginPopup(popup) {
       try { if (popup && !popup.closed) popup.close() } catch { /* best effort */ }
     }
@@ -3409,15 +3402,9 @@ window.__ModuleLoader__.load({
       const balanceGeneration = useRef(0)
       const claimPending = useRef(false)
       const creditCapability = CHANNEL_CREDITS[channel.id]
-      const [zcodeProvider, setZcodeProvider] = useState(() => {
-        try { return window.localStorage?.getItem(ZCODE_PROVIDER_KEY) === 'zai' ? 'zai' : 'bigmodel' } catch { return 'bigmodel' }
-      })
+      // 端点选择器已经删掉：zcode 一律走国内 bigmodel 端点，不再读写偏好。
+      const zcodeProvider = 'bigmodel'
       const loginAttempt = useRef(null)
-      const chooseZcodeProvider = value => {
-        if (value !== 'bigmodel' && value !== 'zai') return
-        setZcodeProvider(value)
-        try { window.localStorage?.setItem(ZCODE_PROVIDER_KEY, value) } catch { /* preference still applies this session */ }
-      }
       const balanceLabel = creditCapability?.unit === 'tokens' ? t('chan.credits.tokens')
         : creditCapability?.unit === 'dollars' ? t('chan.credits.dollars')
           : creditCapability?.quota ? t('chan.credits.quota') : t('chan.credits.left')
@@ -3728,7 +3715,6 @@ window.__ModuleLoader__.load({
           h('span', { className: 'ofm_chanstate' },
             h('span', { className: `ofm_dot ${connected ? 'ok' : closedByAccounts ? 'err' : ''}` }),
             stateText)),
-        h('p', { className: 'ofm_note' }, channel.note),
         h('div', { className: 'ofm_chanmeta' },
           h('span', null, `${t('chan.meta.accounts')} `, h('b', null, `${enabledCount}/${accountsCount}`)),
           h('span', null, `${t('chan.meta.models')} `, h('b', null, modelsLabel)),
@@ -3738,17 +3724,6 @@ window.__ModuleLoader__.load({
               ? creditCapability.quota ? t('chan.credits.loaded').replace('{count}', String((balances ?? []).filter(row => Number.isFinite(row.balance?.total)).length)) : kilo(balancesTotal)
               : balances === undefined ? '…' : '—')) : null),
         h('div', { className: 'ofm_chanacts' },
-          channel.id === 'zcode' ? h('div', { className: 'ofm_seg', role: 'group', 'aria-label': t('chan.zcode.provider') },
-            h('button', {
-              type: 'button', disabled: busy !== '' || !rpc,
-              'aria-pressed': zcodeProvider === 'bigmodel',
-              onClick: () => chooseZcodeProvider('bigmodel'),
-            }, t('chan.zcode.bigmodel')),
-            h('button', {
-              type: 'button', disabled: busy !== '' || !rpc,
-              'aria-pressed': zcodeProvider === 'zai',
-              onClick: () => chooseZcodeProvider('zai'),
-            }, t('chan.zcode.zai'))) : null,
           h('button', { type: 'button', className: 'ofm_btn', disabled: busy !== '' || !rpc, 'aria-busy': busy === 'add' ? 'true' : undefined, onClick: startLogin }, busy === 'add' ? '…' : t('chan.act.add')),
           accountsCount > 0 ? h('button', {
             type: 'button', className: 'ofm_btn ghost', disabled: busy !== '' || !rpc, 'aria-busy': busy === 'refreshAll' ? 'true' : undefined,
@@ -3882,6 +3857,58 @@ window.__ModuleLoader__.load({
       return h(Fragment, null, card, modal)
     }
 
+
+    /**
+     * The MiMo lane's card.
+     *
+     * MiMo has no account pool: its credential is the cookie the Xiaomi MiMo
+     * desktop app already holds, so there is nothing to add or remove here and
+     * nothing to sign in through. The card therefore shows only what the lane
+     * can answer on its own — whether a desktop session was found, how much of
+     * the daily allowance is left, and how many models the gateway advertises.
+     */
+    function MiMoCard(props) {
+      const { t } = props
+      const [state, setState] = useState(undefined)
+      const [busy, setBusy] = useState(false)
+      const load = useCallback(async force => {
+        try { setState(await api(`/mimo/status${force ? '?refresh=1' : ''}`, { timeout: 25_000 })) }
+        catch (error) { setState({ signedIn: false, reason: String(error?.message ?? error) }) }
+      }, [])
+      useEffect(() => { void load(false) }, [load])
+      const signedIn = state?.signedIn === true
+      const quota = state?.quota ?? null
+      const percent = typeof quota?.percent === 'number' ? Math.round(quota.percent) : null
+      const reset = typeof quota?.resetDate === 'string' && quota.resetDate !== ''
+        ? quota.resetDate
+        : typeof quota?.resetAt === 'number' && Number.isFinite(quota.resetAt)
+          ? new Date(quota.resetAt).toLocaleDateString()
+          : ''
+      const models = Array.isArray(state?.models) ? state.models.length : 0
+      return h('div', {
+        className: `ofm_chan ofm_glass${signedIn ? '' : ' off'}`,
+        'data-state': signedIn ? 'on' : 'off',
+      },
+        h('div', { className: 'ofm_chanhead' },
+          h('span', { className: 'ofm_chanid' },
+            h('b', null, 'MiMo'),
+            h('span', null, '小米 · 桌面端额度')),
+          h('span', { className: 'ofm_chanstate' },
+            h('span', { className: `ofm_dot ${signedIn ? 'ok' : ''}` }),
+            state === undefined ? '…' : signedIn ? t('chan.state.on') : t('chan.state.off'))),
+        h('div', { className: 'ofm_chanmeta' },
+          h('span', null, '额度 ', h('b', null, state === undefined ? '…' : percent === null ? '—' : `${percent}%`)),
+          reset === '' ? null : h('span', null, '重置 ', h('b', null, reset)),
+          h('span', null, `${t('chan.meta.models')} `, h('b', null, state === undefined ? '…' : String(models)))),
+        signedIn || state === undefined ? null : h('p', { className: 'ofm_note' }, String(state?.reason ?? '未在小米 MiMo 桌面端登录')),
+        h('div', { className: 'ofm_chanacts' },
+          h('button', {
+            type: 'button', className: 'ofm_btn', disabled: busy,
+            'aria-busy': busy ? 'true' : undefined,
+            onClick: () => { setBusy(true); void load(true).finally(() => setBusy(false)) },
+          }, busy ? '…' : '刷新额度')))
+    }
+
     function ChannelsPage(props) {
       const { t, ctx, summary } = props
       const { available, rpc } = useChannelRpc(ctx)
@@ -3998,7 +4025,7 @@ window.__ModuleLoader__.load({
         !available ? h('div', { className: 'ofm_callout' }, h('div', null, t('chan.rpc.unavailable'))) : null,
         !ready && available ? h('div', { className: 'ofm_chanwrap' },
           [0, 1, 2].map(index => h('div', { className: 'ofm_skel', key: index, style: { minHeight: 168 } }))) : null,
-        ready ? h('div', { className: 'ofm_chanwrap' }, CHANNEL_PROVIDERS.map(channel => h(ChannelCard, {
+        ready ? h('div', { className: 'ofm_chanwrap' }, [h(MiMoCard, { key: 'mimo', t }), ...CHANNEL_PROVIDERS.map(channel => h(ChannelCard, {
           key: channel.id,
           channel,
           status: statuses?.[channel.id],
@@ -4006,7 +4033,7 @@ window.__ModuleLoader__.load({
           t,
           onError,
           onChanged,
-        }))) : null,
+        }))]) : null,
         error !== '' && !failed ? h('p', { className: 'ofm_note' }, `${t('chan.error').replace('{reason}', error)}`) : null)
     }
 
