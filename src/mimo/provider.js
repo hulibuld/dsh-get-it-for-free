@@ -165,6 +165,23 @@ export function createMiMo({ logger = console, onTopology = () => {} } = {}) {
       return { id: provider, name: MIMO_DISPLAY_NAME }
     },
 
+    // The harness calls these three without optional guards: `prepareRoutes()`
+    // reads `providerRetryPolicy` while registering, image dispatch calls
+    // `imageRequestTarget`, and the token meter calls `imageRequestPricing`.
+    // Missing members throw a TypeError there, the route never mounts and the
+    // settings card says the lane is not attached.
+    providerRetryPolicy() {
+      return undefined
+    },
+
+    imageRequestPricing() {
+      return undefined
+    },
+
+    imageRequestTarget(provider, model, image) {
+      return { width: image.width, height: image.height }
+    },
+
     async listModels(provider) {
       // No credential means no usable models: an empty list keeps the group out
       // of the picker entirely instead of offering rows that cannot answer.

@@ -72,6 +72,40 @@ const PKG_URL = new URL('./', import.meta.url)
 const PKG_DIR = fileURLToPath(PKG_URL)
 const ENTRY_URL = new URL('index.js', import.meta.url).href
 
+/**
+ * macOS 复制目录时会顺手生成 AppleDouble 影子文件（`._xxx`）。DSH 读取插件元信息时
+ * 把 `locale/` 下每个 .json 都当作一个语言包，遇到 `._en.json` 就抛
+ * `must use a language id as its filename`，插件信息整个读不出来。
+ * 这些文件对本插件没有任何用处，启动时扫一遍清掉，下次启动就不会再报。
+ */
+function sweepAppleDoubleFiles(root) {
+  let removed = 0
+  const walk = (dir, depth) => {
+    if (depth > 6) return
+    let entries
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name)
+      if (entry.name === '.DS_Store' || entry.name.startsWith('._')) {
+        try {
+          fs.rmSync(full, { recursive: true, force: true })
+          removed += 1
+        } catch {
+          /* 删不掉就算了，不能影响启动 */
+        }
+        continue
+      }
+      if (entry.isDirectory() && entry.name !== 'node_modules') walk(full, depth + 1)
+    }
+  }
+  walk(root, 0)
+  return removed
+}
+
 /** Published version of the installed package, read once at load. */
 function readPackageVersion() {
   try {
@@ -137,6 +171,13 @@ function distributionOf(config, settings) {
 
 export function apply(ctx, config) {
   const logger = ctx.logger ?? console
+  // 先清掉 macOS 影子文件：它们会让 DSH 的插件元信息读取失败（见函数注释）。
+  try {
+    const swept = sweepAppleDoubleFiles(PKG_DIR)
+    if (swept > 0) logger.warn?.(`[get-it-for-free] cleaned ${swept} macOS AppleDouble file(s) that break plugin metadata`)
+  } catch {
+    /* 清理失败不影响启动 */
+  }
   const home = resolveDshHome()
   const dataDir = path.resolve(home, DATA_DIR_NAME)
   // 从旧版目录迁移一次：账号登录态、可用性缓存、设置都留在那里。
@@ -481,15 +522,71 @@ export function apply(ctx, config) {
   // 同一家厂商的第二条路：不在插件里手搓 HTTP（那种流量迟早被当成滥用），
   // 而是驱动用户自己装好、自己登录的官方 CLI。官方客户端发什么它就发什么。
   // 没装 CLI 时这条路由一条模型都不投放，选择器里直接看不到，不影响现有渠道。
+  // 一个 CLI 可以替几个腾讯账号干活：每个账号一份独立额度，用户说的是「我所有
+  // 账号」，不是「CLI 碰巧登着的那个」。这些令牌本来就由渠道包持有并会自动续期，
+  // 所以这里只读它的凭据，不另存一份 —— 两处各存一份迟早会有一处过期。
+  let credentialsService
+  let credentialRefOf
+  async function loadCliAccounts() {
+    const service = credentialsService
+    if (service === undefined) return []
+    if (credentialRefOf === undefined) {
+      try {
+        credentialRefOf = (await import('@deepseek-ai/dsh-credentials')).credentialRef
+      } catch {
+        credentialRefOf = null
+      }
+    }
+    if (credentialRefOf === null) return []
+    const statePath = path.join(os.homedir(), '.dsh', 'channel-pack', 'state.json')
+    let state
+    try {
+      state = JSON.parse(await fs.promises.readFile(statePath, 'utf8'))
+    } catch {
+      return []
+    }
+    const rows = Array.isArray(state?.accounts) ? state.accounts : []
+    const out = []
+    for (const row of rows) {
+      if (row === null || typeof row !== 'object') continue
+      if (row.provider !== 'buddy' || row.enabled === false) continue
+      if (typeof row.credentialRef !== 'string' || row.credentialRef === '') continue
+      try {
+        const resolved = await service.resolve(credentialRefOf(row.credentialRef))
+        if (resolved === undefined || resolved === null) continue
+        const parsed = JSON.parse(resolved.value)
+        if (parsed === null || typeof parsed !== 'object') continue
+        if (typeof parsed.access_token !== 'string' || parsed.access_token === '') continue
+        const expiresAt = Number(parsed.expires_at ?? 0)
+        out.push({
+          id: String(row.id),
+          nickname: String(row.nickname ?? parsed.nickname ?? row.id),
+          token: parsed.access_token,
+          expiresAt: expiresAt > 1e12 ? expiresAt : expiresAt * 1000,
+        })
+      } catch {
+        // 单个账号读不出来只是它自己缺席，不能拖垮整条通道。
+      }
+    }
+    return out
+  }
+
   let cliLane = {
-    status: async () => ({ provider: CLI_ROUTE, installed: false, path: '', version: '', models: [] }),
+    status: async () => ({ provider: CLI_ROUTE, installed: false, path: '', version: '', accounts: [], models: [] }),
   }
   try {
-    const lane = createCliLane({ logger })
+    const lane = createCliLane({ logger, loadAccounts: loadCliAccounts })
     ctx.llm.registerAdapter([CLI_ROUTE], lane.adapter)
     ctx.effect(() => () => { lane.dispose() }, 'get-it-for-free: codebuddy cli lane')
     cliLane = { status: patch => lane.status(patch ?? {}) }
   } catch (error) {
+    // The settings card cannot tell "no CLI" apart from "lane failed to mount",
+    // and this one is silent in a packaged app, so leave it on disk.
+    try {
+      const dir = path.join(os.homedir(), '.dsh', 'get-it-for-free')
+      fs.mkdirSync(dir, { recursive: true })
+      fs.appendFileSync(path.join(dir, 'cli-probe.log'), `${new Date().toISOString()} | lane mount failed: ${error?.message ?? error}\n`)
+    } catch { /* diagnostics only */ }
     logger.warn?.(`get-it-for-free: CodeBuddy CLI 通道未挂载（${error?.message ?? error}）`)
   }
 
@@ -1064,7 +1161,9 @@ export function apply(ctx, config) {
   let channelPackModule
   ctx.inject(['credentials', 'commands', 'llm'], scoped => {
     let stopped = false
-    scoped.effect(() => () => { stopped = true }, 'get-it-for-free: channel pack')
+    // CLI 通道要读同一批令牌：凭据服务在宿主里，这里把作用域里的那份留给它用。
+    credentialsService = scoped.credentials
+    scoped.effect(() => () => { stopped = true; credentialsService = undefined }, 'get-it-for-free: channel pack')
     // Dynamic import: the pack's own imports (the kernel's llm and credential
     // modules) are host-provided, and a composition that lacks them must still
     // load this plugin's free lane. `pack.js` is the bundled form of the

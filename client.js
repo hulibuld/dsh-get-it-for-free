@@ -1764,7 +1764,7 @@ window.__ModuleLoader__.load({
 .ofm_chan{position:relative;display:flex;flex-direction:column;gap:12px;padding:16px 17px 15px;border-radius:16px;border:1px solid var(--dsw-alias-border-l2);background:color-mix(in srgb,var(--dsw-alias-bg-layer-3) 78%,transparent);box-shadow:inset 0 1px 0 rgb(255 255 255 / 5%),0 1px 2px rgb(0 0 0 / 5%);overflow:hidden;transition:transform .22s cubic-bezier(.32,.72,0,1),box-shadow .24s ease,border-color .2s ease}
 .ofm_chan::before{content:"";position:absolute;left:0;right:0;top:0;height:2px;background:linear-gradient(90deg,var(--chan-accent,var(--dsw-alias-state-business-primary)),transparent 78%);opacity:.95}
 .ofm_chan:hover{transform:translateY(-3px);box-shadow:inset 0 1px 0 rgb(255 255 255 / 8%),0 18px 40px rgb(0 0 0 / 15%);border-color:color-mix(in srgb,var(--chan-accent,var(--dsw-alias-state-business-primary)) 55%,transparent)}
-.ofm_chan.off{opacity:.62}
+.ofm_chan.off{opacity:1;border-style:dashed;border-color:color-mix(in srgb,var(--dsw-alias-label-tertiary) 42%,transparent)}
 .ofm_chanhead{display:flex;align-items:center;gap:11px}
 .ofm_chanlogo{width:38px;height:38px;border-radius:12px;display:grid;place-items:center;flex:none;font-weight:800;font-size:13px;color:#fff;letter-spacing:-.3px;background:linear-gradient(150deg,var(--chan-accent,var(--dsw-alias-state-business-primary)),color-mix(in srgb,var(--chan-accent,var(--dsw-alias-state-business-primary)) 45%,#101828));box-shadow:0 6px 16px color-mix(in srgb,var(--chan-accent,var(--dsw-alias-state-business-primary)) 34%,transparent),inset 0 1px 0 rgb(255 255 255 / 22%)}
 .ofm_chan:hover .ofm_chanlogo{transform:scale(1.06) rotate(-3deg);transition:transform .35s cubic-bezier(.34,1.56,.64,1)}
@@ -2503,7 +2503,9 @@ window.__ModuleLoader__.load({
 .ofm_chan[data-state]::before,.ofm_chan::before{display:none!important;background:none!important}
 .ofm_chan[data-state]:hover{border-color:var(--dsw-alias-border-l2)!important}
 .ofm_chan .ofm_chanlogo{background:var(--dsw-alias-bg-layer-2)!important;color:var(--dsw-alias-label-secondary)!important}
-.ofm_chan .ofm_chanstate,.ofm_chan .ofm_chanmeta,.ofm_chan .ofm_note{color:var(--dsw-alias-label-tertiary)!important}
+.ofm_chan .ofm_chanmeta,.ofm_chan .ofm_note{color:var(--dsw-alias-label-tertiary)!important}
+/* 未接入/未安装这类状态必须一眼看清，不能被整体淡化吃掉 */
+.ofm_chan .ofm_chanstate{color:var(--dsw-alias-label-secondary)!important;font-size:11.5px!important;font-weight:600!important}
 .ofm_chan:hover,.ofm_card:hover{border-color:var(--dsw-alias-border-l2)!important}
 .ofm_pill,.ofm_tag,.ofm_chip,.ofm_newtag,.ofm_hottag,.ofm_badge,.ofm_kbd{border-radius:3px!important;border:1px solid var(--dsw-alias-border-l1)!important;background:transparent!important;color:var(--dsw-alias-label-secondary)!important;box-shadow:none!important;font-weight:500!important;letter-spacing:0!important;text-transform:none!important}
 .ofm_dot{box-shadow:none!important}
@@ -2563,6 +2565,20 @@ window.__ModuleLoader__.load({
 .ofm_risk_ignore:hover{opacity:.85;color:#6b5a55}
 .ofm_risk_done{padding:10px 12px;border-radius:6px;border:1px solid #6b2020;background:#1c1111;color:#ffb3a8;font-size:12px;line-height:1.7;text-align:center}
 
+
+
+/* ── 未接入/未安装这类状态要一眼看见 ───────────────────────────────────────
+   之前整张卡 opacity .62 + 状态字用 tertiary 灰，结果用户扫过去只会注意到
+   底部的按钮，以为那张卡不存在。现在卡片本体不淡化，状态做成实心胶囊。 */
+.ofm_root .ofm_chan.off{opacity:1!important;border-style:dashed!important;border-color:color-mix(in srgb,var(--dsw-alias-label-tertiary) 52%,transparent)!important}
+.ofm_root .ofm_chan[data-state="off"] .ofm_chanstate{
+  color:var(--dsw-alias-label-primary)!important;
+  background:color-mix(in srgb,var(--dsw-alias-label-tertiary) 20%,transparent)!important;
+  border-color:transparent!important;
+  font-weight:700!important;
+  font-size:11.5px!important;
+}
+.ofm_root .ofm_chan[data-state="off"] .ofm_chanstate .ofm_dot{background:var(--dsw-alias-label-secondary)!important;box-shadow:none!important}
 `
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -3954,6 +3970,8 @@ window.__ModuleLoader__.load({
       const installed = state?.installed === true
       const models = Array.isArray(state?.models) ? state.models.length : 0
       const version = typeof state?.version === 'string' ? state.version : ''
+      const accounts = Array.isArray(state?.accounts) ? state.accounts : []
+      const nicknames = accounts.map(row => row?.nickname).filter(name => typeof name === 'string' && name !== '')
       return h('div', {
         className: `ofm_chan ofm_glass${installed ? '' : ' off'}`,
         'data-state': installed ? 'on' : 'off',
@@ -3964,20 +3982,26 @@ window.__ModuleLoader__.load({
             h('span', null, '腾讯 · 官方客户端通道')),
           h('span', { className: 'ofm_chanstate' },
             h('span', { className: `ofm_dot ${installed ? 'ok' : ''}` }),
-            state === undefined ? '…' : installed ? '已找到 CLI' : '未安装'))),
+            state === undefined ? '…' : installed ? '已找到 CLI' : '未安装')),
         h('div', { className: 'ofm_chanmeta' },
           h('span', null, `版本 `, h('b', null, state === undefined ? '…' : version === '' ? '—' : version)),
+          h('span', null, `账号 `, h('b', null, state === undefined ? '…' : String(nicknames.length === 0 ? 1 : nicknames.length))),
           h('span', null, `${t('chan.meta.models')} `, h('b', null, state === undefined ? '…' : String(models)))),
         typeof state?.error === 'string' && state.error !== ''
           ? h('p', { className: 'ofm_note' }, `检测失败：${state.error}（刚升级完插件的话，需要重启 DSH 让后端接口生效）`)
-          : installed || state === undefined ? null : h('p', { className: 'ofm_note' },
-            '想在 DSH 里用官方客户端通道，先在终端里装好并登录 codebuddy（npm 包 @tencent-ai/codebuddy-code）。装好后这条通道会自己出现在模型选择器里，和现有渠道并存。'),
+          : installed
+            ? h('p', { className: 'ofm_note' },
+              nicknames.length === 0
+                ? '现在用本机 codebuddy 登录的那个账号。'
+                : `正在用 ${nicknames.length} 个腾讯账号：${nicknames.join('、')}。每个账号各自一份额度，选择器里每条模型后面都写着账号名。`)
+            : state === undefined ? null : h('p', { className: 'ofm_note' },
+              '想在 DSH 里用官方客户端通道，先在终端里装好并登录 codebuddy（npm 包 @tencent-ai/codebuddy-code）。装好后这条通道会自己出现在模型选择器里，和现有渠道并存。'),
         h('div', { className: 'ofm_chanacts' },
           h('button', {
             type: 'button', className: 'ofm_btn', disabled: busy,
             'aria-busy': busy ? 'true' : undefined,
             onClick: () => { setBusy(true); void load(true).finally(() => setBusy(false)) },
-          }, busy ? '…' : '重新检测'))
+          }, busy ? '…' : '重新检测')))
     }
 
 

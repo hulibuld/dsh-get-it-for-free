@@ -38,6 +38,7 @@
  */
 
 import { spawn } from 'node:child_process'
+import fs from 'node:fs'
 import { access, constants } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -70,6 +71,24 @@ const FALLBACK_MODELS = [
   { id: 'hy3', name: 'Hy3', contextWindow: 192_000, maxTokens: 64_000, vision: true },
   { id: 'hy4-preview', name: 'Hy4 Preview', contextWindow: 1_000_000, maxTokens: 64_000, vision: true },
 ]
+
+/**
+ * Model ids carry the account they belong to: `hy3@buddy-4633f609`.
+ *
+ * One CLI install can speak for several Tencent accounts, and each account has
+ * its own quota. The suffix is what lets the picker offer all of them at once;
+ * an id without a suffix means "whatever account the CLI is signed into", so
+ * single-account machines keep working unchanged.
+ */
+const ACCOUNT_MARK = '@'
+
+/** Split `hy3@buddy-4633f609` into the model and the account it runs on. */
+export function splitModelId(model) {
+  const text = typeof model === 'string' ? model : ''
+  const at = text.lastIndexOf(ACCOUNT_MARK)
+  if (at <= 0) return { base: text, accountId: '' }
+  return { base: text.slice(0, at), accountId: text.slice(at + 1) }
+}
 
 /** Framing: the CLI must answer as a model endpoint, not as an agent. */
 const SYSTEM_PROMPT = [
@@ -107,13 +126,36 @@ export function cliCandidates(env = process.env) {
 }
 
 /**
+ * PATH for child processes.
+ *
+ * GUI-launched apps get a minimal PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), and
+ * `codebuddy` is a `#!/usr/bin/env node` script — so without this the CLI is
+ * present but unlaunchable and the probe reports it as missing. Node lives in
+ * Homebrew, /usr/local, ~/.local/bin or an nvm tree on this kind of machine.
+ */
+export function childPath(env = process.env) {
+  const dirs = String(env.PATH ?? '').split(path.delimiter).filter(Boolean)
+  const extra = [
+    path.dirname(process.execPath),
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    path.join(env.HOME ?? os.homedir(), '.local', 'bin'),
+    '/usr/bin',
+    '/bin',
+    '/usr/sbin',
+    '/sbin',
+  ]
+  return [...new Set([...extra, ...dirs])].join(path.delimiter)
+}
+
+/**
  * Run one process to completion and collect its output.
  *
  * @param command - executable.
  * @param args - argument list.
- * @param options - `{ env, input, timeoutMs, signal }`.
+ * @param options - `{ extraEnv, input, timeoutMs, signal }`.
  */
-function runProcess(command, args, { input = '', timeoutMs = DEFAULT_TIMEOUT_MS, signal } = {}) {
+function runProcess(command, args, { extraEnv, input = '', timeoutMs = DEFAULT_TIMEOUT_MS, signal } = {}) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted === true) {
       reject(new Error('请求已取消'))
@@ -121,7 +163,7 @@ function runProcess(command, args, { input = '', timeoutMs = DEFAULT_TIMEOUT_MS,
     }
     const child = spawn(command, args, {
       cwd: os.tmpdir(),
-      env: { ...process.env, ...CLI_ENV, CODEBUDDY_DISABLE_AUTO_MEMORY: '1', DISABLE_AUTOUPDATER: '1' },
+      env: { ...process.env, ...CLI_ENV, ...(extraEnv ?? {}), PATH: childPath(), CODEBUDDY_DISABLE_AUTO_MEMORY: '1', DISABLE_AUTOUPDATER: '1' },
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
     })
@@ -179,26 +221,60 @@ function runProcess(command, args, { input = '', timeoutMs = DEFAULT_TIMEOUT_MS,
 }
 
 /**
+ * One line of diagnosis, written only when discovery fails.
+ *
+ * A GUI-launched process cannot be attached to a debugger, so when the CLI is
+ * present but unreachable the only way to see why is to leave a note on disk.
+ */
+function noteDiscoveryFailure(reason) {
+  try {
+    const dir = path.join(os.homedir(), '.dsh', 'get-it-for-free')
+    fs.mkdirSync(dir, { recursive: true })
+    const line = [
+      new Date().toISOString(),
+      reason,
+      `execPath=${process.execPath}`,
+      `PATH=${String(process.env.PATH ?? '')}`,
+      `HOME=${String(process.env.HOME ?? '')}`,
+    ].join(' | ')
+    fs.appendFileSync(path.join(dir, 'cli-probe.log'), line + '\n')
+  } catch {
+    // Diagnostics must never break the probe.
+  }
+}
+
+/**
  * Locate a runnable CLI.
  *
  * @returns `{ path, version }`, or undefined when nothing usable is installed.
  */
 export async function findCli() {
+  let existing
+  const reasons = []
   for (const candidate of cliCandidates()) {
     try {
       await access(candidate, constants.X_OK)
     } catch {
       continue
     }
+    existing ??= candidate
     try {
-      const { stdout } = await runProcess(candidate, ['--version'], { timeoutMs: 8_000 })
+      const { stdout, stderr } = await runProcess(candidate, ['--version'], { timeoutMs: 8_000 })
       const version = stdout.match(/\b\d+\.\d+\.\d+(?:[-+][\w.-]+)?\b/)?.[0]
       if (version !== undefined) return { path: candidate, version }
-    } catch {
-      // Present but not runnable (wrong arch, broken installer) — keep looking.
+      const said = `${stdout} ${stderr}`.replace(/\s+/g, ' ').trim().slice(0, 160)
+      reasons.push(`${candidate}: --version 没有打印版本号（输出 ${said || '空'}）`)
+    } catch (error) {
+      // Present but unlaunchable (missing interpreter, wrong arch). Keep the
+      // path anyway: `--version` failing does not mean a turn cannot be served,
+      // and answering "not installed" for a file that is plainly there is the
+      // more confusing of the two lies.
+      reasons.push(`${candidate}: ${error?.message ?? error}`)
     }
   }
-  return undefined
+  if (existing === undefined) noteDiscoveryFailure('no candidate existed: ' + cliCandidates().join(','))
+  else noteDiscoveryFailure(reasons.join(' ; ') || 'no reason recorded')
+  return existing === undefined ? undefined : { path: existing, version: '' }
 }
 
 /**
@@ -303,10 +379,10 @@ function buildPrompt(options, tools) {
  * Relay one turn through the CLI.
  *
  * @param options - the harness GenerateOptions for this turn.
- * @param context - `{ cliPath, tools, timeoutMs }`.
+ * @param context - `{ cliPath, tools, timeoutMs, token }`.
  * @returns `{ chunks, finish }` — the harness chunk sequence plus a finish reason.
  */
-export async function relayTurn(options, { cliPath, tools = [], timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+export async function relayTurn(options, { cliPath, tools = [], timeoutMs = DEFAULT_TIMEOUT_MS, token = '' } = {}) {
   const allowed = new Set(tools.map(tool => tool?.name).filter(name => typeof name === 'string' && name !== ''))
   const args = [
     '--print',
@@ -320,9 +396,11 @@ export async function relayTurn(options, { cliPath, tools = [], timeoutMs = DEFA
     '--no-session-persistence',
     '--system-prompt', SYSTEM_PROMPT,
   ]
-  if (typeof options.model === 'string' && options.model !== '') args.push('--model', options.model)
+  const { base } = splitModelId(options.model)
+  if (base !== '') args.push('--model', base)
 
   const { stdout, stderr } = await runProcess(cliPath, args, {
+    extraEnv: token === '' ? undefined : { CODEBUDDY_AUTH_TOKEN: token },
     input: buildPrompt(options, tools),
     timeoutMs,
     signal: options.signal,
@@ -358,12 +436,16 @@ export async function relayTurn(options, { cliPath, tools = [], timeoutMs = DEFA
 /**
  * Build the CLI route's runtime: an adapter plus the status the settings page reads.
  *
- * @param options - `{ logger }`.
+ * @param options - `{ logger, loadAccounts }`. `loadAccounts()` returns the
+ *   Tencent accounts the CLI may speak for (`{ id, nickname, token }[]`); an
+ *   empty list means "just use the account the CLI is signed into".
  * @returns `{ adapter, status, probe, dispose }`.
  */
-export function createCliLane({ logger = console } = {}) {
+export function createCliLane({ logger = console, loadAccounts } = {}) {
   let located
   let locatedAt = 0
+  let accounts
+  let accountsAt = 0
 
   /**
    * Resolve the CLI, caching the answer for a minute.
@@ -379,9 +461,68 @@ export function createCliLane({ logger = console } = {}) {
     return located
   }
 
+  /**
+   * The accounts the CLI can answer as, cached for a minute.
+   *
+   * These are the credentials the channel pack already holds and refreshes, so
+   * the CLI lane never keeps a second copy of the same tokens. A failure here
+   * degrades to the locally signed-in account instead of taking the lane down.
+   */
+  async function listAccounts({ force = false } = {}) {
+    if (!force && accounts !== undefined && Date.now() - accountsAt < 60_000) return accounts
+    let rows = []
+    try {
+      rows = (await loadAccounts?.()) ?? []
+    } catch (error) {
+      logger.warn?.(`get-it-for-free: 读取 CLI 账号失败（${error?.message ?? error}）`)
+      rows = []
+    }
+    accounts = Array.isArray(rows)
+      ? rows.filter(row => row !== null && typeof row === 'object' && typeof row.token === 'string' && row.token !== '')
+      : []
+    accountsAt = Date.now()
+    return accounts
+  }
+
+  /** One entry per account × model, so the picker shows every quota. */
+  function modelsOf(provider, list) {
+    if (list.length === 0) {
+      return FALLBACK_MODELS.map(model => ({
+        provider,
+        id: model.id,
+        name: model.name,
+        inputModalities: model.vision === true ? ['text', 'image'] : ['text'],
+      }))
+    }
+    return list.flatMap(account => FALLBACK_MODELS.map(model => ({
+      provider,
+      id: `${model.id}${ACCOUNT_MARK}${account.id}`,
+      name: `${model.name} · ${account.nickname ?? account.id}`,
+      inputModalities: model.vision === true ? ['text', 'image'] : ['text'],
+    })))
+  }
+
   const adapter = {
     providerInfo(provider) {
       return { id: provider, name: 'CodeBuddy CLI' }
+    },
+
+    // The harness calls these three without guarding them: `prepareRoutes()`
+    // reads `providerRetryPolicy` while registering, and image dispatch calls
+    // `imageRequestTarget` directly. A missing member throws a TypeError there,
+    // the route never mounts, and the settings card reports "未安装" even when
+    // the CLI is installed (`lane mount failed: adapter.providerRetryPolicy is
+    // not a function`). Declare them so the route always mounts.
+    providerRetryPolicy() {
+      return undefined
+    },
+
+    imageRequestPricing() {
+      return undefined
+    },
+
+    imageRequestTarget(provider, model, image) {
+      return { width: image.width, height: image.height }
     },
 
     async listModels(provider) {
@@ -389,20 +530,16 @@ export function createCliLane({ logger = console } = {}) {
       // instead of offering models that cannot answer.
       const cli = await probe()
       if (cli === null) return []
-      return FALLBACK_MODELS.map(model => ({
-        provider,
-        id: model.id,
-        name: model.name,
-        inputModalities: model.vision === true ? ['text', 'image'] : ['text'],
-      }))
+      return modelsOf(provider, await listAccounts())
     },
 
     async resolveModel(provider, model) {
-      const found = FALLBACK_MODELS.find(row => row.id === model)
-      const info = found ?? { id: model, name: model, contextWindow: 128_000, maxTokens: 32_000, vision: false }
+      const { base } = splitModelId(model)
+      const found = FALLBACK_MODELS.find(row => row.id === base)
+      const info = found ?? { id: base === '' ? model : base, name: base === '' ? model : base, contextWindow: 128_000, maxTokens: 32_000, vision: false }
       return {
         provider,
-        id: info.id,
+        id: model,
         name: info.name,
         inputModalities: info.vision === true ? ['text', 'image'] : ['text'],
         context: { contextWindow: info.contextWindow },
@@ -434,10 +571,28 @@ export function createCliLane({ logger = console } = {}) {
       }
       return
     }
+    const { accountId } = splitModelId(options.model)
+    let token = ''
+    if (accountId !== '') {
+      const list = await listAccounts()
+      const found = list.find(row => row.id === accountId)
+      if (found === undefined) {
+        yield {
+          type: 'finish',
+          reason: {
+            kind: 'error',
+            failure: { message: `CodeBuddy 账号 ${accountId} 的登录已经失效，请到设置页把它重新加一次`, code: 'CLI_ACCOUNT_MISSING' },
+          },
+        }
+        return
+      }
+      token = found.token
+    }
     try {
       const { chunks, finish } = await relayTurn(options, {
         cliPath: cli.path,
         tools: options.tools ?? [],
+        token,
       })
       for (const chunk of chunks) yield chunk
       yield { type: 'finish', reason: finish }
@@ -455,17 +610,24 @@ export function createCliLane({ logger = console } = {}) {
     probe,
     async status({ force = false } = {}) {
       const cli = await probe({ force })
+      if (cli === null) {
+        return { provider: CLI_ROUTE, installed: false, path: '', version: '', accounts: [], models: [] }
+      }
+      const list = await listAccounts({ force })
       return {
         provider: CLI_ROUTE,
-        installed: cli !== null,
-        path: cli?.path ?? '',
-        version: cli?.version ?? '',
-        models: cli === null ? [] : FALLBACK_MODELS.map(row => ({ id: row.id, name: row.name })),
+        installed: true,
+        path: cli.path,
+        version: cli.version,
+        accounts: list.map(row => ({ id: row.id, nickname: row.nickname ?? row.id, expiresAt: Number(row.expiresAt ?? 0) })),
+        models: modelsOf(CLI_ROUTE, list).map(row => ({ id: row.id, name: row.name })),
       }
     },
     dispose() {
       located = undefined
       locatedAt = 0
+      accounts = undefined
+      accountsAt = 0
     },
   }
 }

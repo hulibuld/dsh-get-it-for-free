@@ -103,6 +103,16 @@ export class FreeModelAdapter {
     return FALLBACK_IMAGE_PRICING
   }
 
+  /**
+   * Image projection this route sends. The harness calls this without an
+   * optional guard whenever a request carries an image, so it has to exist:
+   * declaring none used to mean a TypeError mid-request rather than a fallback.
+   * Free outlets accept the image as-is, so report the incoming dimensions.
+   */
+  imageRequestTarget(_provider, _model, image) {
+    return { width: image.width, height: image.height }
+  }
+
   /** Models this route advertises right now. */
   async listModels(provider) {
     const state = this.deps.state()
