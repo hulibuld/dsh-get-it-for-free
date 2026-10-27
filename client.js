@@ -3245,10 +3245,13 @@ window.__ModuleLoader__.load({
 
 
     /**
-     * The thirteen account channels enabled by OFM. Identity is static (it is
-     * the product, not a reading), so the grid renders instantly and only the
+     * The account channels enabled by OFM. Identity is static (it is the
+     * product, not a reading), so the grid renders instantly and only the
      * *state* comes from the pack over RPC. `accent` drives each card's stripe
      * and logo tile; `login` picks the flow the card offers.
+     *
+     * 十家在这里排好队就够了 —— 渠道实现本身全在 pack 里（`productById` 认识谁，
+     * 谁就能登录）。少一张卡不等于少一条通道，只是用户在设置页点不到它。
      */
     const CHANNEL_PROVIDERS = [
       { id: 'codearts', name: 'CodeArts', org: '华为云', accent: '#C7000B', login: 'browser' },
@@ -3260,6 +3263,7 @@ window.__ModuleLoader__.load({
       { id: 'raccoon', name: 'Raccoon', org: '商汤', accent: '#00A6A6', login: 'browser' },
       { id: 'minimax', name: 'MiniMax Code', org: 'MiniMax', accent: '#E4007F', login: 'browser' },
       { id: 'zcode', name: 'ZCode', org: '智谱', accent: '#3B6EF6', login: 'browser' },
+      { id: 'loomy', name: 'Loomy', org: '讯飞 · 微信扫码', accent: '#1182E4', login: 'browser' },
     ]
 
     /** 与现有 RPC 的能力对应：余额、每日领取及独立签到状态分别判断。 */
@@ -3962,9 +3966,40 @@ window.__ModuleLoader__.load({
       const { t } = props
       const [state, setState] = useState(undefined)
       const [busy, setBusy] = useState(false)
+      const [check, setCheck] = useState(undefined)
       const load = useCallback(async force => {
         try { setState(await api(`/cli-lane/status${force ? '?refresh=1' : ''}`, { timeout: 25_000 })) }
         catch (error) { setState({ installed: false, error: String(error?.message ?? error) }) }
+      }, [])
+      // 一次最小的真实请求：失败时给出的原因比「本轮运行失败」有用得多，
+      // 也不用为了看原因白花一轮对话。
+      const runCheck = useCallback(async () => {
+        setCheck({ running: true })
+        try {
+          const reply = await api('/cli-lane/self-test', { timeout: 120_000 })
+          setCheck({
+            running: false,
+            ok: reply?.ok === true,
+            code: String(reply?.code ?? ''),
+            message: String(reply?.message ?? ''),
+            durationMs: Number(reply?.durationMs ?? 0),
+          })
+        } catch (error) {
+          const message = String(error?.message ?? error)
+          // 只有一种情况会走到这里：后端还没跑上这段新代码（插件路由在 Host 进程里，
+          // 页面刷新换不掉它）。把「该重启」直接说在脸上，别让用户以为是 CLI 坏了。
+          const stale = message.toLowerCase().includes('not found') || message.toLowerCase().includes('404')
+          setCheck({
+            running: false,
+            ok: false,
+            code: 'REQUEST_FAILED',
+            stale,
+            message: stale
+              ? '后端跑的还是旧版插件（自检接口不存在）。要完全退出 DeepSeek Harness 再打开，只刷新这个页面不够。'
+              : message,
+            durationMs: 0,
+          })
+        }
       }, [])
       useEffect(() => { void load(false) }, [load])
       const installed = state?.installed === true
@@ -3993,15 +4028,29 @@ window.__ModuleLoader__.load({
             ? h('p', { className: 'ofm_note' },
               nicknames.length === 0
                 ? '现在用本机 codebuddy 登录的那个账号。'
-                : `正在用 ${nicknames.length} 个腾讯账号：${nicknames.join('、')}。每个账号各自一份额度，选择器里每条模型后面都写着账号名。`)
+                : `正在用 ${nicknames.length} 个腾讯账号：${nicknames.join('、')}。每个账号各自一份额度，请求会在它们之间轮着走；模型选择器里只列模型本身，不显示账号。`)
             : state === undefined ? null : h('p', { className: 'ofm_note' },
               '想在 DSH 里用官方客户端通道，先在终端里装好并登录 codebuddy（npm 包 @tencent-ai/codebuddy-code）。装好后这条通道会自己出现在模型选择器里，和现有渠道并存。'),
+        check !== undefined && check.running !== true
+          ? h('p', { className: 'ofm_note' },
+            check.ok
+              ? `自检通过：${Math.round(check.durationMs / 1000)} 秒拿到回复「${check.message}」。`
+              : check.stale === true
+                ? `${check.message}`
+                : `自检失败（${check.code === '' ? '未知原因' : check.code}）：${check.message}。原始输出写在 ~/.dsh/get-it-for-free/cli-failure.log。`)
+          : check?.running === true
+            ? h('p', { className: 'ofm_note' }, '自检中：正在跑一次最小的 CLI 请求，最多 90 秒…')
+            : null,
         h('div', { className: 'ofm_chanacts' },
           h('button', {
             type: 'button', className: 'ofm_btn', disabled: busy,
             'aria-busy': busy ? 'true' : undefined,
             onClick: () => { setBusy(true); void load(true).finally(() => setBusy(false)) },
-          }, busy ? '…' : '重新检测')))
+          }, busy ? '…' : '重新检测'),
+          h('button', {
+            type: 'button', className: 'ofm_btn', disabled: check?.running === true || !installed,
+            onClick: () => { void runCheck() },
+          }, check?.running === true ? '自检中…' : '自检一次')))
     }
 
 

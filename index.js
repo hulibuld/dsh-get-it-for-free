@@ -573,12 +573,16 @@ export function apply(ctx, config) {
 
   let cliLane = {
     status: async () => ({ provider: CLI_ROUTE, installed: false, path: '', version: '', accounts: [], models: [] }),
+    selfTest: async () => ({ ok: false, code: 'CLI_NOT_FOUND', message: 'CodeBuddy CLI 通道没有挂载', durationMs: 0 }),
   }
   try {
     const lane = createCliLane({ logger, loadAccounts: loadCliAccounts })
     ctx.llm.registerAdapter([CLI_ROUTE], lane.adapter)
     ctx.effect(() => () => { lane.dispose() }, 'get-it-for-free: codebuddy cli lane')
-    cliLane = { status: patch => lane.status(patch ?? {}) }
+    cliLane = {
+      status: patch => lane.status(patch ?? {}),
+      selfTest: patch => lane.selfTest(patch ?? {}),
+    }
   } catch (error) {
     // The settings card cannot tell "no CLI" apart from "lane failed to mount",
     // and this one is silent in a packaged app, so leave it on disk.
@@ -1947,6 +1951,15 @@ export function createApiRoutes(deps) {
           return send(200, await deps.cliLane.status({ force }))
         } catch (error) {
           return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // One minimal CLI turn, so the settings card can show why a real turn
+      // failed instead of the user having to spend a session turn to find out.
+      if (routePath === '/cli-lane/self-test') {
+        try {
+          return send(200, await deps.cliLane.selfTest({}))
+        } catch (error) {
+          return send(500, { ok: false, code: 'CLI_SELFTEST_FAILED', message: String(error?.message ?? error).slice(0, 300) })
         }
       }
       if (routePath === '/mimo/status') {

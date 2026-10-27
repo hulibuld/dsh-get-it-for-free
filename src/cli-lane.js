@@ -52,11 +52,46 @@ export const CLI_ROUTE_LABEL = 'CodeBuddy CLI · 更稳'
 /** Environment the official CLI needs to reach the China-region service. */
 const CLI_ENV = { CODEBUDDY_INTERNET_ENVIRONMENT: 'internal' }
 
-/** How long one turn may take before we give up. */
-const DEFAULT_TIMEOUT_MS = 180_000
+/**
+ * How long one turn may take before we give up.
+ *
+ * A turn carries the whole conversation plus every DSH tool schema, so a real
+ * request is a 150 KB prompt and one model round trip can take most of a
+ * minute. The ceiling is generous on purpose and overridable, because a machine
+ * that is busy (or a CLI that is slow to boot) otherwise looks like "the
+ * channel is broken" when it was merely about to answer.
+ */
+const DEFAULT_TIMEOUT_MS = readEnvInt('GET_IT_FOR_FREE_CLI_TIMEOUT_MS', 240_000, 30_000, 900_000)
+
+/**
+ * How many model turns one invocation may take.
+ *
+ * The CLI counts *its* turns, not ours: a model that submits StructuredOutput
+ * twice, or asks for a tool the schema does not allow, burns a turn each time.
+ * Four was too tight — a single schema retry plus one tool request could end the
+ * invocation with `error_max_turns`, which used to surface as the opaque
+ * "没有返回可用的结果".
+ */
+const DEFAULT_MAX_TURNS = readEnvInt('GET_IT_FOR_FREE_CLI_MAX_TURNS', 8, 2, 32)
 
 /** Ceiling on what we are willing to buffer from one invocation. */
 const MAX_STDOUT_BYTES = 24 * 1024 * 1024
+
+/** Counter for the per-invocation stdout files (pid alone is not enough). */
+let outputSeq = 0
+
+/** How much of stderr to keep for diagnosis (the message shown stays short). */
+const MAX_STDERR_BYTES = 64 * 1024
+
+/** Where failures land when nothing else can explain them. */
+const FAILURE_LOG_MAX_BYTES = 1_000_000
+
+/** Read an integer override from the environment, clamped to a sane range. */
+function readEnvInt(name, fallback, min, max) {
+  const raw = Number(process.env[name])
+  if (!Number.isFinite(raw) || raw <= 0) return fallback
+  return Math.min(max, Math.max(min, Math.round(raw)))
+}
 
 /**
  * Models advertised when the CLI has not been asked yet.
@@ -67,10 +102,30 @@ const MAX_STDOUT_BYTES = 24 * 1024 * 1024
  * know fails cleanly and the caller falls back.
  */
 const FALLBACK_MODELS = [
-  { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 1_000_000, maxTokens: 64_000, vision: true },
-  { id: 'hy3', name: 'Hy3', contextWindow: 192_000, maxTokens: 64_000, vision: true },
-  { id: 'hy4-preview', name: 'Hy4 Preview', contextWindow: 1_000_000, maxTokens: 64_000, vision: true },
+  { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 1_000_000, maxTokens: 64_000, vision: true, efforts: ['low', 'high', 'max'], defaultEffort: 'high' },
+  { id: 'hy3', name: 'Hy3', contextWindow: 192_000, maxTokens: 64_000, vision: true, efforts: ['low', 'high'], defaultEffort: 'high' },
+  { id: 'hy4-preview', name: 'Hy4 Preview', contextWindow: 1_000_000, maxTokens: 64_000, vision: true, efforts: ['high'], defaultEffort: 'high' },
 ]
+
+/**
+ * How a thinking level reaches the CLI.
+ *
+ * `codebuddy --effort <level>` accepts minimal / low / medium / high / xhigh /
+ * max. The levels offered per model above are the product's own declaration
+ * (same table the HTTP lane uses), so the composer's choices match what the
+ * vendor claims each model supports. 'off' has no CLI spelling; the closest
+ * honest mapping is the cheapest level rather than silently sending nothing.
+ */
+const CLI_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+
+/** Display names for the composer's effort menu. */
+const EFFORT_NAMES = { minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'XHigh', max: 'Max' }
+
+function effortFlag(value) {
+  const id = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  if (id === 'off' || id === 'none' || id === 'disabled') return 'minimal'
+  return CLI_EFFORTS.includes(id) ? id : ''
+}
 
 /**
  * Model ids carry the account they belong to: `hy3@buddy-4633f609`.
@@ -151,6 +206,23 @@ export function childPath(env = process.env) {
 /**
  * Run one process to completion and collect its output.
  *
+ * ## Why stdout goes to a file instead of a pipe
+ *
+ * Measured on codebuddy 2.176.0 (2026-10-27), same oversized turn, same args:
+ *
+ *   stdout redirected to a file   → 246 484 bytes, complete JSON
+ *   stdout to a pipe (`| cat`)    → exactly 65 536 bytes, JSON cut mid-string
+ *
+ * 65 536 is one macOS pipe buffer. The CLI finishes with `process.exit()`, and
+ * Node cannot flush an async pipe write before that; a file is written
+ * synchronously, so nothing is lost. A pipe therefore truncated **every** real
+ * DSH turn (the echoed envelope alone carries the whole skill catalog and runs
+ * past 64 KB), the answer never parsed, and the user saw the generic
+ * 「CodeBuddy CLI 没有返回可用的结果」 for a request that had in fact succeeded.
+ *
+ * So: hand the child a real file for stdout, read it back when it exits, and
+ * keep the pipe only as a fallback when the temp file cannot be created.
+ *
  * @param command - executable.
  * @param args - argument list.
  * @param options - `{ extraEnv, input, timeoutMs, signal }`.
@@ -161,24 +233,65 @@ function runProcess(command, args, { extraEnv, input = '', timeoutMs = DEFAULT_T
       reject(new Error('请求已取消'))
       return
     }
+    let stdoutPath
+    let stdoutFd
+    let useFile = false
+    try {
+      stdoutPath = path.join(os.tmpdir(), `dsh-cli-${process.pid}-${Date.now()}-${outputSeq += 1}.json`)
+      stdoutFd = fs.openSync(stdoutPath, 'w')
+      useFile = true
+    } catch {
+      useFile = false
+    }
     const child = spawn(command, args, {
       cwd: os.tmpdir(),
       env: { ...process.env, ...CLI_ENV, ...(extraEnv ?? {}), PATH: childPath(), CODEBUDDY_DISABLE_AUTO_MEMORY: '1', DISABLE_AUTOUPDATER: '1' },
       windowsHide: true,
-      stdio: ['pipe', 'pipe', 'pipe'],
+      stdio: ['pipe', useFile ? stdoutFd : 'pipe', 'pipe'],
     })
+    // The child holds its own duplicate; the parent's copy is closed right away so
+    // the file is never held open by us while the CLI is still writing.
+    if (useFile) {
+      try { fs.closeSync(stdoutFd) } catch { /* not ours to worry about */ }
+    }
+    const startedAt = Date.now()
     let stdout = ''
     let stderr = ''
     let bytes = 0
     let settled = false
     let timedOut = false
+    const dropOutputFile = () => {
+      if (!useFile || stdoutPath === undefined) return
+      try { fs.rmSync(stdoutPath, { force: true }) } catch { /* best effort */ }
+    }
     const finish = (error, value) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
       signal?.removeEventListener('abort', onAbort)
-      if (error) reject(error)
-      else resolve(value)
+      const settle = () => {
+        if (error) reject(error)
+        else resolve(value)
+      }
+      if (!useFile) {
+        settle()
+        return
+      }
+      // Read before deleting: the file is the only copy of the answer.
+      try {
+        const size = fs.statSync(stdoutPath).size
+        if (size > MAX_STDOUT_BYTES) {
+          dropOutputFile()
+          reject(new Error('CodeBuddy CLI 输出超过安全上限'))
+          return
+        }
+        if (value !== undefined) {
+          value.stdout = size === 0 ? '' : fs.readFileSync(stdoutPath, 'utf8')
+          value.stdoutBytes = size
+        }
+      } catch { /* keep whatever the caller already has */ }
+      dropOutputFile()
+      settle()
     }
     const kill = () => {
       try { child.kill('SIGKILL') } catch { /* already gone */ }
@@ -190,31 +303,46 @@ function runProcess(command, args, { extraEnv, input = '', timeoutMs = DEFAULT_T
     const timer = setTimeout(() => {
       timedOut = true
       kill()
-      finish(new Error(`CodeBuddy CLI 在 ${Math.round(timeoutMs / 1000)} 秒内没有返回`))
+      // Carry the CLI's own last words into the timeout message: "it said nothing
+      // for four minutes" and "it said 504 and then hung" need different fixes.
+      const hint = briefReason(stderr)
+      finish(new Error(`CodeBuddy CLI 在 ${Math.round(timeoutMs / 1000)} 秒内没有返回${hint}`))
     }, timeoutMs)
     timer.unref?.()
     signal?.addEventListener('abort', onAbort, { once: true })
-    child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
-    child.stdout.on('data', chunk => {
-      bytes += Buffer.byteLength(chunk)
-      if (bytes > MAX_STDOUT_BYTES) {
-        kill()
-        finish(new Error('CodeBuddy CLI 输出超过安全上限'))
-        return
-      }
-      stdout += chunk
-    })
+    if (useFile) {
+      // Nothing to drain: the child writes straight into the file.
+      child.stdout?.resume?.()
+    } else {
+      child.stdout.setEncoding('utf8')
+      child.stdout.on('data', chunk => {
+        bytes += Buffer.byteLength(chunk)
+        if (bytes > MAX_STDOUT_BYTES) {
+          kill()
+          finish(new Error('CodeBuddy CLI 输出超过安全上限'))
+          return
+        }
+        stdout += chunk
+      })
+    }
     child.stderr.on('data', chunk => {
-      stderr = (stderr + chunk).slice(-8192)
+      stderr = (stderr + chunk).slice(-MAX_STDERR_BYTES)
     })
     child.stdin.on('error', () => {})
     child.once('error', error => {
       finish(new Error(error?.code === 'ENOENT' ? '找不到 CodeBuddy CLI' : `无法启动 CodeBuddy CLI：${error?.message ?? error}`))
     })
-    child.once('close', code => {
+    child.once('close', (code, closeSignal) => {
       if (timedOut) return
-      resolve({ stdout, stderr, exitCode: code })
+      finish(undefined, {
+        stdout,
+        stderr,
+        exitCode: code,
+        signal: closeSignal ?? null,
+        stdoutBytes: bytes,
+        durationMs: Date.now() - startedAt,
+      })
     })
     child.stdin.end(input)
   })
@@ -302,16 +430,131 @@ function answerSchema() {
   }
 }
 
-/** Turn the CLI's stderr/stdout into one sentence a human can act on. */
-function cliFailure(text) {
+/**
+ * The most human-useful fragment of a log blob, as a parenthetical.
+ *
+ * Failures used to collapse into "没有返回可用的结果" and nothing else, which is
+ * unactionable: it is the same sentence for an expired login, a model the
+ * account cannot use, a 504 from the vendor and a max-turns exhaustion. Every
+ * message keeps a short quote of what the CLI actually said.
+ */
+function briefReason(text) {
+  const lines = String(text ?? '')
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line !== '')
+  const looksLikeJson = line => line.startsWith('{') || line.startsWith('[') || line.startsWith('"')
+  const bad = lines.find(line => !looksLikeJson(line)
+    && /(?:error|failed|failure|unavailable|denied|refus|timeout|超时|失败|错误)/iu.test(line))
+  const picked = bad ?? lines.find(line => !looksLikeJson(line)) ?? ''
+  const flat = picked.replace(/\s+/gu, ' ').slice(0, 180)
+  return flat === '' ? '' : `（${flat}）`
+}
+
+/**
+ * Turn the CLI's output into one actionable sentence plus a stable code.
+ *
+ * `retryable` is decided here rather than at the call site: the vendor's 5xx and
+ * the transient "API key verification service temporarily unavailable" are worth
+ * one silent retry, while a bad model id or a dead login is not.
+ */
+function diagnoseFailure(text) {
   const clean = String(text ?? '').replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, '')
-  const rule = [
-    [/^\s*(?:Error:\s*)?401\b[^\r\n]*(?:authentication|unauthorized|sign in|login)/imu, 'CodeBuddy CLI 登录已失效，请在终端里运行 codebuddy 重新登录'],
-    [/^\s*(?:Error:\s*)?403\b[^\r\n]*(?:forbidden|access denied|permission)/imu, 'CodeBuddy 账号或模型权限不足（403）'],
-    [/^\s*(?:Error:\s*)?429\b[^\r\n]*(?:rate|limit|too many)/imu, 'CodeBuddy 返回频率限制（429）'],
-    [/(?:ECONNRESET|ETIMEDOUT|ENOTFOUND|socket disconnected|TLS)/iu, 'CodeBuddy CLI 网络连接失败'],
+  const rules = [
+    [/^\s*(?:Error:\s*)?401\b[^\r\n]*(?:authentication|unauthorized|sign in|login)/imu,
+      'CodeBuddy CLI 登录已失效，请在终端里运行 codebuddy 重新登录', 'CLI_AUTH', false],
+    [/(?:service_unavailable|API key verification service temporarily unavailable)/iu,
+      'CodeBuddy 服务端暂时不可用（过一会儿再试即可）', 'CLI_UPSTREAM', true],
+    [/^\s*(?:Error:\s*)?50[0234]\b/imu,
+      'CodeBuddy 服务端暂时不可用（过一会儿再试即可）', 'CLI_UPSTREAM', true],
+    [/(?:error_max_turns|max(?:imum)?\s+turns|too many turns)/iu,
+      'CodeBuddy CLI 用尽了本轮的模型轮次（可以在设置里调大 GET_IT_FOR_FREE_CLI_MAX_TURNS）', 'CLI_MAX_TURNS', true],
+    [/(?:service info not found|model not found|invalid model|unsupported model|no such model|model .* does not exist)/iu,
+      '这个模型在当前 CodeBuddy 账号上不可用，请换一个模型', 'CLI_MODEL_UNAVAILABLE', false],
+    [/^\s*(?:Error:\s*)?403\b[^\r\n]*(?:forbidden|access denied|permission)/imu,
+      'CodeBuddy 账号或模型权限不足（403）', 'CLI_FORBIDDEN', false],
+    [/^\s*(?:Error:\s*)?429\b[^\r\n]*(?:rate|limit|too many)/imu,
+      'CodeBuddy 返回频率限制（429）', 'CLI_RATE_LIMIT', true],
+    [/(?:ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket disconnected|TLS|fetch failed)/iu,
+      'CodeBuddy CLI 网络连接失败', 'CLI_NETWORK', true],
   ]
-  return rule.find(([pattern]) => pattern.test(clean))?.[1] ?? 'CodeBuddy CLI 没有返回可用的结果'
+  for (const [pattern, message, code, retryable] of rules) {
+    if (pattern.test(clean)) return { message, code, retryable }
+  }
+  return {
+    message: `CodeBuddy CLI 没有返回可用的结果${briefReason(clean)}`,
+    code: 'CLI_UNKNOWN',
+    retryable: false,
+  }
+}
+
+/** Build an Error that still carries the diagnosis the UI does not show. */
+function cliError(diagnosis) {
+  const error = new Error(diagnosis.message)
+  error.code = diagnosis.code
+  error.retryable = diagnosis.retryable === true
+  return error
+}
+
+/** Keep one failure's evidence on disk; the log rotates at 1 MB. */
+function logFailure(details) {
+  try {
+    const dir = path.join(os.homedir(), '.dsh', 'get-it-for-free')
+    fs.mkdirSync(dir, { recursive: true })
+    const file = path.join(dir, 'cli-failure.log')
+    try {
+      if (fs.statSync(file).size > FAILURE_LOG_MAX_BYTES) fs.renameSync(file, `${file}.1`)
+    } catch {
+      // No log yet, or it is not ours to rotate.
+    }
+    const block = [
+      `--- ${new Date().toISOString()}`,
+      `model=${details.model} account=${details.accountId === '' ? '(auto)' : details.accountId} attempt=${details.attempt}`,
+      `cli=${details.cliPath} exitCode=${details.exitCode} signal=${details.signal ?? ''} durationMs=${details.durationMs} stdoutBytes=${details.stdoutBytes}`,
+      `code=${details.code} message=${details.message}`,
+      `args=${details.args.join(' ').slice(0, 1500)}`,
+      `stderr=${String(details.stderr ?? '').slice(-4000)}`,
+      `stdout=${String(details.stdout ?? '').slice(-2000)}`,
+      '',
+    ].join('\n')
+    fs.appendFileSync(file, block)
+  } catch {
+    // Diagnostics must never be the reason a turn fails.
+  }
+}
+
+/**
+ * Pull the CLI's records out of stdout.
+ *
+ * `--output-format json` prints one array, but a CLI that writes a warning line
+ * before the document (or one record per line) should not turn a good answer into
+ * "没有返回唯一的最终结果" — so try the whole blob, then the line-wise form, then
+ * the outermost bracketed slice.
+ */
+function collectRecords(text) {
+  const source = String(text ?? '').trim()
+  if (source === '') return []
+  const linewise = source.split(/\r?\n/).filter(line => /^[[{]/.test(line.trim())).join(',')
+  const firstBracket = source.search(/[[{]/)
+  const lastBracket = Math.max(source.lastIndexOf(']'), source.lastIndexOf('}'))
+  const candidates = [
+    source,
+    linewise === '' ? undefined : `[${linewise}]`,
+    firstBracket >= 0 && lastBracket > firstBracket ? source.slice(firstBracket, lastBracket + 1) : undefined,
+  ]
+  for (const candidate of candidates) {
+    if (candidate === undefined) continue
+    try {
+      const parsed = JSON.parse(candidate)
+      const rows = Array.isArray(parsed) ? parsed : [parsed]
+      const objects = rows.filter(row => row !== null && typeof row === 'object')
+      if (objects.length > 0) return objects
+    } catch {
+      // Try the next shape.
+    }
+  }
+  return []
 }
 
 /**
@@ -322,23 +565,39 @@ function cliFailure(text) {
  * worse than a clean error, because DSH would execute the half it understood.
  */
 function parseAnswer(stdout, stderr) {
-  let document
-  try {
-    document = JSON.parse(stdout.trim())
-  } catch {
-    throw new Error(cliFailure(`${stderr}\n${stdout}`))
+  const text = String(stdout ?? '').trim()
+  const records = collectRecords(text)
+  if (records.length === 0) {
+    throw cliError(diagnoseFailure(`${stderr}\n${text}`))
   }
-  const records = Array.isArray(document) ? document : [document]
   const finals = records.filter(row => row !== null && typeof row === 'object'
     && (row.type === 'result' || row.structured_output !== undefined))
-  if (finals.length !== 1) throw new Error('CodeBuddy CLI 没有返回唯一的最终结果')
-  const final = finals[0]
+  if (finals.length === 0) {
+    const subtypes = records.map(row => row.subtype ?? row.type).filter(value => typeof value === 'string')
+    throw cliError(diagnoseFailure(`${stderr}\n${subtypes.join(' ')}\n${text.slice(0, 4000)}`))
+  }
+  // Take the last result record: with retries inside one process the CLI may emit
+  // several, and the final one is the answer that matters.
+  const final = finals[finals.length - 1]
   if (final.is_error === true || String(final.subtype ?? '').startsWith('error')) {
-    throw new Error(cliFailure(`${stderr}\n${stdout}`))
+    const detail = typeof final.result === 'string' && final.result !== '' ? final.result : ''
+    throw cliError(diagnoseFailure(`${final.subtype ?? ''}\n${detail}\n${stderr}\n${text.slice(0, 4000)}`))
   }
   const answer = final.structured_output ?? final.result
+  if (typeof answer === 'string') {
+    // A CLI that ignored --json-schema still has a usable answer.
+    const trimmed = answer.trim()
+    if (trimmed === '') throw cliError({ message: 'CodeBuddy CLI 返回了空回复', code: 'CLI_EMPTY', retryable: true })
+    try {
+      const parsed = JSON.parse(trimmed)
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed
+    } catch {
+      // Not JSON: treat it as the text answer.
+    }
+    return { text: answer, toolCalls: [] }
+  }
   if (answer === null || typeof answer !== 'object' || Array.isArray(answer)) {
-    throw new Error('CodeBuddy CLI 返回的结果格式不正确')
+    throw cliError({ message: 'CodeBuddy CLI 返回的结果格式不正确', code: 'CLI_BAD_SHAPE', retryable: false })
   }
   return answer
 }
@@ -382,8 +641,19 @@ function buildPrompt(options, tools) {
  * @param context - `{ cliPath, tools, timeoutMs, token }`.
  * @returns `{ chunks, finish }` — the harness chunk sequence plus a finish reason.
  */
-export async function relayTurn(options, { cliPath, tools = [], timeoutMs = DEFAULT_TIMEOUT_MS, token = '' } = {}) {
+export async function relayTurn(options, {
+  cliPath,
+  tools = [],
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  token = '',
+  maxTurns = DEFAULT_MAX_TURNS,
+  attempts = 2,
+  accountId: hintedAccount = '',
+} = {}) {
   const allowed = new Set(tools.map(tool => tool?.name).filter(name => typeof name === 'string' && name !== ''))
+  const { base, accountId } = splitModelId(options.model)
+  const accountForLog = accountId !== '' ? accountId : hintedAccount
+  const effort = effortFlag(options.reasoningEffort)
   const args = [
     '--print',
     '--output-format', 'json',
@@ -392,20 +662,57 @@ export async function relayTurn(options, { cliPath, tools = [], timeoutMs = DEFA
     '--setting-sources', 'user',
     '--strict-mcp-config',
     '--mcp-config', '{"mcpServers":{}}',
-    '--max-turns', '4',
+    '--max-turns', String(maxTurns),
     '--no-session-persistence',
     '--system-prompt', SYSTEM_PROMPT,
   ]
-  const { base } = splitModelId(options.model)
   if (base !== '') args.push('--model', base)
+  // Only when the composer picked a level: an explicit --effort overrides the
+  // CLI's own default, so sending it unconditionally would silently change how
+  // every turn thinks.
+  if (effort !== '') args.push('--effort', effort)
 
-  const { stdout, stderr } = await runProcess(cliPath, args, {
-    extraEnv: token === '' ? undefined : { CODEBUDDY_AUTH_TOKEN: token },
-    input: buildPrompt(options, tools),
-    timeoutMs,
-    signal: options.signal,
-  })
-  const answer = parseAnswer(stdout, stderr)
+  const prompt = buildPrompt(options, tools)
+  const startedAt = Date.now()
+  let answer
+  let lastError
+  let lastRun = {}
+  for (let attempt = 1; attempt <= Math.max(1, attempts); attempt += 1) {
+    try {
+      lastRun = await runProcess(cliPath, args, {
+        extraEnv: token === '' ? undefined : { CODEBUDDY_AUTH_TOKEN: token },
+        input: prompt,
+        timeoutMs,
+        signal: options.signal,
+      })
+      answer = parseAnswer(lastRun.stdout, lastRun.stderr)
+      lastError = undefined
+      break
+    } catch (error) {
+      lastError = error
+      const diagnosis = { message: String(error?.message ?? error), code: String(error?.code ?? 'CLI_UNKNOWN') }
+      logFailure({
+        model: options.model,
+        accountId: accountForLog,
+        attempt,
+        cliPath,
+        exitCode: lastRun.exitCode,
+        signal: lastRun.signal,
+        durationMs: lastRun.durationMs ?? Date.now() - startedAt,
+        stdoutBytes: lastRun.stdoutBytes,
+        code: diagnosis.code,
+        message: diagnosis.message,
+        args,
+        stderr: lastRun.stderr,
+        stdout: lastRun.stdout,
+      })
+      // One silent retry for the transient classes only: a bad model id or a dead
+      // login would fail identically a second time, just slower.
+      if (error?.retryable !== true || attempt >= Math.max(1, attempts) || options.signal?.aborted === true) break
+      await new Promise(resolve => setTimeout(resolve, 1_200))
+    }
+  }
+  if (lastError !== undefined) throw lastError
 
   const chunks = []
   let index = 0
@@ -431,6 +738,36 @@ export async function relayTurn(options, { cliPath, tools = [], timeoutMs = DEFA
   if (chunks.length === 0) throw new Error('CodeBuddy CLI 返回了空回复')
 
   return { chunks, finish: calls.length > 0 ? { kind: 'tool-calls' } : { kind: 'stop' } }
+}
+
+/**
+ * One minimal turn, run on demand from the settings page.
+ *
+ * The failure this replaces was indistinguishable from "the channel is broken":
+ * one sentence covered a vendor 504, an expired login and a max-turns
+ * exhaustion. A two-character prompt costs seconds and returns the real reason
+ * (plus the exact quote), so the next report is actionable instead of a guess.
+ */
+export async function runSelfTest({ cliPath, token = '', timeoutMs = 90_000 } = {}) {
+  const startedAt = Date.now()
+  try {
+    const { chunks } = await relayTurn(
+      { model: '', messages: [{ role: 'user', content: '只回复两个字符：OK' }], system: '你是一个简洁的助手。', tools: [] },
+      { cliPath, token, timeoutMs, maxTurns: 4, attempts: 1 },
+    )
+    const text = chunks
+      .filter(chunk => chunk.type === 'block-end' && chunk.block?.type === 'text')
+      .map(chunk => chunk.block.text)
+      .join('')
+    return { ok: true, code: 'OK', message: text.slice(0, 200), durationMs: Date.now() - startedAt }
+  } catch (error) {
+    return {
+      ok: false,
+      code: typeof error?.code === 'string' ? error.code : 'CLI_UNKNOWN',
+      message: String(error?.message ?? error),
+      durationMs: Date.now() - startedAt,
+    }
+  }
 }
 
 /**
@@ -484,22 +821,36 @@ export function createCliLane({ logger = console, loadAccounts } = {}) {
     return accounts
   }
 
-  /** One entry per account × model, so the picker shows every quota. */
-  function modelsOf(provider, list) {
-    if (list.length === 0) {
-      return FALLBACK_MODELS.map(model => ({
-        provider,
-        id: model.id,
-        name: model.name,
-        inputModalities: model.vision === true ? ['text', 'image'] : ['text'],
-      }))
-    }
-    return list.flatMap(account => FALLBACK_MODELS.map(model => ({
+  /**
+   * The picker's model list: one entry per model, no account attribution.
+   *
+   * The account is a routing detail, not a choice the user should have to make
+   * (and 「Hy3 · 舟」 in a dropdown is noise). Multiple accounts still all get
+   * used: `streamTurn` picks one per turn. Ids suffixed with an account
+   * (`hy3@buddy-xxxx`) stay valid for sessions saved before this change.
+   */
+  function modelsOf(provider) {
+    return FALLBACK_MODELS.map(model => ({
       provider,
-      id: `${model.id}${ACCOUNT_MARK}${account.id}`,
-      name: `${model.name} · ${account.nickname ?? account.id}`,
+      id: model.id,
+      name: model.name,
       inputModalities: model.vision === true ? ['text', 'image'] : ['text'],
-    })))
+    }))
+  }
+
+  /** Round-robin over the accounts that still have a live token. */
+  let accountCursor = 0
+  function nextAccount(list) {
+    if (list.length === 0) return undefined
+    const now = Date.now()
+    const live = list.filter(row => {
+      const expiresAt = Number(row.expiresAt ?? 0)
+      return expiresAt === 0 || expiresAt > now
+    })
+    const pool = live.length > 0 ? live : list
+    const picked = pool[accountCursor % pool.length]
+    accountCursor = (accountCursor + 1) % 1_000_003
+    return picked
   }
 
   const adapter = {
@@ -530,13 +881,14 @@ export function createCliLane({ logger = console, loadAccounts } = {}) {
       // instead of offering models that cannot answer.
       const cli = await probe()
       if (cli === null) return []
-      return modelsOf(provider, await listAccounts())
+      return modelsOf(provider)
     },
 
     async resolveModel(provider, model) {
       const { base } = splitModelId(model)
       const found = FALLBACK_MODELS.find(row => row.id === base)
       const info = found ?? { id: base === '' ? model : base, name: base === '' ? model : base, contextWindow: 128_000, maxTokens: 32_000, vision: false }
+      const efforts = Array.isArray(info.efforts) ? info.efforts : []
       return {
         provider,
         id: model,
@@ -544,6 +896,12 @@ export function createCliLane({ logger = console, loadAccounts } = {}) {
         inputModalities: info.vision === true ? ['text', 'image'] : ['text'],
         context: { contextWindow: info.contextWindow },
         defaultMaxTokens: info.maxTokens,
+        ...efforts.length === 0 ? {} : {
+          reasoning: {
+            efforts: efforts.map(id => ({ id, name: EFFORT_NAMES[id] ?? id })),
+            ...typeof info.defaultEffort === 'string' && efforts.includes(info.defaultEffort) ? { defaultEffort: info.defaultEffort } : {},
+          },
+        },
       }
     },
 
@@ -573,6 +931,7 @@ export function createCliLane({ logger = console, loadAccounts } = {}) {
     }
     const { accountId } = splitModelId(options.model)
     let token = ''
+    let usedAccount = accountId
     if (accountId !== '') {
       const list = await listAccounts()
       const found = list.find(row => row.id === accountId)
@@ -587,20 +946,32 @@ export function createCliLane({ logger = console, loadAccounts } = {}) {
         return
       }
       token = found.token
+    } else {
+      // No account in the model id: spread turns across every signed-in account
+      // so the lane behaves like one endpoint backed by several quotas. With no
+      // accounts at all, the CLI falls back to its own login.
+      const picked = nextAccount(await listAccounts())
+      if (picked !== undefined) {
+        token = picked.token
+        usedAccount = picked.id
+      }
     }
     try {
       const { chunks, finish } = await relayTurn(options, {
         cliPath: cli.path,
         tools: options.tools ?? [],
         token,
+        accountId: usedAccount,
       })
       for (const chunk of chunks) yield chunk
       yield { type: 'finish', reason: finish }
     } catch (error) {
-      logger.warn?.(`get-it-for-free: CodeBuddy CLI 通道失败（${error?.message ?? error}）`)
+      const code = typeof error?.code === 'string' && error.code !== '' ? error.code : 'CLI_FAILED'
+      const message = String(error?.message ?? error)
+      logger.warn?.(`get-it-for-free: CodeBuddy CLI 通道失败（${code}）${message}（详情见 ~/.dsh/get-it-for-free/cli-failure.log）`)
       yield {
         type: 'finish',
-        reason: { kind: 'error', failure: { message: String(error?.message ?? error), code: 'CLI_FAILED' } },
+        reason: { kind: 'error', failure: { message, code } },
       }
     }
   }
@@ -608,6 +979,15 @@ export function createCliLane({ logger = console, loadAccounts } = {}) {
   return {
     adapter,
     probe,
+    /** Run one minimal turn so the card can show the real reason for a failure. */
+    async selfTest({ timeoutMs = 90_000 } = {}) {
+      const cli = await probe({ force: true })
+      if (cli === null) {
+        return { ok: false, code: 'CLI_NOT_FOUND', message: '没有找到 CodeBuddy CLI', durationMs: 0 }
+      }
+      const account = nextAccount(await listAccounts({ force: true }))
+      return runSelfTest({ cliPath: cli.path, token: account?.token ?? '', timeoutMs })
+    },
     async status({ force = false } = {}) {
       const cli = await probe({ force })
       if (cli === null) {
@@ -620,7 +1000,7 @@ export function createCliLane({ logger = console, loadAccounts } = {}) {
         path: cli.path,
         version: cli.version,
         accounts: list.map(row => ({ id: row.id, nickname: row.nickname ?? row.id, expiresAt: Number(row.expiresAt ?? 0) })),
-        models: modelsOf(CLI_ROUTE, list).map(row => ({ id: row.id, name: row.name })),
+        models: modelsOf(CLI_ROUTE).map(row => ({ id: row.id, name: row.name })),
       }
     },
     dispose() {
