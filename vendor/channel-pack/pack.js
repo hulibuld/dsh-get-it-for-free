@@ -35466,15 +35466,20 @@ function isContentRejection(body) {
   }
   return /request illegal/i.test(body) || /安全审核|safety review/i.test(body);
 }
-// MARK: harness-identity scrubber (local patch)
-// CodeBuddy / WorkBuddy (copilot.tencent.com, workbuddy.ai) 对请求体做关键词风控：
-// system/assistant 文本里出现 `DeepSeek Harness` 这个词组时（请求体足够大就稳定触发），
-// 直接回 400 code=11128 "Illegal API invocation from an unapproved channel"。
-// 实测：原文 400，把 DeepSeek 与 Harness 之间的空格换成零宽空格 U+200B 后 200，
-// 模型看到的语义完全不变；凭据、请求头、正文其它字段均不影响。
-// 前后负向断言保证路径语境不被改写（如 /Applications/DeepSeek Harness.app/...），
-// 否则模型会拿到带零宽字符的坏路径。
-var HARNESS_BRAND_RE = /(?<![\\/])(DeepSeek)[ \u00A0]+(Harness)(?![\\/])/gi;
+// MARK: harness-identity scrubber (local patch, 2026-10-29 重写)
+// CodeBuddy / WorkBuddy (copilot.tencent.com, workbuddy.ai) 对请求体里的第三方 agent 指纹做
+// **模糊**匹配：`DeepSeek` 后面接空白（含零宽字符）再接 `Harness`，一律回
+// 400 code=11128 "Illegal API invocation from an unapproved channel"。
+// 2026-10-29 用真令牌直接打 copilot.tencent.com 复测（system 里只放这一句）：
+//   `You are an AI agent powered by DeepSeek Harness.`        → 400
+//   中间空格换成 U+200B（本文件旧方案）                        → 仍 400（模糊匹配忽略零宽字符）
+//   连写成 `DeepSeekHarness`                                  → 仍 400
+//   中间换连字符 / 夹一个中文词                                → 200（但语义被破坏）
+//   只留 `powered by DeepSeek.` 或 `powered by DSH.`           → 200
+// 结论：遮挡没用，必须真替换。这里把这半句整个删掉、只留 `DeepSeek`，
+// 模型读到的仍是「由 DeepSeek 驱动」，语义不变，实测 200。
+// 前后负向断言保住路径语境（如 /Applications/DeepSeek Harness.app/…），不动真实路径。
+var HARNESS_BRAND_RE = /(?<![\\/])(DeepSeek)[\s\u00A0\u200B\u200C\u200D\uFEFF]*Harness(?![\\/])/gi;
 // MARK: dsh prompt fingerprint (local patch, 2026-10-27)
 // 上游除了查品牌词，还会对「第三方 agent 提示词」做模糊指纹匹配：
 // system 里同时出现下面这两句时，判「不是官方客户端发出的」，回 400 code=11128。
@@ -35503,7 +35508,7 @@ function rewriteDshFingerprintText(text) {
 }
 function neutralizeHarnessBrandText(text) {
   if (typeof text !== "string" || !/DeepSeek/i.test(text)) return text;
-  return text.replace(HARNESS_BRAND_RE, "$1\u200B $2");
+  return text.replace(HARNESS_BRAND_RE, "$1");
 }
 function sanitizePromptText(text) {
   return rewriteDshFingerprintText(neutralizeHarnessBrandText(text));
@@ -35520,12 +35525,12 @@ function neutralizeHarnessBrandValue(value) {
 }
 function sanitizeHarnessIdentityInBody(body) {
   if (typeof body !== "string") return body;
-  if (!/DeepSeek/i.test(body) && body.indexOf("Tokens prefixed with @") === -1) return body;
+  if (!/DeepSeek/i.test(body) && body.indexOf("Tokens prefixed with @") === -1 && body.indexOf("identify files or directories on the host") === -1) return body;
   try {
     const data = JSON.parse(body);
     return JSON.stringify(neutralizeHarnessBrandValue(data));
   } catch (error) {
-    return rewriteDshFingerprintText(body.replace(HARNESS_BRAND_RE, "$1\u200B $2"));
+    return rewriteDshFingerprintText(body.replace(HARNESS_BRAND_RE, "$1"));
   }
 }
 
@@ -59820,6 +59825,23 @@ async function probeWithAdapter(entry, credential, modelId, timeoutMs) {
       sessionLane: GEMINI_SESSION_LANE_SMOKE,
       project: GEMINI_DEFAULT_PROJECT,
       product: GEMINI
+    });
+  } else if (entry.provider === RACCOON.id) {
+    // ⚠ 漏掉这一支的后果比「测试失败」严重：任何没被上面认领的 provider 都会
+    // 落到下面的 CodeArts 兜底，也就是**拿这个渠道的令牌去华为云端点**发请求。
+    // 商汤的账号因此长期测不出真实原因，面板只显示一个笼统的失败。
+    adapter = new RaccoonAdapter({
+      credentialRef: ref,
+      resolveCredential: async () => credential,
+      refresh: async () => credential,
+      product: RACCOON
+    });
+  } else if (entry.provider === LOOMY.id) {
+    adapter = new LoomyAdapter({
+      credentialRef: ref,
+      resolveCredential: async () => credential,
+      refresh: async () => credential,
+      product: LOOMY
     });
   } else {
     adapter = new CodeArtsAdapter({

@@ -3331,11 +3331,22 @@ window.__ModuleLoader__.load({
       // Context wrappers do not invalidate readers; actual transport replacement does.
       // 宿主可能把处理结果再包一层 `{ok, value}`，这里统一剥到底，
       // 让调用方永远拿到 handler 的返回体。
+      // 面板里那句光秃秃的「rpc-failed」什么都说明不了：信封是 {ok:false} 但
+      // error 里既没有 message 也没有 code。把信封的键名带进文案，至少能看出
+      // 是哪一层返回的空错误（渠道包 / 宿主桥 / 浏览器侧 rpc）。
+      const describeEnvelope = value => {
+        try {
+          const keys = value === null || typeof value !== 'object' ? String(value) : Object.keys(value).join(',')
+          return `rpc-failed（{${keys}}${value?.type === undefined ? '' : ` type=${String(value.type)}`}）`
+        } catch {
+          return 'rpc-failed'
+        }
+      }
       const unwrapEnvelope = value => {
         let current = value
         for (let depth = 0; depth < 4; depth++) {
           if (current === null || typeof current !== 'object') return current
-          if (current.ok === false) throw new Error(current.error?.message ?? current.error?.code ?? 'rpc-failed')
+          if (current.ok === false) throw new Error(describeEnvelope(current))
           if (current.ok === true && 'value' in current) { current = current.value; continue }
           if (current.type === 'server-response' && 'value' in current) { current = current.value; continue }
           return current
@@ -3366,10 +3377,10 @@ window.__ModuleLoader__.load({
           lastRaw = `status=${response.status} ${rawText.slice(0, 200)}`
           let body
           try { body = rawText === '' ? {} : JSON.parse(rawText) } catch { body = {} }
-          if (body?.type === 'server-response' && body.ok === false) throw new Error(body.error?.message ?? body.error?.code ?? 'rpc-failed')
+          if (body?.type === 'server-response' && body.ok === false) throw new Error(describeEnvelope(body))
           const inner = body?.value ?? body
           if (inner?.ok === true) return unwrapEnvelope(inner.value)
-          if (inner?.ok === false) throw new Error(inner.error?.message ?? inner.error?.code ?? 'rpc-failed')
+          if (inner?.ok === false) throw new Error(describeEnvelope(inner))
           return inner
         } finally { clearTimeout(timer) }
       }, [])
@@ -3381,7 +3392,7 @@ window.__ModuleLoader__.load({
           if (bridged?.ok === false) throw new Error(bridged.error ?? 'bridge-failed')
           const inner = unwrapEnvelope(bridged?.reply)
           if (inner?.ok === true) { lastTransportKind = 'bridge'; return inner.value }
-          if (inner?.ok === false) throw new Error(inner.error?.message ?? inner.error?.code ?? 'rpc-failed')
+          if (inner?.ok === false) throw new Error(describeEnvelope(inner))
           lastTransportKind = 'bridge'
           return inner
         } catch { /* 桥不通，落到下面的浏览器侧通道 */ }
@@ -3392,7 +3403,7 @@ window.__ModuleLoader__.load({
         try {
           const result = await latest.call.call(latest.connection.rpc, '/api', 'channel-pack', { method, payload }, controller.signal)
           if (result?.ok === true) { lastTransportKind = 'rpc'; return unwrapEnvelope(result.value) }
-          if (result?.ok === false) throw new Error(result.error?.message ?? result.error?.code ?? 'rpc-failed')
+          if (result?.ok === false) throw new Error(describeEnvelope(result))
           lastTransportKind = 'rpc'
           return result
         } catch (error) {
@@ -3425,7 +3436,9 @@ window.__ModuleLoader__.load({
 
     function ChannelCard(props) {
       const { channel, status, rpc, t, onError, onChanged } = props
-      const [open, setOpen] = useState(null)
+      // 账号区默认展开。折叠着的时候，每行账号的「测试 / 刷新 / 停用 / 删除」全被
+      // 藏在里面，用起来就像这个渠道根本没有测试按钮——用户就是这么报的。
+      const [open, setOpen] = useState('accounts')
       const [accounts, setAccounts] = useState(undefined)
       const [models, setModels] = useState(undefined)
       const [credits, setCredits] = useState(undefined)
@@ -3555,6 +3568,15 @@ window.__ModuleLoader__.load({
         const timer = setTimeout(() => { void loadModels() }, 120)
         return () => clearTimeout(timer)
       }, [loadModels])
+
+      // 账号区默认是展开的，所以进页面就得把账号拉一次：只有点折叠开关的那条
+      // 路径会加载账号，光把初始状态设成展开会一直停在占位骨架上。
+      useEffect(() => {
+        if (open !== 'accounts') return
+        if (accounts !== undefined) return
+        void loadAccounts()
+        void loadCredits()
+      }, [open, accounts, loadAccounts, loadCredits])
 
       // 未接入（一条账号都没有）的渠道：模型自动全部关掉。这些模型本来也选不到，
       // 留着只会让「模型」栏里挂一堆还能点的开关，容易让人以为渠道能用。
@@ -3823,8 +3845,11 @@ window.__ModuleLoader__.load({
                       type: 'button', className: 'ofm_minibtn', disabled: busy !== '' || !rpc,
                       onClick: () => accountAction('test:' + row.id, row.id, async () => {
                         const value = await rpc('account.test', { accountId: row.id }, 90_000)
+                        // testAccount 回的字段叫 message；这里原来读 error，于是每次
+                        // 失败都只剩一句没有理由的「操作失败」，把真实原因吞掉了。
+                        const reason = value?.message ?? value?.error ?? ''
                         setNotice(value?.ok === false
-                          ? t('chan.test.failed').replace('{reason}', value?.error ?? '')
+                          ? t('chan.test.failed').replace('{reason}', reason)
                           : t('chan.test.ok').replace('{ms}', String(value?.ms ?? value?.latencyMs ?? '—')))
                       }),
                     }, t('chan.act.test')),

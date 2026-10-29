@@ -1,6 +1,6 @@
 {
   "name": "dsh-get-it-for-free",
-  "version": "2.5.2",
+  "version": "2.5.6",
   "private": false,
   "type": "module",
   "description": "把华为云 CodeArts、腾讯 CodeBuddy / WorkBuddy、Qoder、TRAE、Raccoon、LobsterAI、MiniMax、ZCode、讯飞 Loomy 等免费/签到型账号渠道接入 DeepSeek Harness：账号登录、每日签到、模型池同步、本机用量看板。纯本地运行，无遥测、无自动更新。",

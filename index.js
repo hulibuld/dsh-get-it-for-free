@@ -1889,6 +1889,39 @@ function imageResolver(ctx, logger) {
 /** The fixed failure classes the pool proxy may surface to the client. */
 const POOL_REASONS = new Set(['no-lane', 'gateway-status', 'malformed', 'unreachable'])
 
+/**
+ * Leave one line per panel RPC on disk.
+ *
+ * The settings page can only show what the envelope says, and an envelope with
+ * `{ok:false}` plus an empty `error` renders as the useless word `rpc-failed`.
+ * The interesting part — which envelope it was, and what came back — only exists
+ * here in the host, so it goes to a log instead of nowhere.
+ */
+function noteRpcBridge(method, durationMs, reply, error) {
+  try {
+    const dir = path.join(os.homedir(), '.dsh', 'get-it-for-free')
+    fs.mkdirSync(dir, { recursive: true })
+    const shape = value => {
+      if (value === undefined) return 'undefined'
+      if (value === null) return 'null'
+      if (typeof value !== 'object') return typeof value
+      const keys = Object.keys(value).slice(0, 8).join(',')
+      const ok = value.ok === undefined ? '' : ` ok=${String(value.ok)}`
+      const err = value.error === undefined ? '' : ` error=${JSON.stringify(value.error).slice(0, 200)}`
+      return `{${keys}}${ok}${err}`
+    }
+    const line = [
+      new Date().toISOString(),
+      method,
+      `${durationMs}ms`,
+      error === undefined ? `reply=${shape(reply)}` : `threw=${String(error?.stack ?? error).slice(0, 600)}`,
+    ].join(' | ')
+    fs.appendFileSync(path.join(dir, 'rpc.log'), line + '\n')
+  } catch {
+    // Diagnostics must never break the call itself.
+  }
+}
+
 export function createApiRoutes(deps) {
   return async function handler(req, res) {
     const url = new URL(req.url ?? '/', 'http://localhost')
@@ -1930,10 +1963,15 @@ export function createApiRoutes(deps) {
         if (name === '') return send(400, { error: 'method required' })
         const rpc = deps.connection?.rpc?.call
         if (typeof rpc !== 'function') return send(503, { error: 'connection.rpc unavailable' })
+        const startedAt = Date.now()
         try {
           const reply = await deps.connection.rpc.call('/api', 'channel-pack', { method: name, payload: body?.payload })
+          // 面板报错只有一个「rpc-failed」，看不出是哪一层。这里把每次桥接的
+          // 结果形状记下来：ok/error 是谁返回的、有没有 message，一次点击就能查。
+          noteRpcBridge(name, Date.now() - startedAt, reply, undefined)
           return send(200, { ok: true, reply })
         } catch (error) {
+          noteRpcBridge(name, Date.now() - startedAt, undefined, error)
           return send(502, { ok: false, error: String(error?.message ?? error).slice(0, 300) })
         }
       }
