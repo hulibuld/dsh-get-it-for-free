@@ -1,12 +1,8 @@
-node_modules/
-*.tgz
-.DS_Store
-._*
-*.log
-
 # 由 DSH 上传流程补充
+.DS_Store
 Thumbs.db
 desktop.ini
+node_modules/
 __pycache__/
 *.pyc
 .venv/

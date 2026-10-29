@@ -58625,6 +58625,23 @@ function findDailyCheckinActivity(activities) {
   return activities.find((activity) => activity.type === CODEARTS_DAILY_LOGIN_TYPE);
 }
 async function claimCodeArtsDailyCheckin(credential, fetcher = directFetch) {
+  // 签到必须**永不抛**：抛出去的错在 collectClaimResults 里会被压成一个没有
+  // 上下文的 code:-1，面板只剩「操作失败」。这里把整条流程包起来，任何异常都
+  // 变成一条带原文的 failed 结果，面板和自动签到调度器都读得到原因。
+  try {
+    const outcome = await claimCodeArtsDailyCheckinInner(credential, fetcher);
+    return { ok: outcome.kind === "claimed", status: outcome.kind, ...outcome };
+  } catch (error) {
+    return {
+      kind: "failed",
+      ok: false,
+      status: "failed",
+      code: -1,
+      message: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+async function claimCodeArtsDailyCheckinInner(credential, fetcher = directFetch) {
   const infoResult = await fetchCodeArtsAccountInfoDetailed(credential, fetcher);
   if (!infoResult.ok) {
     return { kind: "failed", code: -1, message: `\u8D26\u6237\u4FE1\u606F\u67E5\u8BE2\u5931\u8D25\uFF1A${infoResult.message}` };
@@ -60995,14 +61012,26 @@ async function collectClaimResults(accounts, product, deps) {
       }
     } catch (error) {
       deps.warn?.(`[channel-pack] credits.claimAll \u8D26\u53F7 ${entry.id} \u5931\u8D25: ${String(error)}`);
+      // 原来这里只留下 code:-1，真实原因没有人读。现在统一成 ok/status/message
+      // 三件套，面板与每日签到调度器读同一套字段。
       outcome = {
         kind: "failed",
-        code: -1,
+        ok: false,
+        status: "failed",
+        code: error?.code ?? -1,
         message: error instanceof Error ? error.message : String(error)
       };
     }
-    outcomes.push(outcome);
-    results.push({ accountId: entry.id, nickname: entry.nickname, outcome });
+    // 每条结果都补齐 ok/status/message：调用方不必再按 kind 猜语义，也不会
+    // 因为某个渠道的 claim 只返回 kind 就把失败原因弄丢。
+    const normalized = {
+      ok: outcome?.kind === "claimed",
+      status: String(outcome?.kind ?? "failed"),
+      message: typeof outcome?.message === "string" ? outcome.message : "",
+      ...outcome
+    };
+    outcomes.push(normalized);
+    results.push({ accountId: entry.id, nickname: entry.nickname, outcome: normalized });
   }
   return { results, summary: computeClaimSummary(outcomes) };
 }

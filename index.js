@@ -30,7 +30,7 @@ import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { externalUrl, openExternal } from './src/open-external.js'
 import { ROUTE_LABELS, ROUTE_MAIN, ROUTE_REGION } from './src/adapter.js'
-import { DATA_DIR_NAME, LEGACY_DATA_DIR_NAME, resolveDshHome, publicModelVisibility, validateModelVisibility, isModelHidden } from './src/store.js'
+import { DATA_DIR_NAME, LEGACY_DATA_DIR_NAME, resolveDshHome, publicModelVisibility, validateModelVisibility, isModelHidden, dayKey } from './src/store.js'
 import { isEacEntry, isKiloEntry } from './src/catalog.js'
 import { STATE } from './src/probe.js'
 import { generateKey, rankLanAddresses, startForwardServer, startLanRelay } from './src/forward.js'
@@ -1194,6 +1194,91 @@ export function apply(ctx, config) {
     // credentials. JSON API and SSE must report the same admission boundary.
     logger.warn?.(`get-it-for-free: ${surface} admission rejected status=${status} source=${source} reason=${reason}`)
   }
+  // ── CodeArts 每日自动签到 ───────────────────────────────────────────────────
+  // 以前这里只有手动 RPC `credits.claimAll`：用户不点，就永远不签到，面板上也
+  // 留不下任何「今天到底试没试、为什么没签上」的痕迹。这一段补两件事：
+  // 调度器按天去重地重试，状态落盘供 UI 只读展示。
+  const CHECKIN_PROVIDER = 'codearts'
+  const CHECKIN_START_HOUR = 8
+  const CHECKIN_INTERVAL_MS = 30 * 60_000
+  const CHECKIN_MAX_ATTEMPTS = 6
+  const CHECKIN_FILE = path.join(os.homedir(), '.dsh', 'get-it-for-free', 'checkin.json')
+
+  function writeCheckinFile(next) {
+    try {
+      fs.mkdirSync(path.dirname(CHECKIN_FILE), { recursive: true })
+      fs.writeFileSync(CHECKIN_FILE, JSON.stringify(next, null, 2))
+    } catch (error) {
+      // 状态写不下去只是面板看不见，不该影响签到本身。
+      logger.warn?.(`get-it-for-free: 签到状态写入失败（${error?.message ?? error}）`)
+    }
+  }
+
+  let checkinInFlight = false
+  let checkinStopped = false
+
+  /** 走和面板按钮同一条桥，签到逻辑只存在 pack 里一份。 */
+  async function runCheckinTick() {
+    if (checkinStopped || checkinInFlight) return
+    if (new Date().getHours() < CHECKIN_START_HOUR) return
+    const today = dayKey()
+    const previous = readCheckinFile()
+    const state = previous.dayKey === today
+      ? previous
+      : { dayKey: today, attempts: 0, lastAt: 0, lastResult: null }
+    if (Number(state.attempts ?? 0) >= CHECKIN_MAX_ATTEMPTS) return
+    const rpc = fenceConnection?.rpc?.call
+    if (typeof rpc !== 'function') return
+    checkinInFlight = true
+    let lastResult
+    try {
+      const reply = await rpc('/api', 'channel-pack', {
+        method: 'credits.claimAll',
+        payload: { provider: CHECKIN_PROVIDER },
+      })
+      const value = reply?.ok === false ? undefined : reply?.value
+      const summary = value?.summary ?? null
+      const results = Array.isArray(value?.results) ? value.results.slice(0, 20) : []
+      lastResult = {
+        ok: Number(summary?.claimed ?? 0) + Number(summary?.alreadyClaimed ?? 0) > 0,
+        reason: results.length === 0 ? 'no-accounts' : '',
+        summary,
+        results,
+        error: reply?.ok === false ? String(reply?.error?.message ?? reply?.error ?? '') : '',
+      }
+    } catch (error) {
+      lastResult = {
+        ok: false,
+        reason: '',
+        summary: null,
+        results: [],
+        error: String(error?.message ?? error).slice(0, 300),
+      }
+    } finally {
+      checkinInFlight = false
+    }
+    // 一个 CodeArts 账号都没有时，六次重试只是白敲上游，直接把这天记为用完。
+    const attempts = lastResult.reason === 'no-accounts'
+      ? CHECKIN_MAX_ATTEMPTS
+      : Number(state.attempts ?? 0) + 1
+    writeCheckinFile({ dayKey: today, attempts, lastAt: Date.now(), lastResult })
+    logger.info?.(`get-it-for-free: 自动签到 ${attempts}/${CHECKIN_MAX_ATTEMPTS} ${lastResult.ok ? 'ok' : 'failed'} ${lastResult.reason === 'no-accounts' ? '(无 CodeArts 账号)' : ''}`)
+  }
+
+  ctx.effect(() => {
+    // 首轮延后到启动稳定之后：启动阶段要抢出口、绑端口、刷目录，签到排在这些
+    // 后面，才不会把一次启动期的网络抖动记成「签到失败」。
+    const first = setTimeout(() => { void runCheckinTick() }, 90_000)
+    first.unref?.()
+    const timer = setInterval(() => { void runCheckinTick() }, CHECKIN_INTERVAL_MS)
+    timer.unref?.()
+    return () => {
+      checkinStopped = true
+      clearTimeout(first)
+      clearInterval(timer)
+    }
+  }, 'get-it-for-free: codearts checkin')
+
   const api = createApiRoutes({
     settings, stats, availability, catalog: () => modelRuntime.catalog, state,
     refreshCatalog, refreshAvailability, syncForward, syncRelay, syncEgress,
@@ -1922,6 +2007,24 @@ function noteRpcBridge(method, durationMs, reply, error) {
   }
 }
 
+/**
+ * 读每日签到的状态文件。面板只读，写入权属于调度器。
+ *
+ * 读失败一律返回空态而不是抛：面板为了看状态而拿到一个 500，比暂时看不到
+ * 状态更糟。文件默认 `<dsh home>/get-it-for-free/checkin.json`。
+ */
+function readCheckinFile() {
+  const empty = { dayKey: '', attempts: 0, lastAt: 0, lastResult: null }
+  try {
+    const file = path.join(os.homedir(), '.dsh', 'get-it-for-free', 'checkin.json')
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+    if (parsed === null || typeof parsed !== 'object') return empty
+    return { ...empty, ...parsed }
+  } catch {
+    return empty
+  }
+}
+
 export function createApiRoutes(deps) {
   return async function handler(req, res) {
     const url = new URL(req.url ?? '/', 'http://localhost')
@@ -1963,6 +2066,11 @@ export function createApiRoutes(deps) {
         if (name === '') return send(400, { error: 'method required' })
         const rpc = deps.connection?.rpc?.call
         if (typeof rpc !== 'function') return send(503, { error: 'connection.rpc unavailable' })
+        // 只读本地状态，不走宿主 RPC 也不打网络：面板要的只是「今天试了几次、
+        // 上次什么结果」。签到本身的写与重试都在调度器里。
+        if (name === 'credits.checkinState') {
+          return send(200, { ok: true, reply: { ok: true, value: readCheckinFile() } })
+        }
         const startedAt = Date.now()
         try {
           const reply = await deps.connection.rpc.call('/api', 'channel-pack', { method: name, payload: body?.payload })
