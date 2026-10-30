@@ -31189,6 +31189,40 @@ function nextUtc8DayStartMs(nowMs = Date.now()) {
 function looksLikeBillingError(text) {
   return /billing\s+daily\s+count\s+exceeded|daily\s+count\s+exceeded|billing_error/i.test(text);
 }
+/**
+ * Qoder 的「这个账号当前用不了这个模型」业务码。
+ *
+ * ⚠️ 与 `BILLING_BUSINESS_CODE = "110"`（当日额度用完）**不是同一个码**。
+ * 112 的错误正文不是人话，而是一段 JSON：`{"pricingUrl":"https://qoder.com.cn/pricing?client=qoder"}`。
+ * 老代码不认它，落进 `SERVER` 分支 —— 于是既不换账号、也不标记额度，
+ * 同一个账号被反复撞墙，用户只看到一坨 JSON。
+ *
+ * 判据只认「码」和「正文里有 pricingUrl」两种，不做模糊猜测。
+ */
+var QODER_PRICING_BUSINESS_CODE = "112";
+function isQoderPricingBusinessCode(code) {
+  return code === QODER_PRICING_BUSINESS_CODE || code === Number(QODER_PRICING_BUSINESS_CODE);
+}
+function looksLikeQoderPricingMessage(text) {
+  return /"pricingUrl"\s*:/u.test(text);
+}
+/**
+ * 把 Qoder 那串「JSON 当错误文案」还原成人话，并把付费页链接留出来。
+ *
+ * 112 的成因官方没有文档，从现场看是两种之一：当日额度用完，或该账号套餐不含
+ * 这个模型——两者对用户的动作是一样的（换账号，或者去升级套餐），所以文案
+ * 不硬断是哪一种。
+ */
+function describeQoderPricingMessage(message) {
+  let pricingUrl = "";
+  try {
+    const parsed = JSON.parse(message);
+    if (parsed !== null && typeof parsed === "object" && typeof parsed.pricingUrl === "string") pricingUrl = parsed.pricingUrl;
+  } catch {
+  }
+  const base = "\u8FD9\u4E2A\u8D26\u53F7\u5F53\u524D\u7528\u4E0D\u4E86\u8BE5\u6A21\u578B\uFF08Qoder \u4E1A\u52A1\u7801 112\uFF1A\u5F53\u65E5\u989D\u5EA6\u7528\u5B8C\uFF0C\u6216\u8D26\u53F7\u5957\u9910\u4E0D\u542B\u8FD9\u4E2A\u6A21\u578B\uFF09";
+  return pricingUrl.length > 0 ? `${base}\uFF1B\u5957\u9910\u4E0E\u989D\u5EA6\u89C1 ${pricingUrl}` : base;
+}
 var QUEUE_MAX_DELAY_MS = 1e4;
 var QUEUE_MAX_ATTEMPTS = 180;
 function readFiniteNumber(value) {
@@ -39224,9 +39258,10 @@ async function* consumeOpenAiSse(response, options, config) {
               }
             );
           }
-          if (isBillingBusinessCode(data.code) || looksLikeBillingError(data.message)) {
+          if (isBillingBusinessCode(data.code) || isQoderPricingBusinessCode(data.code) || looksLikeBillingError(data.message)) {
+            const text = isQoderPricingBusinessCode(data.code) || looksLikeQoderPricingMessage(data.message) ? describeQoderPricingMessage(data.message) : data.message;
             throw new LlmError6(
-              `${label}: ${data.message}`,
+              `${label}: ${text}`,
               "QUOTA_EXCEEDED",
               { ...typeof data.code === "number" ? { status: data.code } : {} }
             );
@@ -39252,8 +39287,9 @@ async function* consumeOpenAiSse(response, options, config) {
                 }
               );
             }
-            if (looksLikeBillingError(data.message)) {
-              throw new LlmError6(`${label}: ${data.message}`, "QUOTA_EXCEEDED", {
+            if (looksLikeBillingError(data.message) || looksLikeQoderPricingMessage(data.message)) {
+              const text = looksLikeQoderPricingMessage(data.message) ? describeQoderPricingMessage(data.message) : data.message;
+              throw new LlmError6(`${label}: ${text}`, "QUOTA_EXCEEDED", {
                 ...status === void 0 ? {} : { status }
               });
             }
