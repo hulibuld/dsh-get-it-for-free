@@ -58712,6 +58712,39 @@ async function fetchCodeArtsOpsActivitiesDetailed(credential, fetcher = directFe
 function findDailyCheckinActivity(activities) {
   return activities.find((activity) => activity.type === CODEARTS_DAILY_LOGIN_TYPE);
 }
+/**
+ * 读 CodeArts 的每日签到状态，形状对齐 WorkBuddy 那套（`todayCheckedIn` /
+ * `todayCredit`），这样设置页的「今日已领 x」徽章对两家是同一条渲染路径。
+ *
+ * 原来 `credits.status` 对 codearts 直接返回 `status: null`，面板上就永远没有
+ * 签到信息——用户抱怨的「好像没有上次签到」就是这里。
+ *
+ * 判据来自活动列表本身：`claimable === false` 且 `status` 落在 CLAIMED_STATUSES
+ * 里，才算今天已领；`claimable === true` 是还没领，徽章不显示。
+ */
+async function fetchCodeArtsCheckinStatus(credential, fetcher = directFetch) {
+  const infoResult = await fetchCodeArtsAccountInfoDetailed(credential, fetcher);
+  if (!infoResult.ok) return null;
+  const info = infoResult.info;
+  if (!info.isCreditPackage) {
+    return { active: false, todayCheckedIn: false, todayCredit: 0 };
+  }
+  const activitiesResult = await fetchCodeArtsOpsActivitiesDetailed(credential, fetcher);
+  if (!activitiesResult.ok) return null;
+  const activity = findDailyCheckinActivity(activitiesResult.activities);
+  if (activity === void 0) {
+    return { active: false, todayCheckedIn: false, todayCredit: 0 };
+  }
+  const claimed = activity.claimable !== true && CLAIMED_STATUSES.includes(activity.status);
+  return {
+    active: true,
+    todayCheckedIn: claimed,
+    todayCredit: claimed && Number.isFinite(activity.amount) ? activity.amount : 0,
+    amount: activity.amount,
+    claimable: activity.claimable === true,
+    campaignStatus: activity.status
+  };
+}
 async function claimCodeArtsDailyCheckin(credential, fetcher = directFetch) {
   // 签到必须**永不抛**：抛出去的错在 collectClaimResults 里会被压成一个没有
   // 上下文的 code:-1，面板只剩「操作失败」。这里把整条流程包起来，任何异常都
@@ -61476,6 +61509,35 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
         const suffix = shortId().toUpperCase();
         const refName = `${provider.toUpperCase()}_ACCOUNT_${suffix}`;
         const product = productById(provider);
+        // Gemini 不走 auth/state 那套（那是 CodeBuddy 系的产品专用接口），它是一条
+        // 标准 OAuth：本地起回调服务器 → 浏览器授权 → 换 token。函数本来就在包里
+        // （startGeminiOAuthFlow），只是从来没接到 RPC 上，所以设置页里连卡片都
+        // 没有。这里把它接进和 codearts 一样的「先建占位账号、后台等结果」流程。
+        if (provider === GEMINI.id) {
+          const ref = credentialRef13(refName);
+          const started = await startGeminiOAuthFlow({});
+          await pool.addAccount({
+            id,
+            provider: GEMINI.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now()
+          });
+          started.result.then(async (credential) => {
+            await ctx.credentials.set(ref, JSON.stringify(credential));
+            await pool.updateAccount(id, {
+              nickname: typeof credential?.email === "string" && credential.email !== "" ? credential.email : id,
+              refreshable: typeof credential?.refresh_token === "string" && credential.refresh_token !== ""
+            });
+          }).catch((error) => {
+            ctx.logger.warn(`[channel-pack] background ${GEMINI.id} login failed for ${id}: ${String(error)}`);
+            void pool.removeAccount(id).catch(() => {
+            });
+          });
+          return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } };
+        }
         if (product !== void 0) {
           let state;
           let authUrl;
@@ -62297,13 +62359,13 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
       case "credits.status": {
         const req = payload;
         if (req.provider === "codearts") {
-          const accounts2 = await pool.listAccounts(req.provider);
-          return {
-            ok: true,
-            value: {
-              accounts: accounts2.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null }))
-            }
-          };
+          const codeartsStatusAccounts = await pool.listAccounts(req.provider);
+          const value = await collectCreditsStatus(codeartsStatusAccounts, void 0, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchStatus: (credential) => fetchCodeArtsCheckinStatus(credential, codeartsFetcher),
+            warn: (msg) => ctx.logger?.warn?.(msg)
+          });
+          return { ok: true, value: { accounts: value } };
         }
         if (req.provider === LOBSTERAI.id) {
           const accounts2 = await pool.listAccounts(req.provider);

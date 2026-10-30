@@ -3264,11 +3264,12 @@ window.__ModuleLoader__.load({
       { id: 'minimax', name: 'MiniMax Code', org: 'MiniMax', accent: '#E4007F', login: 'browser' },
       { id: 'zcode', name: 'ZCode', org: '智谱', accent: '#3B6EF6', login: 'browser' },
       { id: 'loomy', name: 'Loomy', org: '讯飞 · 微信扫码', accent: '#1182E4', login: 'browser' },
+      { id: 'gemini', name: 'Gemini', org: 'Google · Antigravity', accent: '#4285F4', login: 'browser' },
     ]
 
     /** 与现有 RPC 的能力对应：余额、每日领取及独立签到状态分别判断。 */
     const CHANNEL_CREDITS = {
-      codearts: { claim: true },
+      codearts: { claim: true, status: true },
       buddy: { claim: true, status: true },
       workbuddy: {},
       lobsterai: { claim: true },
@@ -3279,6 +3280,7 @@ window.__ModuleLoader__.load({
       raccoon: {},
       minimax: { claim: true, status: true },
       zcode: { claim: true, unit: 'tokens' },
+      gemini: {},
     }
 
     /**
