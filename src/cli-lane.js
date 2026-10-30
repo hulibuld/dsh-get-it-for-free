@@ -104,6 +104,72 @@ const DEFAULT_IDLE_MS = readEnvInt('GET_IT_FOR_FREE_CLI_IDLE_MS', 300_000, 60_00
 const DEFAULT_FIRST_BYTE_MS = readEnvInt('GET_IT_FOR_FREE_CLI_FIRST_BYTE_MS', 180_000, 30_000, 900_000)
 
 /**
+ * How long the CLI may stay silent **after its handshake but before answering**.
+ *
+ * 三种静默是三种病，共用一条预算就必然误判：
+ *   ① 一个字节都没有      —— 进程没起来 / 被自身重试循环占着
+ *   ② 写完握手就再也不吭声 —— 令牌失效、额度耗尽、上游把这台机子拉黑
+ *   ③ 答到一半卡住        —— 真的慢
+ * ② 最容易被漏掉：失效令牌时 CLI 照样立刻写出 init 与 status 两条记录（约
+ * 3.5 KB），随后永久静默。只看字节数会把那 3.5 KB 当成「有进展」，于是等满
+ * 五分钟才报「没有任何输出」，用户拿不到任何能行动的信息。这里给它单独一条
+ * 更短的预算，超时就报「握手完成但没开始回答」。
+ */
+const DEFAULT_HANDSHAKE_MS = readEnvInt('GET_IT_FOR_FREE_CLI_HANDSHAKE_MS', 120_000, 30_000, 900_000)
+
+/**
+ * 「模型开始回答了」的判据：出现了内容类的流记录。
+ *
+ * 有意**不含** `assistant` 与 `result`：失效令牌时 CLI 会写一条
+ * `{"type":"assistant",...}`，正文就是纯文本 `401 Unauthorized`。要是把
+ * assistant 也算「已开答」，那条记录就会把待机判据推进流预算，卡死又要等满
+ * 五分钟（实测 305081 ms，正是这个错）。
+ */
+const CONTENT_RECORD_RE = /"type"\s*:\s*"(?:message_start|message_stop|content_block_start|content_block_delta|content_block_stop|thinking_delta|text_delta)"/u
+
+/** 401 可能只出现在正文里，不一定走 stderr。 */
+const AUTH_ERROR_RE = /\b401\b[^\r\n]{0,60}(?:unauthorized|authentication|sign in|login)/iu
+
+const CLI_NO_FIRST_BYTE = 'CLI_NO_FIRST_BYTE'
+const CLI_HANDSHAKE_STALL = 'CLI_HANDSHAKE_STALL'
+const CLI_STREAM_STALL = 'CLI_STREAM_STALL'
+
+/** 这三种卡死都说明「换一个账号才有希望」，不要拿同一个令牌硬耗。 */
+const STALL_CODES = new Set([CLI_NO_FIRST_BYTE, CLI_HANDSHAKE_STALL, CLI_STREAM_STALL])
+const FAILOVER_CODES = new Set([...STALL_CODES, 'CLI_AUTH'])
+
+/** 换号后把这个账号冷藏这么久，避免紧接着又挑中它。 */
+const ACCOUNT_COOLDOWN_MS = readEnvInt('GET_IT_FOR_FREE_CLI_ACCOUNT_COOLDOWN_MS', 600_000, 60_000, 3_600_000)
+const accountCooldowns = new Map()
+function coolDownAccount(accountId) {
+  if (typeof accountId !== 'string' || accountId === '') return
+  accountCooldowns.set(accountId, Date.now() + ACCOUNT_COOLDOWN_MS)
+}
+function isAccountCoolingDown(accountId) {
+  const until = accountCooldowns.get(accountId)
+  if (until === undefined) return false
+  if (Date.now() >= until) {
+    accountCooldowns.delete(accountId)
+    return false
+  }
+  return true
+}
+
+/**
+ * 看门狗的超时错误。
+ *
+ * `retryable` 在本文件只表示「同一个令牌再试一次值不值」，卡死恰恰最不值：
+ * 上游已经不理这个账号了。翻身的办法是换号，而换号发生在 streamTurn，所以
+ * 这里标 false，由 FAILOVER_CODES 单独驱动换号。
+ */
+function stallError(code, message) {
+  const error = new Error(message)
+  error.code = code
+  error.retryable = false
+  return error
+}
+
+/**
  * How many model turns one invocation may take.
  *
  * The CLI counts *its* turns, not ours: a model that submits StructuredOutput
@@ -272,7 +338,7 @@ export function childPath(env = process.env) {
  * @param args - argument list.
  * @param options - `{ extraEnv, input, timeoutMs, signal }`.
  */
-function runProcess(command, args, { extraEnv, input = '', timeoutMs = DEFAULT_TIMEOUT_MS, idleMs = DEFAULT_IDLE_MS, firstByteMs = DEFAULT_FIRST_BYTE_MS, signal, onStdoutText } = {}) {
+function runProcess(command, args, { extraEnv, input = '', timeoutMs = DEFAULT_TIMEOUT_MS, idleMs = DEFAULT_IDLE_MS, firstByteMs = DEFAULT_FIRST_BYTE_MS, handshakeMs = DEFAULT_HANDSHAKE_MS, signal, onStdoutText } = {}) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted === true) {
       reject(new Error('请求已取消'))
@@ -312,6 +378,22 @@ function runProcess(command, args, { extraEnv, input = '', timeoutMs = DEFAULT_T
     let tailFd
     let tailTimer
     let tailOffset = 0
+    // 见 CONTENT_RECORD_RE 的注释：字节数不等于「开始回答」。
+    let sawContent = false
+    let contentProbe = ''
+    const noteContent = text => {
+      if (sawContent) return
+      contentProbe = (contentProbe + text).slice(-4096)
+      if (AUTH_ERROR_RE.test(contentProbe)) {
+        const error = new Error('CodeBuddy CLI 登录已失效（令牌被上游拒绝，401），请到设置页重新登录这个账号')
+        error.code = 'CLI_AUTH'
+        error.retryable = false
+        kill()
+        finish(error)
+        return
+      }
+      if (CONTENT_RECORD_RE.test(contentProbe)) sawContent = true
+    }
     const wantsTail = typeof onStdoutText === 'function'
     const tailDecoder = wantsTail ? new StringDecoder('utf8') : undefined
     const pump = force => {
@@ -326,7 +408,10 @@ function runProcess(command, args, { extraEnv, input = '', timeoutMs = DEFAULT_T
         if (read <= 0) return
         tailOffset += read
         const text = tailDecoder.write(read === slice.length ? slice : slice.subarray(0, read))
-        if (text !== '') onStdoutText(text)
+        if (text !== '') {
+          noteContent(text)
+          onStdoutText(text)
+        }
       } catch {
         // 文件还没建好或暂时读不到：下一轮再看，绝不因此中断回合。
       }
@@ -425,13 +510,22 @@ function runProcess(command, args, { extraEnv, input = '', timeoutMs = DEFAULT_T
         if (waited < firstByteMs) return
         kill()
         const hint = briefReason(stderr)
-        finish(new Error(`CodeBuddy CLI 在 ${Math.round(firstByteMs / 1000)} 秒内一个字节都没有写出来${hint}`))
+        finish(stallError(CLI_NO_FIRST_BYTE, `CodeBuddy CLI 在 ${Math.round(firstByteMs / 1000)} 秒内一个字节都没有写出来${hint}`))
+        return
+      }
+      // 写出过握手记录、却一条内容记录都没有：上游压根没开始回答。失效令牌
+      // 就是这个形态（3.5 KB 的 init/status 后永久静默），等满五分钟没意义。
+      if (!sawContent) {
+        if (waited < handshakeMs) return
+        kill()
+        const hint = briefReason(stderr)
+        finish(stallError(CLI_HANDSHAKE_STALL, `CodeBuddy CLI 握手完成后 ${Math.round(handshakeMs / 1000)} 秒没有开始回答（已写出 ${lastSeenBytes} 字节）${hint}`))
         return
       }
       if (waited < idleMs) return
       kill()
       const hint = briefReason(stderr)
-      finish(new Error(`CodeBuddy CLI 卡住了：${Math.round(idleMs / 1000)} 秒没有任何输出${hint}`))
+      finish(stallError(CLI_STREAM_STALL, `CodeBuddy CLI 卡住了：${Math.round(idleMs / 1000)} 秒没有任何输出${hint}`))
     }
     idleTimer = setInterval(idleProbe, 5_000)
     idleTimer.unref?.()
@@ -454,6 +548,7 @@ function runProcess(command, args, { extraEnv, input = '', timeoutMs = DEFAULT_T
           return
         }
         stdout += chunk
+        noteContent(chunk)
         if (wantsTail) onStdoutText(chunk)
       })
     }
@@ -730,6 +825,8 @@ function diagnoseFailure(text) {
   const rules = [
     [/^\s*(?:Error:\s*)?401\b[^\r\n]*(?:authentication|unauthorized|sign in|login)/imu,
       'CodeBuddy CLI 登录已失效，请在终端里运行 codebuddy 重新登录', 'CLI_AUTH', false],
+    [AUTH_ERROR_RE,
+      'CodeBuddy CLI 登录已失效（令牌被上游拒绝，401），请到设置页重新登录这个账号', 'CLI_AUTH', false],
     [/(?:service_unavailable|API key verification service temporarily unavailable)/iu,
       'CodeBuddy 服务端暂时不可用（过一会儿再试即可）', 'CLI_UPSTREAM', true],
     [/^\s*(?:Error:\s*)?50[0234]\b/imu,
@@ -1308,30 +1405,59 @@ export function createCliLane({ logger = console, loadAccounts } = {}) {
       // No account in the model id: spread turns across every signed-in account
       // so the lane behaves like one endpoint backed by several quotas. With no
       // accounts at all, the CLI falls back to its own login.
-      const picked = nextAccount(await listAccounts())
+      const all = await listAccounts()
+      const fresh = all.filter(row => !isAccountCoolingDown(row.id))
+      const picked = nextAccount(fresh.length > 0 ? fresh : all)
       if (picked !== undefined) {
         token = picked.token
         usedAccount = picked.id
       }
     }
-    try {
-      // 边跑边 yield：思考增量在生成过程中就送到界面上，不用等整轮结束。
-      for await (const chunk of relayTurnStream(options, {
-        cliPath: cli.path,
-        tools: options.tools ?? [],
-        token,
-        accountId: usedAccount,
-      })) {
-        yield chunk
+    // 一个账号卡死或登录失效，不代表这个通道坏了：换一个账号往往立刻就好。
+    // 所以这里不是一个 try，而是一个换号循环。
+    const tried = new Set()
+    let emittedAny = false
+    for (;;) {
+      if (usedAccount !== '') tried.add(usedAccount)
+      let failure
+      try {
+        // 边跑边 yield：思考增量在生成过程中就送到界面上，不用等整轮结束。
+        for await (const chunk of relayTurnStream(options, {
+          cliPath: cli.path,
+          tools: options.tools ?? [],
+          token,
+          accountId: usedAccount,
+        })) {
+          if (chunk?.type !== 'finish') emittedAny = true
+          yield chunk
+        }
+        return
+      } catch (error) {
+        const code = typeof error?.code === 'string' && error.code !== '' ? error.code : 'CLI_FAILED'
+        const message = String(error?.message ?? error)
+        logger.warn?.(`get-it-for-free: CodeBuddy CLI 通道失败（${code}）${message}（详情见 ~/.dsh/get-it-for-free/cli-failure.log）`)
+        if (!FAILOVER_CODES.has(code)) {
+          yield { type: 'finish', reason: { kind: 'error', failure: { message, code } } }
+          return
+        }
+        if (usedAccount !== '') coolDownAccount(usedAccount)
+        failure = { message, code }
       }
-    } catch (error) {
-      const code = typeof error?.code === 'string' && error.code !== '' ? error.code : 'CLI_FAILED'
-      const message = String(error?.message ?? error)
-      logger.warn?.(`get-it-for-free: CodeBuddy CLI 通道失败（${code}）${message}（详情见 ~/.dsh/get-it-for-free/cli-failure.log）`)
-      yield {
-        type: 'finish',
-        reason: { kind: 'error', failure: { message, code } },
+      // 已经发出过块就不能重来（块收不回来，界面会重复）。显式指定了账号的
+      // 也不换号——用户就是点名要这个账号，换掉会让人更困惑。
+      if (emittedAny || accountId !== '' || options.signal?.aborted === true) {
+        yield { type: 'finish', reason: { kind: 'error', failure } }
+        return
       }
+      const next = nextAccount(
+        (await listAccounts()).filter(row => !tried.has(row.id) && !isAccountCoolingDown(row.id))
+      )
+      if (next === undefined) {
+        yield { type: 'finish', reason: { kind: 'error', failure } }
+        return
+      }
+      token = next.token
+      usedAccount = next.id
     }
   }
 

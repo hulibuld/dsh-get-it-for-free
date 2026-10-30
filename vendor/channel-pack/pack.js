@@ -30843,8 +30843,20 @@ var AccountPool = class {
       return resetAt === void 0 || resetAt === 0 || Date.now() >= resetAt;
     });
     if (candidates.length === 0) return null;
+    // 按用量轮换：各平台额度按账号算，原来「数组顺序 = 优先级」会让第一个账号
+    // 总先被榨干，用户看到的就是「刚用一天就限流」。改成按最近 7 天 token 消耗
+    // 升序，用得最少的先上；没有记录的新号给 -1 排最前（额度是满的）。
+    // 排序稳定：用量相同（含都无记录）时保留原数组顺序，用户拖拽仍是 tie-breaker。
+    const usageOf = (entry) => {
+      const used = ledgerUsageForAccount(entry.id, 7);
+      return used === void 0 ? -1 : used;
+    };
+    const ranked = candidates
+      .map((entry, index) => ({ entry, index, used: usageOf(entry) }))
+      .sort((a, b) => (a.used - b.used) || (a.index - b.index))
+      .map((row) => row.entry);
     const failures = [];
-    for (const entry of candidates) {
+    for (const entry of ranked) {
       let resolved;
       try {
         resolved = await this.ctx.credentials.resolve(credentialRef(entry.credentialRef));
@@ -32802,6 +32814,40 @@ function utc8DayKey(ts) {
   const month = String(shifted.getUTCMonth() + 1).padStart(2, "0");
   const day2 = String(shifted.getUTCDate()).padStart(2, "0");
   return `${shifted.getUTCFullYear()}-${month}-${day2}`;
+}
+/**
+ * 某个账号在最近 N 天花掉的 token（输入 + 输出）。
+ *
+ * 自动选号要按「谁用得少」排就得有这个。直接从落盘日聚合表现算、不缓存：
+ * 账本每天在变，缓存只会让「面板显示的」和「选号用的」变成两份数。
+ * 返回 undefined 表示窗口内没有记录，与「记录为 0」区分开——新号该优先用。
+ */
+function ledgerUsageForAccount(accountId, sinceDays = 7) {
+  if (typeof accountId !== "string" || accountId === "") return void 0;
+  try {
+    const days = readTokenLedgerDayMap();
+    if (!(days instanceof Map) || days.size === 0) return void 0;
+    const cutoff = Date.now() - sinceDays * 24 * 60 * 60 * 1e3;
+    let total = 0;
+    let seen = false;
+    for (const [day2, buckets] of days) {
+      const dayStart = Date.parse(`${day2}T00:00:00Z`);
+      if (Number.isFinite(dayStart) && dayStart < cutoff) continue;
+      if (!(buckets instanceof Map)) continue;
+      for (const [key, bucket] of buckets) {
+        // 桶键形态：`channel|provider|accountId|model`
+        const parts = String(key).split("|");
+        if (parts.length < 4) continue;
+        if (parts[2] !== accountId) continue;
+        seen = true;
+        total += (Number(bucket.inputTokens) || 0) + (Number(bucket.outputTokens) || 0);
+      }
+    }
+    return seen ? total : void 0;
+  } catch {
+    // 账本读不出来只影响排序偏好，绝不能让它拦下选号。
+    return void 0;
+  }
 }
 function clampCount(value) {
   const n = Number(value);
@@ -43493,9 +43539,17 @@ var LoomyAdapter = class extends LlmAdapter7 {
         }
         return;
       } catch (error) {
-        if (options.signal?.aborted || !(error instanceof LlmError10) || error.code !== "QUOTA_EXCEEDED") throw error;
+        // ⚠️ 429 也要换号。原实现只认 QUOTA_EXCEEDED（402 积分不足），而上游限流
+        // 绝大多数时候回的是 429，被 httpErrorCode4 归成 RATE_LIMIT 后直接抛出去
+        // —— 三个账号里一个被限流，整条通道就报 rate limited，另外两个有额度却闲着。
+        // 这与「刚用一天就限流」是同一个病：额度按账号算，却从不把请求摊过去。
+        const failoverable = error instanceof LlmError10 && (error.code === "QUOTA_EXCEEDED" || error.code === "RATE_LIMIT");
+        if (options.signal?.aborted || !failoverable) throw error;
         if (accountId) {
-          await this.options.accountPool?.updateModelRateLimit(accountId, options.model, nextUtc8DayStartMs());
+          // 积分耗尽按天记账；429 是短时窗口限流，只压 60 秒（按天封禁要白等次日零点）。
+          // updateModelRateLimit 取「更长者」，短冷却不会覆盖真实日额度标记。
+          const resetAt = error.code === "QUOTA_EXCEEDED" ? nextUtc8DayStartMs() : Date.now() + 6e4;
+          await this.options.accountPool?.updateModelRateLimit(accountId, options.model, resetAt);
         }
         if (emitted || attempt === 2 || this.options.nextAccount === void 0) throw error;
         const next = await this.options.nextAccount(options.model, tried);
@@ -43982,9 +44036,17 @@ var RaccoonAdapter = class extends LlmAdapter8 {
         }
         return;
       } catch (error) {
-        if (options.signal?.aborted || !(error instanceof LlmError11) || error.code !== "QUOTA_EXCEEDED") throw error;
+        // ⚠️ 429 也要换号。原实现只认 QUOTA_EXCEEDED（402 积分不足），而上游限流
+        // 绝大多数时候回的是 429，被 httpErrorCode4 归成 RATE_LIMIT 后直接抛出去
+        // —— 三个账号里一个被限流，整条通道就报 rate limited，另外两个有额度却闲着。
+        // 这与「刚用一天就限流」是同一个病：额度按账号算，却从不把请求摊过去。
+        const failoverable = error instanceof LlmError11 && (error.code === "QUOTA_EXCEEDED" || error.code === "RATE_LIMIT");
+        if (options.signal?.aborted || !failoverable) throw error;
         if (accountId) {
-          await this.options.accountPool?.updateModelRateLimit(accountId, options.model, nextUtc8DayStartMs());
+          // 积分耗尽按天记账；429 是短时窗口限流，只压 60 秒（按天封禁要白等次日零点）。
+          // updateModelRateLimit 取「更长者」，短冷却不会覆盖真实日额度标记。
+          const resetAt = error.code === "QUOTA_EXCEEDED" ? nextUtc8DayStartMs() : Date.now() + 6e4;
+          await this.options.accountPool?.updateModelRateLimit(accountId, options.model, resetAt);
         }
         if (emitted || attempt === 2 || this.options.nextAccount === void 0) throw error;
         const next = await this.options.nextAccount(options.model, tried);
@@ -57258,6 +57320,13 @@ function newGeminiRequestId(nowMs = Date.now()) {
   return `agent/${nowMs}/${randomBytes8(4).toString("hex")}`;
 }
 var GEMINI_UPSTREAM_FLASH = "gemini-3.8-flash";
+// Pro 档。上游 model id 可用环境变量覆盖：不同账号/项目拿到的 Pro 名称可能不同，
+// 写死一个值在换号后会整条通道 404。要改就设 GET_IT_FOR_FREE_GEMINI_PRO_MODEL。
+var GEMINI_UPSTREAM_PRO = typeof process !== "undefined" && typeof process.env?.GET_IT_FOR_FREE_GEMINI_PRO_MODEL === "string" && process.env.GET_IT_FOR_FREE_GEMINI_PRO_MODEL.trim() !== "" ? process.env.GET_IT_FOR_FREE_GEMINI_PRO_MODEL.trim() : "gemini-3.8-pro";
+// Argon 档（Gemini 4）。同样允许用环境变量覆盖上游 id。
+var GEMINI_UPSTREAM_ARGON = typeof process !== "undefined" && typeof process.env?.GET_IT_FOR_FREE_GEMINI_ARGON_MODEL === "string" && process.env.GET_IT_FOR_FREE_GEMINI_ARGON_MODEL.trim() !== "" ? process.env.GET_IT_FOR_FREE_GEMINI_ARGON_MODEL.trim() : "gemini-4-argon";
+// 受支持的 canonical 模型集合。以后再加档位只需这里塞一个 id，再加下面目录一条。
+var GEMINI_SUPPORTED_MODELS = /* @__PURE__ */ new Set([GEMINI_UPSTREAM_FLASH, GEMINI_UPSTREAM_PRO, GEMINI_UPSTREAM_ARGON]);
 var GEMINI_BUDGET_LOW = 1e3;
 var GEMINI_BUDGET_MEDIUM = 4e3;
 var GEMINI_BUDGET_HIGH = 1e4;
@@ -57276,6 +57345,24 @@ var GEMINI_FALLBACK_MODELS = [
   {
     id: GEMINI_UPSTREAM_FLASH,
     name: "Gemini 3.8 Flash",
+    contextWindow: GEMINI_CONTEXT_WINDOW,
+    maxTokens: GEMINI.maxOutputTokens,
+    supportsImage: true,
+    effortOptions: GEMINI_EFFORT_IDS,
+    defaultEffort: GEMINI_DEFAULT_EFFORT
+  },
+  {
+    id: GEMINI_UPSTREAM_PRO,
+    name: "Gemini 3.8 Pro",
+    contextWindow: GEMINI_CONTEXT_WINDOW,
+    maxTokens: GEMINI.maxOutputTokens,
+    supportsImage: true,
+    effortOptions: GEMINI_EFFORT_IDS,
+    defaultEffort: GEMINI_DEFAULT_EFFORT
+  },
+  {
+    id: GEMINI_UPSTREAM_ARGON,
+    name: "Gemini 4 Argon",
     contextWindow: GEMINI_CONTEXT_WINDOW,
     maxTokens: GEMINI.maxOutputTokens,
     supportsImage: true,
@@ -57305,9 +57392,10 @@ function geminiCanonicalModelId(modelId) {
   return modelId;
 }
 function geminiModelSpec(modelId, effort) {
-  if (geminiCanonicalModelId(modelId) !== GEMINI_UPSTREAM_FLASH) {
+  const canonical = geminiCanonicalModelId(modelId);
+  if (!GEMINI_SUPPORTED_MODELS.has(canonical)) {
     throw new LlmError14(
-      `gemini: \u6A21\u578B "${modelId}" \u4E0D\u5728\u672C provider \u76EE\u5F55\u4E2D\uFF08\u4EC5\u652F\u6301 ${GEMINI_UPSTREAM_FLASH}\uFF09`,
+      `gemini: \u6A21\u578B "${modelId}" \u4E0D\u5728\u672C provider \u76EE\u5F55\u4E2D\uFF08\u4EC5\u652F\u6301 ${[...GEMINI_SUPPORTED_MODELS].join(", ")}\uFF09`,
       "INVALID_REQUEST",
       // ⚠️ `status` 只落在 `LlmError.failure`（不是顶层属性），且网关的
       // `failureToOpenAiError` 两处都要读 —— 见 `openai-gateway/stream.ts`。
@@ -57316,7 +57404,7 @@ function geminiModelSpec(modelId, effort) {
   }
   const tier = geminiEffortToTier(effort);
   return {
-    upstream: `${GEMINI_UPSTREAM_FLASH}-${tier}`,
+    upstream: `${canonical}-${tier}`,
     tier,
     thinkingBudget: geminiThinkingBudget(tier),
     includeThoughts: true
@@ -59534,7 +59622,7 @@ var GeminiAdapter = class extends LlmAdapter10 {
     const entry = this.loadModels().find((item) => item.id === geminiCanonicalModelId(options.model));
     if (entry === void 0) {
       throw new LlmError15(
-        `gemini: \u6A21\u578B "${options.model}" \u4E0D\u5728\u672C provider \u76EE\u5F55\u4E2D\uFF08\u4EC5\u652F\u6301 ${GEMINI_UPSTREAM_FLASH}\uFF09`,
+        `gemini: \u6A21\u578B "${options.model}" \u4E0D\u5728\u672C provider \u76EE\u5F55\u4E2D\uFF08\u4EC5\u652F\u6301 ${[...GEMINI_SUPPORTED_MODELS].join(", ")}\uFF09`,
         "INVALID_REQUEST",
         // 模型名写错是确定性失败：带上 404，网关才不会把它当 502 让客户端白重试。
         { status: 404 }
