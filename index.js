@@ -1194,11 +1194,17 @@ export function apply(ctx, config) {
     // credentials. JSON API and SSE must report the same admission boundary.
     logger.warn?.(`get-it-for-free: ${surface} admission rejected status=${status} source=${source} reason=${reason}`)
   }
-  // ── CodeArts 每日自动签到 ───────────────────────────────────────────────────
+  // ── 每日自动签到（所有支持签到的渠道） ─────────────────────────────────────
   // 以前这里只有手动 RPC `credits.claimAll`：用户不点，就永远不签到，面板上也
-  // 留不下任何「今天到底试没试、为什么没签上」的痕迹。这一段补两件事：
-  // 调度器按天去重地重试，状态落盘供 UI 只读展示。
-  const CHECKIN_PROVIDER = 'codearts'
+  // 留不下任何「今天到底试没试、为什么没签上」的痕迹。
+  //
+  // 3.0.6 起从「只管 CodeArts」扩成「所有支持签到的渠道都签」：每个渠道各记各的
+  // 次数与结果，互不牵连——某个渠道一直失败，不该拖住其它渠道当天那一次。
+  const CHECKIN_PROVIDERS = ['codearts', 'qodercn', 'trae', 'lobsterai', 'loomy', 'zcode', 'minimax']
+  const CHECKIN_LABELS = {
+    codearts: 'CodeArts', qodercn: 'Qoder', trae: 'TRAE',
+    lobsterai: 'LobsterAI', loomy: 'Loomy', zcode: 'ZCode', minimax: 'MiniMax',
+  }
   const CHECKIN_START_HOUR = 8
   const CHECKIN_INTERVAL_MS = 30 * 60_000
   const CHECKIN_MAX_ATTEMPTS = 6
@@ -1217,29 +1223,19 @@ export function apply(ctx, config) {
   let checkinInFlight = false
   let checkinStopped = false
 
+  const emptyCheckinEntry = () => ({ attempts: 0, lastAt: 0, lastResult: null })
+
   /** 走和面板按钮同一条桥，签到逻辑只存在 pack 里一份。 */
-  async function runCheckinTick() {
-    if (checkinStopped || checkinInFlight) return
-    if (new Date().getHours() < CHECKIN_START_HOUR) return
-    const today = dayKey()
-    const previous = readCheckinFile()
-    const state = previous.dayKey === today
-      ? previous
-      : { dayKey: today, attempts: 0, lastAt: 0, lastResult: null }
-    if (Number(state.attempts ?? 0) >= CHECKIN_MAX_ATTEMPTS) return
-    const rpc = fenceConnection?.rpc?.call
-    if (typeof rpc !== 'function') return
-    checkinInFlight = true
-    let lastResult
+  async function claimProvider(rpc, provider) {
     try {
       const reply = await rpc('/api', 'channel-pack', {
         method: 'credits.claimAll',
-        payload: { provider: CHECKIN_PROVIDER },
+        payload: { provider },
       })
       const value = reply?.ok === false ? undefined : reply?.value
       const summary = value?.summary ?? null
       const results = Array.isArray(value?.results) ? value.results.slice(0, 20) : []
-      lastResult = {
+      return {
         ok: Number(summary?.claimed ?? 0) + Number(summary?.alreadyClaimed ?? 0) > 0,
         reason: results.length === 0 ? 'no-accounts' : '',
         summary,
@@ -1247,22 +1243,68 @@ export function apply(ctx, config) {
         error: reply?.ok === false ? String(reply?.error?.message ?? reply?.error ?? '') : '',
       }
     } catch (error) {
-      lastResult = {
+      return {
         ok: false,
         reason: '',
         summary: null,
         results: [],
         error: String(error?.message ?? error).slice(0, 300),
       }
+    }
+  }
+
+  async function runCheckinTick() {
+    if (checkinStopped || checkinInFlight) return
+    if (new Date().getHours() < CHECKIN_START_HOUR) return
+    const rpc = fenceConnection?.rpc?.call
+    if (typeof rpc !== 'function') return
+    const today = dayKey()
+    const previous = readCheckinFile()
+    const sameDay = previous.dayKey === today
+    const known = sameDay && previous.providers !== null && typeof previous.providers === 'object'
+      ? { ...previous.providers }
+      : {}
+    // 兼容 3.0.5 之前的扁平格式（那一天只记了 CodeArts 一条）。
+    if (!sameDay || Object.keys(known).length === 0) {
+      known.codearts = Object.assign(
+        emptyCheckinEntry(),
+        sameDay ? { attempts: previous.attempts ?? 0, lastAt: previous.lastAt ?? 0, lastResult: previous.lastResult ?? null } : {},
+      )
+    }
+    const pending = CHECKIN_PROVIDERS.filter(
+      (provider) => Number(known[provider]?.attempts ?? 0) < CHECKIN_MAX_ATTEMPTS,
+    )
+    if (pending.length === 0) return
+    checkinInFlight = true
+    try {
+      for (const provider of pending) {
+        if (checkinStopped) break
+        const entry = known[provider] ?? emptyCheckinEntry()
+        const lastResult = await claimProvider(rpc, provider)
+        // 签上了（含「今天已经签过」）就没必要再敲：把这天记为用完。
+        // 一个账号都没有时同理，六次重试只是白敲上游。
+        const attempts = lastResult.ok === true || lastResult.reason === 'no-accounts'
+          ? CHECKIN_MAX_ATTEMPTS
+          : Number(entry.attempts ?? 0) + 1
+        known[provider] = { attempts, lastAt: Date.now(), lastResult }
+        logger.info?.(
+          `get-it-for-free: 自动签到 ${CHECKIN_LABELS[provider] ?? provider} ${attempts}/${CHECKIN_MAX_ATTEMPTS} ${lastResult.ok ? 'ok' : 'failed'}${lastResult.reason === 'no-accounts' ? '（无账号）' : ''}`,
+        )
+      }
     } finally {
       checkinInFlight = false
     }
-    // 一个 CodeArts 账号都没有时，六次重试只是白敲上游，直接把这天记为用完。
-    const attempts = lastResult.reason === 'no-accounts'
-      ? CHECKIN_MAX_ATTEMPTS
-      : Number(state.attempts ?? 0) + 1
-    writeCheckinFile({ dayKey: today, attempts, lastAt: Date.now(), lastResult })
-    logger.info?.(`get-it-for-free: 自动签到 ${attempts}/${CHECKIN_MAX_ATTEMPTS} ${lastResult.ok ? 'ok' : 'failed'} ${lastResult.reason === 'no-accounts' ? '(无 CodeArts 账号)' : ''}`)
+    const entries = Object.values(known).filter(
+      (entry) => entry !== null && typeof entry === 'object',
+    )
+    writeCheckinFile({
+      dayKey: today,
+      providers: known,
+      // 扁平字段保留给还不认识 providers 的旧面板/旧脚本。
+      attempts: entries.reduce((max, entry) => Math.max(max, Number(entry.attempts ?? 0)), 0),
+      lastAt: Date.now(),
+      lastResult: known[CHECKIN_PROVIDERS[0]]?.lastResult ?? null,
+    })
   }
 
   ctx.effect(() => {
@@ -1277,7 +1319,7 @@ export function apply(ctx, config) {
       clearTimeout(first)
       clearInterval(timer)
     }
-  }, 'get-it-for-free: codearts checkin')
+  }, 'get-it-for-free: daily checkin')
 
   const api = createApiRoutes({
     settings, stats, availability, catalog: () => modelRuntime.catalog, state,
