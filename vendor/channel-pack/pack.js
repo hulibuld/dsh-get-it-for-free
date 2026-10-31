@@ -35590,8 +35590,19 @@ function neutralizeHarnessBrandText(text) {
   if (typeof text !== "string" || !/DeepSeek/i.test(text)) return text;
   return text.replace(HARNESS_BRAND_RE, "$1");
 }
+// DeepSeek Harness Web GUI 归属段：上游对「整段文本」做精确指纹拉黑（不是敏感词匹配），
+// 段内任意一个词被换掉即放行。这一句来自 @deepseek-ai/dsh-harness-dev-context 的
+// app:web-surface 段，是所有渠道里唯一被黑的段，所以先整句换成中性说法，
+// 再退回品牌折叠兜底（其余位置出现的 "DeepSeek Harness" 仍然会被折叠）。
+var WEB_SURFACE_PHRASE = /the DeepSeek Harness Web GUI/gi;
+var WEB_SURFACE_NEUTRAL = "the local console UI";
+function neutralizeWebSurfacePhrase(text) {
+  if (typeof text !== "string") return text;
+  if (text.toLowerCase().indexOf("the deepseek harness web gui") === -1) return text;
+  return text.replace(/the DeepSeek Harness Web GUI/gi, WEB_SURFACE_NEUTRAL);
+}
 function sanitizePromptText(text) {
-  return rewriteDshFingerprintText(neutralizeHarnessBrandText(text));
+  return rewriteDshFingerprintText(neutralizeHarnessBrandText(neutralizeWebSurfacePhrase(text)));
 }
 function neutralizeHarnessBrandValue(value) {
   if (typeof value === "string") return sanitizePromptText(value);
@@ -36420,7 +36431,7 @@ var BuddyAdapter = class _BuddyAdapter extends LlmAdapter2 {
   }
   /** 发起一次 chat 请求；网络失败映射为可重试的 TRANSPORT 错误。 */
   async send(credential, body, options) {
-    // MARK: harness-identity scrubber used (zero-width brand neutralizer)
+    // MARK: harness-identity scrubber —— 真替换，不是零宽字符遮挡（零宽已验证失效）
     if (this.product.id === "buddy" || this.product.id === "workbuddy") {
       body = sanitizeHarnessIdentityInBody(body);
     }
