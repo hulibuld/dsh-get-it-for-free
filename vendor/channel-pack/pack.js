@@ -58146,6 +58146,61 @@ async function claimQoderDailyCheckin(credential, product, fetcher = fetch, nowM
   return { kind: "already-claimed", message: "\u4ECA\u5929\u5DF2\u9886\u53D6", ...stale };
 }
 
+
+async function fetchQoderCheckinStatus(credential, product, fetcher = fetch, nowMs = Date.now()) {
+  const parsed = await loadCampaigns(credential, product, fetcher);
+  if (parsed === void 0) return null;
+  const benefits = parsed.campaigns.filter((c) => c.actionType === "CLAIM_BENEFIT");
+  if (benefits.length === 0) return { active: false, todayCheckedIn: false, todayCredit: 0 };
+  const refreshed = hasQoderCampaignRefreshedToday(nowMs);
+  const claimed = benefits.every((c) => c.claimStatus === "CLAIMED");
+  const credit = benefits.reduce((sum, c) => sum + (Number.isFinite(c.amount) ? c.amount : 0), 0);
+  return {
+    active: true,
+    todayCheckedIn: claimed && refreshed,
+    todayCredit: claimed && refreshed ? credit : 0,
+    claimable: !claimed,
+    campaignStatus: benefits.map((c) => c.claimStatus).join(",")
+  };
+}
+async function fetchLobsteraiCheckinStatus(credential, product, clientVersion, fetcher = fetch) {
+  const slot = await fetchLobsteraiActivitySlot(credential, product, clientVersion, fetcher);
+  if (slot === null) return null;
+  if (slot.slotState !== "available" || slot.activityCode.length === 0) {
+    return { active: false, todayCheckedIn: false, todayCredit: 0, slotState: slot.slotState };
+  }
+  const context = await fetchLobsteraiActivityContext(credential, product, slot, fetcher);
+  if (context === null) return null;
+  return {
+    active: true,
+    todayCheckedIn: context.claimedToday === true,
+    todayCredit: 0,
+    claimable: context.claimedToday !== true,
+    slotState: slot.slotState
+  };
+}
+async function fetchLoomyCheckinStatus(credential, product, fetcher = fetch) {
+  const detail = await fetchLoomyCreditDetail(credential, product, fetcher);
+  if (detail === null) return null;
+  const utc8 = new Date(Date.now() + 8 * 36e5);
+  const today = utc8.getUTCFullYear() + "-" + String(utc8.getUTCMonth() + 1).padStart(2, "0") + "-" + String(utc8.getUTCDate()).padStart(2, "0");
+  const cycle = typeof detail.dailyCycleDate === "string" ? detail.dailyCycleDate : "";
+  const claimedToday = cycle.length > 0 && cycle.startsWith(today);
+  return {
+    active: true,
+    todayCheckedIn: claimedToday,
+    todayCredit: claimedToday ? detail.daily : 0,
+    claimable: !claimedToday,
+    dailyCycleDate: cycle
+  };
+}
+async function fetchZcodeCheckinStatus(credential, fetcher = fetch) {
+  await reportZcodeActivation(credential, fetcher);
+  const plans = await fetchZcodeClaimablePlans(credential, fetcher);
+  if (!Array.isArray(plans)) return null;
+  return { active: true, todayCheckedIn: plans.length === 0, todayCredit: 0, claimable: plans.length > 0, planCount: plans.length };
+}
+
 // vendor/channel-pack/src/cline-credits.ts
 var CLINE_CREDITS_TIMEOUT_MS = 3e4;
 var CLINE_BALANCE_SCALE = 1e5;
@@ -62403,23 +62458,46 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
           });
           return { ok: true, value: { accounts: value } };
         }
-        if (req.provider === LOBSTERAI.id) {
-          const accounts2 = await pool.listAccounts(req.provider);
-          return {
-            ok: true,
-            value: {
-              accounts: accounts2.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null }))
-            }
-          };
+        if (isQoderFamily(req.provider)) {
+          const { product: qoderProduct } = requireQoderFamily(req.provider);
+          const qoderStatusAccounts = await pool.listAccounts(req.provider);
+          const qoderValue = await collectCreditsStatus(qoderStatusAccounts, void 0, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchStatus: (credential) => fetchQoderCheckinStatus(credential, qoderProduct),
+            warn: (msg) => ctx.logger?.warn?.(msg)
+          });
+          return { ok: true, value: { accounts: qoderValue } };
         }
         if (req.provider === TRAE.id) {
-          const accounts2 = await pool.listAccounts(req.provider);
-          return {
-            ok: true,
-            value: {
-              accounts: accounts2.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null }))
-            }
-          };
+          const traeStatusAccounts = await pool.listAccounts(req.provider);
+          const traeValue = await collectCreditsStatus(traeStatusAccounts, void 0, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchStatus: async (credential) => {
+              const status = await fetchTraeCheckinStatus(credential, TRAE, fetch);
+              return status === null ? null : { ...status, todayCredit: status.todayCheckedIn ? status.dailyCredit : 0 };
+            },
+            warn: (msg) => ctx.logger?.warn?.(msg)
+          });
+          return { ok: true, value: { accounts: traeValue } };
+        }
+        if (req.provider === LOBSTERAI.id) {
+          const lobsterClientVersion = await lobsterai.resolveClientVersion();
+          const lobsterStatusAccounts = await pool.listAccounts(req.provider);
+          const lobsterValue = await collectCreditsStatus(lobsterStatusAccounts, void 0, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchStatus: (credential) => fetchLobsteraiCheckinStatus(credential, LOBSTERAI, lobsterClientVersion),
+            warn: (msg) => ctx.logger?.warn?.(msg)
+          });
+          return { ok: true, value: { accounts: lobsterValue } };
+        }
+        if (req.provider === ZCODE.id) {
+          const zcodeStatusAccounts = await pool.listAccounts(req.provider);
+          const zcodeValue2 = await collectCreditsStatus(zcodeStatusAccounts, void 0, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchStatus: (credential) => fetchZcodeCheckinStatus(credential, fetch),
+            warn: (msg) => ctx.logger?.warn?.(msg)
+          });
+          return { ok: true, value: { accounts: zcodeValue2 } };
         }
         if (req.provider === CLINE.id) {
           const accounts2 = await pool.listAccounts(req.provider);
@@ -62431,13 +62509,13 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
           };
         }
         if (req.provider === LOOMY.id) {
-          const accounts2 = await pool.listAccounts(req.provider);
-          return {
-            ok: true,
-            value: {
-              accounts: accounts2.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null }))
-            }
-          };
+          const loomyStatusAccounts = await pool.listAccounts(req.provider);
+          const loomyValue = await collectCreditsStatus(loomyStatusAccounts, void 0, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchStatus: (credential) => fetchLoomyCheckinStatus(credential, LOOMY),
+            warn: (msg) => ctx.logger?.warn?.(msg)
+          });
+          return { ok: true, value: { accounts: loomyValue } };
         }
         if (req.provider === MINIMAX.id) {
           const minimaxStatusAccounts = await pool.listAccounts(req.provider);

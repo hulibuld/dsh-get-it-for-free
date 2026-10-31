@@ -433,6 +433,7 @@ window.__ModuleLoader__.load({
         'chan.claim.result': '已领取 {count} 个账号，共 {credit} 积分。',
         'chan.claim.none': '今天没有可领取的积分。',
         'chan.credit.today': '今日已领 {credit}',
+        'chan.credit.todayPlain': '今日已领',
         'chan.model.free': '免费额度',
         'chan.model.dead': '已下架',
         'chan.model.hidden': '已隐藏',
@@ -1127,6 +1128,7 @@ window.__ModuleLoader__.load({
         'chan.claim.result': 'Claimed for {count} account(s), {credit} credits in total.',
         'chan.claim.none': 'Nothing to claim today.',
         'chan.credit.today': '{credit} claimed today',
+        'chan.credit.todayPlain': 'Claimed today',
         'chan.model.free': 'Free quota',
         'chan.model.dead': 'Retired',
         'chan.model.hidden': 'Hidden',
@@ -3272,14 +3274,14 @@ window.__ModuleLoader__.load({
       codearts: { claim: true, status: true },
       buddy: { claim: true, status: true },
       workbuddy: {},
-      lobsterai: { claim: true },
-      qodercn: { claim: true },
-      trae: { claim: true },
+      lobsterai: { claim: true, status: true },
+      qodercn: { claim: true, status: true },
+      trae: { claim: true, status: true },
       cline: { unit: 'dollars' },
-      loomy: { claim: true },
+      loomy: { claim: true, status: true },
       raccoon: {},
       minimax: { claim: true, status: true },
-      zcode: { claim: true, unit: 'tokens' },
+      zcode: { claim: true, status: true, unit: 'tokens' },
       gemini: {},
     }
 
@@ -3826,8 +3828,13 @@ window.__ModuleLoader__.load({
                 return h('div', { className: 'ofm_acct' + (pending ? ' pending' : ''), key: row.id },
                   h('span', { className: 'ofm_acctname', title: row.nickname ?? row.id }, row.nickname ?? row.id),
                   h('span', { className: 'ofm_acctmeta' }, row.enabled === false ? t('chan.disabled') : t('chan.enabled'), ' · ', expiryText(row, t)),
-                  credit?.todayCheckedIn === true && Number.isFinite(credit.todayCredit) ? h('span', { className: 'ofm_creditbadge' },
-                    t('chan.credit.today').replace('{credit}', String(credit.todayCredit))) : null,
+                  // 有的渠道只回「今天签过」不回数额（TRAE / LobsterAI / ZCode 的
+                  // 状态端点都可能是 0 或不给数）。此时只显示「今日已领」，
+                  // 不要拼出「今日已领 0」这种看着像没领到的字样。
+                  credit?.todayCheckedIn === true ? h('span', { className: 'ofm_creditbadge' },
+                    Number.isFinite(credit.todayCredit) && credit.todayCredit > 0
+                      ? t('chan.credit.today').replace('{credit}', String(credit.todayCredit))
+                      : t('chan.credit.todayPlain')) : null,
                   (() => {
                     const balance = balanceOf(row.id)
                     if (!creditCapability) return null
