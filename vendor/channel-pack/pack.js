@@ -59993,6 +59993,21 @@ var TRAE_PROVIDER_ID = "trae";
 var PROBE_PROMPT = "\u53EA\u56DE\u7B54\u4E24\u4E2A\u5B57\uFF1A\u6536\u5230";
 var PROBE_SYSTEM = "You are a helpful assistant.";
 var PROBE_TIMEOUT_MS = 12e4;
+// ── 降智测试 ──────────────────────────────────────────────
+// 「这个渠道是不是被偷偷换成了小模型」没有直接接口可问，只能看它会不会做事。
+// 最省事又能一眼看出差别的题：用 ASCII 画两个汉字。真模型能拼出可辨认的字形，
+// 被降智的会画成一团或者干脆去调工具。所以这条路径**不给任何工具**，
+// system 也只留一句，把变量压到最少。
+var DEGRADE_SYSTEM = "你是一个只输出纯文本的助手。你没有、也不允许调用任何工具。";
+var DEGRADE_PROMPT = [
+  "只用手写 ASCII 字符（例如 - | / \\ _ = + # * 和空格）在回答里画出「测试」两个汉字。",
+  "要求：",
+  "1. 两个字左右并排，每个至少 5 行高，笔画要连得上、一眼能认出是什么字；",
+  "2. 不要用 Unicode 制表符、不要用 emoji、不要贴图片；",
+  "3. 不要调用任何工具，只用聊天正文回答；",
+  "4. 只输出图形本身，前后不要任何解释。"
+].join("\n");
+var DEGRADE_TIMEOUT_MS = 15e4;
 function isRateLimitFailure(error) {
   if (error instanceof LlmError16) {
     if (error.code === "RATE_LIMIT" || error.code === "QUOTA_EXCEEDED" || error.code === "QUOTA") return true;
@@ -60000,7 +60015,7 @@ function isRateLimitFailure(error) {
   const message2 = error instanceof Error ? error.message : String(error);
   return isRateLimited(message2);
 }
-async function probeWithAdapter(entry, credential, modelId, timeoutMs) {
+async function probeWithAdapter(entry, credential, modelId, timeoutMs, options) {
   const signal = AbortSignal.timeout(timeoutMs);
   const ref = credentialRef10(entry.credentialRef);
   const buddyProduct = productById(entry.provider);
@@ -60092,19 +60107,28 @@ async function probeWithAdapter(entry, credential, modelId, timeoutMs) {
     });
   }
   try {
-    for await (const _chunk of adapter.stream({
+    const collected = [];
+    const startedAt = Date.now();
+    let firstMs = 0;
+    for await (const chunk of adapter.stream({
       provider: entry.provider,
       model: modelId,
       messages: [createUserMessage({
-        content: [{ type: "text", text: PROBE_PROMPT }],
+        content: [{ type: "text", text: options?.prompt ?? PROBE_PROMPT }],
         source: { kind: "user" }
       })],
       // ⚠️ **必须传 system**，否则 WorkBuddy 网关返回 400 + code 11128
       // 「first message is not system prompt」（伪装成安全策略拦截），
       // 使重测恒不可用。详见 PROBE_SYSTEM 的注释。
-      system: PROBE_SYSTEM,
+      system: options?.system ?? PROBE_SYSTEM,
       signal
     })) {
+      if (options?.collect !== true) continue;
+      if (firstMs === 0) firstMs = Date.now() - startedAt;
+      if (chunk?.type === "text-delta" && typeof chunk.text === "string") collected.push(chunk.text);
+    }
+    if (options?.collect === true) {
+      return { modelId, ok: true, text: collected.join(""), firstMs, totalMs: Date.now() - startedAt };
     }
     return { modelId, ok: true };
   } catch (error) {
@@ -60120,6 +60144,49 @@ async function probeWithAdapter(entry, credential, modelId, timeoutMs) {
     }
     return { modelId, ok: false, message: `\u65E0\u6CD5\u786E\u8BA4\uFF1A${message2}` };
   }
+}
+/**
+ * 跑一次降智测试：拿这个渠道的账号，用对应的 adapter 发一个「画 测试」的请求，
+ * 把正文收全。换账号重试的理由和探活一样——一个账号限流不代表渠道不可用。
+ */
+async function runDegradeTest(pool, provider, modelId, deps = {}) {
+  const entries = pool.listAccountsByProvider(provider).filter((entry) => entry.enabled !== false);
+  if (entries.length === 0) {
+    return { ok: false, modelId, message: `${provider} 下没有可用账号` };
+  }
+  const timeoutMs = deps.timeoutMs ?? DEGRADE_TIMEOUT_MS;
+  const failures = [];
+  for (const entry of entries) {
+    let credential;
+    try {
+      credential = await pool.resolveCredentialForAccount(entry.id);
+    } catch (error) {
+      failures.push(`${entry.nickname ?? entry.id}: 凭据解析失败`);
+      continue;
+    }
+    if (credential === void 0) {
+      failures.push(`${entry.nickname ?? entry.id}: 凭据不可用`);
+      continue;
+    }
+    const outcome = await probeWithAdapter(entry, credential, modelId, timeoutMs, {
+      system: DEGRADE_SYSTEM,
+      prompt: DEGRADE_PROMPT,
+      collect: true
+    });
+    if (outcome.ok === true) {
+      return {
+        ok: true,
+        modelId,
+        accountId: entry.id,
+        nickname: entry.nickname ?? entry.id,
+        text: outcome.text,
+        firstMs: outcome.firstMs,
+        totalMs: outcome.totalMs
+      };
+    }
+    failures.push(`${entry.nickname ?? entry.id}: ${outcome.message ?? "未知原因"}`);
+  }
+  return { ok: false, modelId, message: failures.join("；") };
 }
 function makeDefaultProbe(pool, timeoutMs) {
   return async (entry, modelId) => {
@@ -62430,6 +62497,17 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
           };
         }
         const value = await testAccount(pool, accountId, modelId);
+        return { ok: true, value };
+      }
+      // ── 降智测试：用这个模型画一次「测试」，看它还是不是原来那个模型 ──
+      case "degrade.test": {
+        const req = payload;
+        const provider = typeof req?.provider === "string" ? req.provider : "";
+        const modelId = typeof req?.modelId === "string" ? req.modelId : "";
+        if (provider === "" || modelId === "") {
+          return { ok: false, error: { code: "bad-request", message: "缺少 provider 或 modelId" } };
+        }
+        const value = await runDegradeTest(pool, provider, modelId, { timeoutMs: req?.timeoutMs });
         return { ok: true, value };
       }
       // ── 限流标记：重置（不发请求，直接清除）──

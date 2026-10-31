@@ -444,6 +444,14 @@ window.__ModuleLoader__.load({
         'chan.model.disableAll': '全部关闭',
         'chan.model.enabledCount': '已开启 {enabled}/{total}',
         'chan.model.allScope': '仅操作当前渠道的全部模型',
+        'chan.model.degrade': '降智测试',
+        'chan.degrade.title': '降智测试 · {name}',
+        'chan.degrade.running': '正在让它用 ASCII 画「测试」两个字…（极简模式，不调用任何工具）',
+        'chan.degrade.meta': '首字 {first} ms · 总耗时 {total} ms · 账号 {account}',
+        'chan.degrade.failed': '没测出来：{reason}',
+        'chan.degrade.empty': '模型回了空内容（一个字都没吐）',
+        'chan.degrade.retry': '再测一次',
+        'chan.degrade.close': '关闭',
         'chan.error': '操作失败：{reason}',
         'chan.confirm.delete': '移除账号 {name}？该账号的凭据会一并删除。',
         'chan.rpc.unavailable': '宿主未提供 connection 服务，渠道操作暂不可用。',
@@ -1139,6 +1147,14 @@ window.__ModuleLoader__.load({
         'chan.model.disableAll': 'Hide all',
         'chan.model.enabledCount': 'Shown {enabled}/{total}',
         'chan.model.allScope': 'Apply to all models in this channel only',
+        'chan.model.degrade': 'Dumbness check',
+        'chan.degrade.title': 'Dumbness check · {name}',
+        'chan.degrade.running': 'Asking it to draw the characters 测试 in ASCII… (minimal mode, no tools)',
+        'chan.degrade.meta': 'first token {first} ms · total {total} ms · account {account}',
+        'chan.degrade.failed': 'No result: {reason}',
+        'chan.degrade.empty': 'The model returned nothing at all',
+        'chan.degrade.retry': 'Run again',
+        'chan.degrade.close': 'Close',
         'chan.error': 'Action failed: {reason}',
         'chan.confirm.delete': 'Remove account {name}? Its credential is deleted with it.',
         'chan.rpc.unavailable': 'This host exposes no connection service, so channel actions are unavailable.',
@@ -3452,6 +3468,19 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState('')
       const [notice, setNotice] = useState('')
       const [login, setLogin] = useState(null)
+      // 降智测试：让这个模型在极简模式（不调任何工具）下用 ASCII 画「测试」两个字。
+      // 不看它嘴上说自己是什么，看它到底能不能照着简单指令动手。
+      const [degrade, setDegrade] = useState(null)
+      const runDegrade = useCallback(async (model) => {
+        const name = model.name ?? model.id
+        setDegrade({ modelId: model.id, name, running: true })
+        try {
+          const value = await rpc('degrade.test', { provider: channel.id, modelId: model.id }, 240_000)
+          setDegrade({ modelId: model.id, name, running: false, value })
+        } catch (error) {
+          setDegrade({ modelId: model.id, name, running: false, value: { ok: false, message: String(error?.message ?? error) } })
+        }
+      }, [rpc, channel.id])
       const modelBatchPending = useRef(false)
       const [balanceError, setBalanceError] = useState('')
       const [balanceLoading, setBalanceLoading] = useState(false)
@@ -3908,6 +3937,11 @@ window.__ModuleLoader__.load({
                 model.dead === true ? h('span', { className: 'ofm_tagpill dead' }, t('chan.model.dead')) : null,
                 model.disabled === true ? h('span', { className: 'ofm_tagpill' }, t('chan.model.hidden')) : null,
                 h('button', {
+                  type: 'button', className: 'ofm_minibtn', disabled: !rpc,
+                  title: t('chan.model.degrade'),
+                  onClick: () => { void runDegrade(model) },
+                }, t('chan.model.degrade')),
+                h('button', {
                   type: 'button', className: 'ofm_minibtn', disabled: busy !== '' || !rpc,
                   onClick: () => accountAction('model:' + model.id, '', async () => {
                     if (model.dead === true) await rpc('model.clearDead', { provider: channel.id, modelId: model.id })
@@ -3928,7 +3962,31 @@ window.__ModuleLoader__.load({
             login.url === '' ? null : h('a', { className: 'ofm_btn primary', href: login.url, target: '_blank', rel: 'noreferrer noopener' }, t('chan.login.open')),
             h('button', { type: 'button', className: 'ofm_btn ghost', onClick: () => setLogin(null) }, t('chan.login.cancel')))))
 
-      return h(Fragment, null, card, modal)
+      const degradeModal = degrade === null ? null : h('div', { className: 'ofm_scrim' },
+        h('div', { className: 'ofm_modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': t('chan.degrade.title').replace('{name}', degrade.name ?? '') },
+          h('div', { className: 'ofm_modalhead' }, t('chan.degrade.title').replace('{name}', degrade.name ?? '')),
+          h('div', { className: 'ofm_modalbody' },
+            degrade.running === true
+              ? h('p', { className: 'ofm_note' }, t('chan.degrade.running'))
+              : degrade.value !== undefined && degrade.value.ok === true
+                ? h(Fragment, null,
+                  h('p', { className: 'ofm_note' }, t('chan.degrade.meta')
+                    .replace('{first}', String(degrade.value.firstMs ?? 0))
+                    .replace('{total}', String(degrade.value.totalMs ?? 0))
+                    .replace('{account}', String(degrade.value.nickname ?? ''))),
+                  h('pre', {
+                    className: 'ofm_mono',
+                    style: { margin: 0, maxHeight: '52vh', overflow: 'auto', whiteSpace: 'pre', lineHeight: 1.1, fontSize: '12px' },
+                  }, degrade.value.text === '' ? t('chan.degrade.empty') : degrade.value.text))
+                : h('p', { className: 'ofm_note' }, t('chan.degrade.failed').replace('{reason}', String(degrade.value?.message ?? '—')))),
+          h('div', { className: 'ofm_modalfoot' },
+            h('button', {
+              type: 'button', className: 'ofm_btn ghost', disabled: degrade.running === true,
+              onClick: () => { void runDegrade({ id: degrade.modelId, name: degrade.name }) },
+            }, t('chan.degrade.retry')),
+            h('button', { type: 'button', className: 'ofm_btn ghost', onClick: () => setDegrade(null) }, t('chan.degrade.close')))))
+
+      return h(Fragment, null, card, modal, degradeModal)
     }
 
 
