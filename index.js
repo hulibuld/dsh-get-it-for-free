@@ -1142,6 +1142,18 @@ export function apply(ctx, config) {
    * its own structural check instead of reading as "admitted".
    */
   const fenceConnection = connectionAdmissionView(() => optional('connection'))
+  /**
+   * The real RPC entry point on the connection service, looked up per call.
+   *
+   * `fenceConnection` above is only the *admission* view — it exposes `admit` and
+   * nothing else. Reading `fenceConnection.rpc.call` therefore yields `undefined`
+   * forever, which silently broke the host-side `/rpc` bridge (every call paid a
+   * failed round trip before the browser lane took over). Use this accessor.
+   */
+  const connectionRpcCall = () => {
+    const rpc = optional('connection')?.rpc
+    return typeof rpc?.call === 'function' ? rpc.call.bind(rpc) : undefined
+  }
   // ── the absorbed free-channel pack ──────────────────────────────────────────
   /**
    * The 免费 channels — CodeArts (华为云), CodeBuddy / WorkBuddy (腾讯), LobsterAI
@@ -1194,132 +1206,6 @@ export function apply(ctx, config) {
     // credentials. JSON API and SSE must report the same admission boundary.
     logger.warn?.(`get-it-for-free: ${surface} admission rejected status=${status} source=${source} reason=${reason}`)
   }
-  // ── 每日自动签到（所有支持签到的渠道） ─────────────────────────────────────
-  // 以前这里只有手动 RPC `credits.claimAll`：用户不点，就永远不签到，面板上也
-  // 留不下任何「今天到底试没试、为什么没签上」的痕迹。
-  //
-  // 3.0.6 起从「只管 CodeArts」扩成「所有支持签到的渠道都签」：每个渠道各记各的
-  // 次数与结果，互不牵连——某个渠道一直失败，不该拖住其它渠道当天那一次。
-  const CHECKIN_PROVIDERS = ['codearts', 'qodercn', 'trae', 'lobsterai', 'loomy', 'zcode', 'minimax']
-  const CHECKIN_LABELS = {
-    codearts: 'CodeArts', qodercn: 'Qoder', trae: 'TRAE',
-    lobsterai: 'LobsterAI', loomy: 'Loomy', zcode: 'ZCode', minimax: 'MiniMax',
-  }
-  const CHECKIN_START_HOUR = 8
-  const CHECKIN_INTERVAL_MS = 30 * 60_000
-  const CHECKIN_MAX_ATTEMPTS = 6
-  const CHECKIN_FILE = path.join(os.homedir(), '.dsh', 'get-it-for-free', 'checkin.json')
-
-  function writeCheckinFile(next) {
-    try {
-      fs.mkdirSync(path.dirname(CHECKIN_FILE), { recursive: true })
-      fs.writeFileSync(CHECKIN_FILE, JSON.stringify(next, null, 2))
-    } catch (error) {
-      // 状态写不下去只是面板看不见，不该影响签到本身。
-      logger.warn?.(`get-it-for-free: 签到状态写入失败（${error?.message ?? error}）`)
-    }
-  }
-
-  let checkinInFlight = false
-  let checkinStopped = false
-
-  const emptyCheckinEntry = () => ({ attempts: 0, lastAt: 0, lastResult: null })
-
-  /** 走和面板按钮同一条桥，签到逻辑只存在 pack 里一份。 */
-  async function claimProvider(rpc, provider) {
-    try {
-      const reply = await rpc('/api', 'channel-pack', {
-        method: 'credits.claimAll',
-        payload: { provider },
-      })
-      const value = reply?.ok === false ? undefined : reply?.value
-      const summary = value?.summary ?? null
-      const results = Array.isArray(value?.results) ? value.results.slice(0, 20) : []
-      return {
-        ok: Number(summary?.claimed ?? 0) + Number(summary?.alreadyClaimed ?? 0) > 0,
-        reason: results.length === 0 ? 'no-accounts' : '',
-        summary,
-        results,
-        error: reply?.ok === false ? String(reply?.error?.message ?? reply?.error ?? '') : '',
-      }
-    } catch (error) {
-      return {
-        ok: false,
-        reason: '',
-        summary: null,
-        results: [],
-        error: String(error?.message ?? error).slice(0, 300),
-      }
-    }
-  }
-
-  async function runCheckinTick() {
-    if (checkinStopped || checkinInFlight) return
-    if (new Date().getHours() < CHECKIN_START_HOUR) return
-    const rpc = fenceConnection?.rpc?.call
-    if (typeof rpc !== 'function') return
-    const today = dayKey()
-    const previous = readCheckinFile()
-    const sameDay = previous.dayKey === today
-    const known = sameDay && previous.providers !== null && typeof previous.providers === 'object'
-      ? { ...previous.providers }
-      : {}
-    // 兼容 3.0.5 之前的扁平格式（那一天只记了 CodeArts 一条）。
-    if (!sameDay || Object.keys(known).length === 0) {
-      known.codearts = Object.assign(
-        emptyCheckinEntry(),
-        sameDay ? { attempts: previous.attempts ?? 0, lastAt: previous.lastAt ?? 0, lastResult: previous.lastResult ?? null } : {},
-      )
-    }
-    const pending = CHECKIN_PROVIDERS.filter(
-      (provider) => Number(known[provider]?.attempts ?? 0) < CHECKIN_MAX_ATTEMPTS,
-    )
-    if (pending.length === 0) return
-    checkinInFlight = true
-    try {
-      for (const provider of pending) {
-        if (checkinStopped) break
-        const entry = known[provider] ?? emptyCheckinEntry()
-        const lastResult = await claimProvider(rpc, provider)
-        // 签上了（含「今天已经签过」）就没必要再敲：把这天记为用完。
-        // 一个账号都没有时同理，六次重试只是白敲上游。
-        const attempts = lastResult.ok === true || lastResult.reason === 'no-accounts'
-          ? CHECKIN_MAX_ATTEMPTS
-          : Number(entry.attempts ?? 0) + 1
-        known[provider] = { attempts, lastAt: Date.now(), lastResult }
-        logger.info?.(
-          `get-it-for-free: 自动签到 ${CHECKIN_LABELS[provider] ?? provider} ${attempts}/${CHECKIN_MAX_ATTEMPTS} ${lastResult.ok ? 'ok' : 'failed'}${lastResult.reason === 'no-accounts' ? '（无账号）' : ''}`,
-        )
-      }
-    } finally {
-      checkinInFlight = false
-    }
-    const entries = Object.values(known).filter(
-      (entry) => entry !== null && typeof entry === 'object',
-    )
-    writeCheckinFile({
-      dayKey: today,
-      providers: known,
-      // 扁平字段保留给还不认识 providers 的旧面板/旧脚本。
-      attempts: entries.reduce((max, entry) => Math.max(max, Number(entry.attempts ?? 0)), 0),
-      lastAt: Date.now(),
-      lastResult: known[CHECKIN_PROVIDERS[0]]?.lastResult ?? null,
-    })
-  }
-
-  ctx.effect(() => {
-    // 首轮延后到启动稳定之后：启动阶段要抢出口、绑端口、刷目录，签到排在这些
-    // 后面，才不会把一次启动期的网络抖动记成「签到失败」。
-    const first = setTimeout(() => { void runCheckinTick() }, 90_000)
-    first.unref?.()
-    const timer = setInterval(() => { void runCheckinTick() }, CHECKIN_INTERVAL_MS)
-    timer.unref?.()
-    return () => {
-      checkinStopped = true
-      clearTimeout(first)
-      clearInterval(timer)
-    }
-  }, 'get-it-for-free: daily checkin')
 
   const api = createApiRoutes({
     settings, stats, availability, catalog: () => modelRuntime.catalog, state,
@@ -1619,6 +1505,8 @@ export function apply(ctx, config) {
     managedDistribution: managed,
     push,
     connection: fenceConnection,
+    /** The real connection service's RPC entry — `connection` above只够做准入校验。 */
+    rpcCall: connectionRpcCall,
     onAdmissionRejection: logAdmissionRejection('settings API'),
     /** Read on every ask, so a machine that changed networks answers with the
      *  interfaces it has now rather than the ones the relay started on. */
@@ -2049,23 +1937,6 @@ function noteRpcBridge(method, durationMs, reply, error) {
   }
 }
 
-/**
- * 读每日签到的状态文件。面板只读，写入权属于调度器。
- *
- * 读失败一律返回空态而不是抛：面板为了看状态而拿到一个 500，比暂时看不到
- * 状态更糟。文件默认 `<dsh home>/get-it-for-free/checkin.json`。
- */
-function readCheckinFile() {
-  const empty = { dayKey: '', attempts: 0, lastAt: 0, lastResult: null }
-  try {
-    const file = path.join(os.homedir(), '.dsh', 'get-it-for-free', 'checkin.json')
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
-    if (parsed === null || typeof parsed !== 'object') return empty
-    return { ...empty, ...parsed }
-  } catch {
-    return empty
-  }
-}
 
 export function createApiRoutes(deps) {
   return async function handler(req, res) {
@@ -2106,16 +1977,11 @@ export function createApiRoutes(deps) {
         const body = await readJson(req)
         const name = typeof body?.method === 'string' ? body.method : ''
         if (name === '') return send(400, { error: 'method required' })
-        const rpc = deps.connection?.rpc?.call
+        const rpc = typeof deps.rpcCall === 'function' ? deps.rpcCall() : deps.connection?.rpc?.call
         if (typeof rpc !== 'function') return send(503, { error: 'connection.rpc unavailable' })
-        // 只读本地状态，不走宿主 RPC 也不打网络：面板要的只是「今天试了几次、
-        // 上次什么结果」。签到本身的写与重试都在调度器里。
-        if (name === 'credits.checkinState') {
-          return send(200, { ok: true, reply: { ok: true, value: readCheckinFile() } })
-        }
         const startedAt = Date.now()
         try {
-          const reply = await deps.connection.rpc.call('/api', 'channel-pack', { method: name, payload: body?.payload })
+          const reply = await rpc('/api', 'channel-pack', { method: name, payload: body?.payload })
           // 面板报错只有一个「rpc-failed」，看不出是哪一层。这里把每次桥接的
           // 结果形状记下来：ok/error 是谁返回的、有没有 message，一次点击就能查。
           noteRpcBridge(name, Date.now() - startedAt, reply, undefined)

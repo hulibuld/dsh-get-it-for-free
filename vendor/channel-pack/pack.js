@@ -53216,7 +53216,9 @@ async function fetchClaimablePlans(credential, fetchImpl) {
     const response = await fetchWithTimeout(
       fetchImpl,
       `${ZCODE_BILLING_PREVIEW_URL}?app_version=${encodeURIComponent(appVersion)}&platform=win32`,
-      { method: "GET", headers: buildZcodeHeaders(credential, { json: false }) },
+      // 这个接口要 Bearer：不带 token 直接 401，于是「可领计划」永远为空，
+      // 上层再把它读成「今日已领」——ZCode 的假徽章就是这么来的。
+      { method: "GET", headers: buildZcodeHeaders(credential, { json: false, authorization: `Bearer ${credential.zcode_jwt}` }) },
       15e3
     );
     if (!response.ok) return [];
@@ -53261,14 +53263,18 @@ async function fetchZcodeClaimablePlans(credential, fetchImpl = fetch) {
   const url = `${ZCODE_BILLING_PREVIEW_URL}?app_version=${encodeURIComponent(appVersion)}&platform=win32`;
   const response = await fetchWithTimeout(fetchImpl, url, {
     method: "GET",
-    headers: buildZcodeHeaders(credential, { json: false })
+    // 同上：preview 必须带 Bearer，否则 401 → plans 恒空 → 假「今日已领」。
+    headers: buildZcodeHeaders(credential, { json: false, authorization: `Bearer ${credential.zcode_jwt}` })
   }, 25e3);
-  if (!response.ok) return [];
+  // 查不到 ≠ 今日没有可领额度：原来的 `return []` 把「上游挂了 / 解析失败」和
+  // 「今天确实没额度」混成同一个空数组，上层于是把它读成「今天已领」，徽章自己
+  // 点亮。失败必须回 null，让调用方知道这条状态不可信。
+  if (!response.ok) return null;
   let parsed;
   try {
     parsed = await response.json();
   } catch {
-    return [];
+    return null;
   }
   const raw = Array.isArray(parsed.data?.plans) ? parsed.data.plans : [];
   const plans = [];
@@ -54404,9 +54410,14 @@ var ZcodeAuth = class extends Service9 {
     }
     await reportZcodeActivation(credential, this.fetchImpl);
     const plans = await fetchZcodeClaimablePlans(credential, this.fetchImpl);
+    const planCount = Array.isArray(plans) ? plans.length : 0;
     return {
       active: true,
-      todayCheckedIn: plans.length === 0,
+      // 空数组只说明「现在没有可领的」，不等于「今天领过了」——preview 对「已领」
+      // 和「本来就没有额度」给的是同一个空数组，没有正面证据就不点亮徽章。
+      todayCheckedIn: false,
+      claimable: planCount > 0,
+      planCount,
       streakDays: 0,
       dailyCredit: 0,
       todayCredit: 0,
@@ -54503,8 +54514,13 @@ var ZcodeAuth = class extends Service9 {
       }
       await reportZcodeActivation(credential, this.fetchImpl);
       const plans = await fetchZcodeClaimablePlans(credential, this.fetchImpl);
+      if (!Array.isArray(plans)) {
+        return [{ kind: "failed", code: -2, message: "\u53EF\u9886\u989D\u5EA6\u67E5\u8BE2\u5931\u8D25\uFF08ZCode preview \u63A5\u53E3\u6CA1\u6709\u6B63\u5E38\u54CD\u5E94\uFF09" }];
+      }
       if (plans.length === 0) {
-        return [{ kind: "already-claimed", message: "\u4ECA\u65E5\u6682\u65E0\u53EF\u9886\u989D\u5EA6\uFF08\u670D\u52A1\u7AEF\u6309\u65E5\u5237\u65B0\uFF09" }];
+        // 不能报 already-claimed：那会让面板显示「已领取 N 个账号」，实际一个都
+        // 没领到，徽章也跟着点亮。空计划只能算「这次没领成」，交给调度器按节奏重试。
+        return [{ kind: "failed", code: -2, message: "\u4ECA\u5929\u6CA1\u6709\u53EF\u9886\u7684\u989D\u5EA6\uFF08preview \u63A5\u53E3\u6CA1\u6709\u8FD4\u56DE\u4EFB\u4F55\u8BA1\u5212\uFF09" }];
       }
       const captchaConfig = await this.fetchCaptchaConfig().catch(() => void 0) ?? ZCODE_CAPTCHA_FALLBACK;
       this.captchaMintConfig = captchaConfig;
@@ -58209,7 +58225,9 @@ async function fetchZcodeCheckinStatus(credential, fetcher = fetch) {
   await reportZcodeActivation(credential, fetcher);
   const plans = await fetchZcodeClaimablePlans(credential, fetcher);
   if (!Array.isArray(plans)) return null;
-  return { active: true, todayCheckedIn: plans.length === 0, todayCredit: 0, claimable: plans.length > 0, planCount: plans.length };
+  // plans 为空不等于「今天已领」：preview 对「已领」和「本来就没有额度」返回同样的
+  // 空数组。没有正面证据就不点亮徽章，只把「现在没有可领的」如实报出去。
+  return { active: true, todayCheckedIn: false, todayCredit: 0, claimable: plans.length > 0, planCount: plans.length, noClaimablePlans: plans.length === 0 };
 }
 
 // vendor/channel-pack/src/cline-credits.ts
@@ -60948,6 +60966,9 @@ function describeRun(totals) {
 function shouldMarkToday(totals) {
   return totals.coversToday > 0;
 }
+/** 自动签到没全成功时的重试节奏：一次启动最多补 4 轮，每轮间隔 20 分钟。 */
+var AUTO_CHECKIN_MAX_RETRY = 4;
+var AUTO_CHECKIN_RETRY_MS = 20 * 6e4;
 function describeChannel(summary) {
   const parts = [];
   if (summary.claimed > 0) {
@@ -60967,6 +60988,8 @@ function describeChannel(summary) {
 function createAutoCheckin(deps) {
   const now = deps.now ?? (() => Date.now());
   let doc = deps.store.load();
+  let retryBudget = 0;
+  let retryDate = "";
   let running2 = false;
   let inflight = null;
   let pending = null;
@@ -61036,12 +61059,30 @@ function createAutoCheckin(deps) {
       totals.inactive += summary.inactive;
       totals.failed += summary.failed;
       totals.coversToday += summary.coversToday ?? summary.claimed + summary.alreadyClaimed;
-      channels.push({ provider, text: describeChannel(summary) });
+      // 只留「几个失败」看不出是哪个号、为什么，第二天照样得重跑一遍才知道。
+      // 把每个失败账号的原话抄进状态文件，用户和下一轮都能直接看到原因。
+      const failures = [];
+      if (Array.isArray(result.value?.results)) {
+        for (const row of result.value.results) {
+          if (row?.outcome?.kind !== "failed" || failures.length >= 5) continue;
+          failures.push({
+            accountId: row.accountId,
+            nickname: row.nickname,
+            message: String(row.outcome.message ?? "").slice(0, 300)
+          });
+        }
+      }
+      channels.push(failures.length === 0 ? { provider, text: describeChannel(summary) } : { provider, text: describeChannel(summary), failures });
     }
-    if (!shouldMarkToday(totals)) {
+    // 只要还有账号没领到（失败 / 出错 / 一个都没签上），就不要把今天记成「跑完了」：
+    // 一记上，这一天剩下的时间就不会再试，失败的那个号要等到明天。
+    const unfinished = totals.failed > 0 || totals.errors > 0 || totals.coversToday === 0;
+    if (unfinished && retryBudget > 0) {
+      retryBudget -= 1;
       deps.warn?.(
-        `[channel-pack] \u81EA\u52A8\u7B7E\u5230\u672A\u8BB0\u5165\u4ECA\u65E5\uFF08\u4E0B\u6B21\u542F\u52A8\u4F1A\u91CD\u8BD5\uFF09\uFF1A${describeRun(totals)}`
+        `[channel-pack] 自动签到还有没领到的账号，${Math.round(AUTO_CHECKIN_RETRY_MS / 6e4)} 分钟后再试（剩 ${retryBudget} 次）：${describeRun(totals)}`
       );
+      (deps.schedule ?? defaultSchedule)(() => { void runIfDue(); }, AUTO_CHECKIN_RETRY_MS);
       return;
     }
     doc = {
@@ -61064,6 +61105,10 @@ function createAutoCheckin(deps) {
   function runIfDue() {
     if (inflight !== null) return inflight;
     if (!doc.enabled) return Promise.resolve();
+    if (retryDate !== today()) {
+      retryDate = today();
+      retryBudget = AUTO_CHECKIN_MAX_RETRY;
+    }
     if (doc.lastDate !== "" && doc.lastDate === today()) return Promise.resolve();
     running2 = true;
     const task = performRun().catch((error) => {
