@@ -18,7 +18,14 @@
  */
 
 import { MiMoCredentialStore } from './credential.js'
-import { MiMoCatalog, MIMO_DISPLAY_NAME, MIMO_PROVIDER, describeModel, displayNameOf } from './catalog.js'
+import {
+  MiMoCatalog,
+  MIMO_DISPLAY_NAME,
+  MIMO_PROVIDER,
+  describeModel,
+  displayNameOf,
+  readDesktopCatalog,
+} from './catalog.js'
 import { MiMoSession } from './session.js'
 import { MiMoQuotaReader } from './quota.js'
 import { createChannel } from '../channel.js'
@@ -116,7 +123,14 @@ export function createMiMo({ logger = console, onTopology = () => {} } = {}) {
   async function refreshRoster(signal) {
     if (identity === undefined || identity === rosterFor) return
     try {
-      const adopted = await catalog.refreshFromGateway(session, { signal })
+      // The desktop app's own `model-catalog.json` first: it is the roster the
+      // signed-in account actually sees, while the gateway probe below normally
+      // finds nothing at all (its routes answer 404 — see catalog.js).
+      const local = readDesktopCatalog()
+      const adopted =
+        local !== undefined && catalog.adoptDesktopModels(local.models) === true
+          ? true
+          : await catalog.refreshFromGateway(session, { signal })
       if (adopted === true) {
         rosterFor = identity
         onTopology()

@@ -49,6 +49,9 @@
  * @module dsh-mimo-connect/catalog
  */
 
+import { existsSync, readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { MIMO_SERVER } from './session.js'
 
 /** Provider route this plugin owns. */
@@ -104,6 +107,68 @@ export const FALLBACK_MIMO_MODELS = [
 
 /** Built-in metadata keyed by model id. */
 const BUILTIN_BY_ID = new Map(FALLBACK_MIMO_MODELS.map(entry => [entry.id, entry]))
+
+/**
+ * Desktop `model-catalog.json` files to probe, most likely first.
+ *
+ * The app writes this file next to its Chromium profile, so it shares the same
+ * two locations as the cookie database: `~/Library/Application Support` on
+ * macOS and `%APPDATA%` on Windows.
+ *
+ * @param env - environment to read.
+ * @returns candidate absolute paths.
+ */
+export function desktopCatalogCandidates(env = process.env) {
+  const out = []
+  const override = env.MIMO_CATALOG_JSON
+  if (typeof override === 'string' && override.trim().length > 0) out.push(override.trim())
+
+  const home = env.HOME ?? env.USERPROFILE
+  if (typeof home === 'string' && home.length > 0) {
+    out.push(join(home, 'Library', 'Application Support', 'Xiaomi MiMo', 'model-catalog.json'))
+    out.push(join(home, '.config', 'Xiaomi MiMo', 'model-catalog.json'))
+  }
+  const appData = env.APPDATA
+  if (typeof appData === 'string' && appData.length > 0) {
+    out.push(join(appData, 'Xiaomi MiMo', 'model-catalog.json'))
+  }
+  return [...new Set(out)]
+}
+
+/**
+ * Read the roster the desktop app is using right now.
+ *
+ * Read-only, and silent on every failure: a catalog that cannot be parsed
+ * leaves the previous roster in effect, which is always better than blanking
+ * the picker.
+ *
+ * @param env - environment to read.
+ * @returns `{ models, accountId, path }` for the first usable file, else undefined.
+ */
+export function readDesktopCatalog(env = process.env) {
+  for (const path of desktopCatalogCandidates(env)) {
+    if (!existsSync(path)) continue
+    let parsed
+    try {
+      parsed = JSON.parse(readFileSync(path, 'utf-8'))
+    } catch {
+      continue
+    }
+    const array = Array.isArray(parsed?.models) ? parsed.models : undefined
+    if (array === undefined) continue
+    const models = array
+      .filter(isChatModel)
+      .map(normalizeGatewayModel)
+      .filter(entry => entry !== undefined)
+    if (models.length === 0) continue
+    return {
+      models,
+      accountId: typeof parsed?.account === 'string' ? parsed.account : undefined,
+      path,
+    }
+  }
+  return undefined
+}
 
 /**
  * Describe one model id, preferring built-in metadata and falling back to
@@ -261,6 +326,14 @@ export function normalizeGatewayModel(entry) {
  */
 export function isChatModel(entry) {
   if (entry === null || typeof entry !== 'object') return typeof entry === 'string'
+  // The desktop app states the kind as `modelType` (`TEXT`, `IMAGE_GENERATION`,
+  // …) rather than as a modality, so read that field first: an image generator
+  // that slipped through here would be offered in the picker and fail every
+  // turn.
+  const modelType = entry.modelType
+  if (typeof modelType === 'string' && modelType.length > 0) {
+    return modelType.toLowerCase() === 'text'
+  }
   const kind = entry.type ?? entry.kind ?? entry.category ?? entry.modality
   if (typeof kind !== 'string') return true
   const k = kind.toLowerCase()
@@ -323,6 +396,30 @@ export class MiMoCatalog {
     if (usable.length === 0) return false
     this.#models = [...usable]
     this.#source = 'gateway'
+    return true
+  }
+
+  /**
+   * Adopt a roster read off the desktop app's own `model-catalog.json`.
+   *
+   * Preferred over the gateway probe: that probe normally finds nothing (see
+   * the module comment on the header), while this file is written by the app
+   * the user is already signed into, so it lists exactly the models the
+   * account can reach — ratios and all.
+   *
+   * @param entries - normalized catalog entries.
+   * @returns true when a non-empty roster was adopted.
+   */
+  adoptDesktopModels(entries) {
+    return this.#adopt(entries, 'desktop')
+  }
+
+  /** Shared adoption: replace the roster only with something non-empty. */
+  #adopt(entries, source) {
+    const usable = Array.isArray(entries) ? entries.filter(e => e !== undefined) : []
+    if (usable.length === 0) return false
+    this.#models = [...usable]
+    this.#source = source
     return true
   }
 

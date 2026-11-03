@@ -23,6 +23,7 @@
 
 import {
   readFileSync,
+  readdirSync,
   existsSync,
   copyFileSync,
   unlinkSync,
@@ -74,32 +75,59 @@ export function desktopCookieCandidates(env = process.env) {
   const override = env.MIMO_COOKIE_DB
   if (typeof override === 'string' && override.trim().length > 0) out.push(override.trim())
 
+  // Every application-data directory the desktop app is known to use. It is an
+  // Electron build, so the cookie database sits inside one Chromium profile
+  // under one of these roots.
+  const roots = []
   const appData = env.APPDATA
   if (typeof appData === 'string' && appData.length > 0) {
-    // The desktop app isolates the Xiaomi account in its own partition.
-    out.push(join(appData, 'Xiaomi MiMo', 'Partitions', 'xiaomi-account', 'Network', 'Cookies'))
-    out.push(join(appData, 'Xiaomi MiMo', 'Network', 'Cookies'))
+    roots.push(join(appData, 'Xiaomi MiMo'))
   }
   const home = env.HOME ?? env.USERPROFILE
   if (typeof home === 'string' && home.length > 0) {
-    // Non-Windows layouts, for completeness.
-    out.push(
-      join(home, '.config', 'Xiaomi MiMo', 'Partitions', 'xiaomi-account', 'Network', 'Cookies'),
-    )
-    out.push(
-      join(
-        home,
-        'Library',
-        'Application Support',
-        'Xiaomi MiMo',
-        'Partitions',
-        'xiaomi-account',
-        'Network',
-        'Cookies',
-      ),
-    )
+    roots.push(join(home, '.config', 'Xiaomi MiMo'))
+    roots.push(join(home, 'Library', 'Application Support', 'Xiaomi MiMo'))
+  }
+
+  for (const root of roots) {
+    // Chromium moved its cookie jar into a `Network` subdirectory; older builds
+    // keep `Cookies` directly in the profile. Both layouts ship in the wild and
+    // which one appears depends on the build, so probe both. Measured on macOS
+    // (MiMo 3.14.3): `Partitions/xiaomi-account/Cookies`, with no `Network`
+    // directory at all — the `Network`-only guess here reported a signed-in
+    // desktop app as "not logged in".
+    out.push(join(root, 'Partitions', 'xiaomi-account', 'Network', 'Cookies'))
+    out.push(join(root, 'Partitions', 'xiaomi-account', 'Cookies'))
+    out.push(join(root, 'Network', 'Cookies'))
+    out.push(join(root, 'Cookies'))
+    // The partition directory name is not guaranteed either — a reinstall can
+    // mint a fresh one — so enumerate whatever partitions actually exist.
+    out.push(...partitionCookiePaths(root))
   }
   return [...new Set(out)]
+}
+
+/**
+ * Cookie databases inside every existing `Partitions/<name>/` of a profile.
+ *
+ * @param root - the application-data directory of the desktop app.
+ * @returns candidate absolute paths, empty when the directory is absent.
+ */
+function partitionCookiePaths(root) {
+  const base = join(root, 'Partitions')
+  let entries
+  try {
+    entries = readdirSync(base, { withFileTypes: true })
+  } catch {
+    return []
+  }
+  const out = []
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    out.push(join(base, entry.name, 'Network', 'Cookies'))
+    out.push(join(base, entry.name, 'Cookies'))
+  }
+  return out
 }
 
 /**

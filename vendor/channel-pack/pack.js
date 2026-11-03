@@ -58130,9 +58130,41 @@ async function claimQoderCampaign(credential, product, campaignId, fetcher = fet
     return { kind: "already-claimed", message: "\u4ECA\u5929\u5DF2\u9886\u53D6" };
   }
   if (result.status !== void 0 && result.status !== "CLAIMED") {
-    return { kind: "failed", code: -1, message: `\u9886\u53D6\u672A\u6210\u529F\uFF08status=${result.status}\uFF09` };
+    // BLOCKED 不是「领不到」。2026-11-02 实测（qodercn 账号 nick4787846386）：
+    // 同一发请求回 `status=BLOCKED`，服务端却已经把这笔记了下来——活动列表随后
+    // 变成 `CLAIMED`、积分随后下发；隔一段时间原样重发同一个请求，直接回
+    // `CLAIMED`，`grantedAt` 就是那一刻，而 `claimedAt` 停在第一次（BLOCKED）的
+    // 时间点。所以这里当场判死是错的：先重看一次活动列表确认，确认到 CLAIMED 就
+    // 按领取成功记账。
+    const confirmed = await confirmQoderClaimRegistered(credential, product, campaignId, fetcher);
+    if (confirmed !== void 0) {
+      return { kind: "claimed", credit: confirmed, streakDays: 0, isStreakDay: false };
+    }
+    return {
+      kind: "failed",
+      code: -1,
+      // 归成 failed 是为了让自动签到调度器按 20 分钟 × 4 轮再确认一次；文案里说清
+      // 「不用反复点」，否则面板只留一句「领取失败」，用户只能一直点。
+      message: `领取未完成（status=${result.status}）：服务端没当场下发积分。这一笔通常已经登记，插件会在下一轮自动确认，不用反复点。`
+    };
   }
   return { kind: "claimed", credit: result.amount ?? 0, streakDays: 0, isStreakDay: false };
+}
+/**
+ * 领取接口回了非 CLAIMED 的状态（BLOCKED 之类）之后，隔一下再看一眼活动列表：
+ * 服务端常常已经把这一笔登记成 CLAIMED 了，只是没在当次响应里下发。
+ *
+ * 返回确认到的积分额（`0` 也算确认），没确认到返回 `undefined` —— 调用方据此
+ * 决定是按领取成功记账，还是如实报出来交给调度器下一轮再确认。
+ */
+var QODER_CLAIM_CONFIRM_DELAY_MS = 1200;
+async function confirmQoderClaimRegistered(credential, product, campaignId, fetcher) {
+  await delay(QODER_CLAIM_CONFIRM_DELAY_MS);
+  const parsed = await loadCampaigns(credential, product, fetcher);
+  if (parsed === void 0) return void 0;
+  const row = parsed.campaigns.find((c) => c.campaignId === campaignId);
+  if (row === void 0 || row.claimStatus !== "CLAIMED") return void 0;
+  return Number.isFinite(row.amount) ? row.amount : 0;
 }
 function describeNonJson(status, text) {
   if (status === 401 || status === 403) return `\u51ED\u636E\u5DF2\u5931\u6548\uFF08HTTP ${status}\uFF09\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u8BE5\u8D26\u53F7`;
@@ -60969,6 +61001,30 @@ function shouldMarkToday(totals) {
 /** 自动签到没全成功时的重试节奏：一次启动最多补 4 轮，每轮间隔 20 分钟。 */
 var AUTO_CHECKIN_MAX_RETRY = 4;
 var AUTO_CHECKIN_RETRY_MS = 20 * 6e4;
+/**
+ * 每天早上补签一轮。
+ *
+ * 两个原因，都是实测出来的：
+ *
+ * ① **Qoder 的每日活动在 UTC+8 10:00 才刷新**（`QODER_CAMPAIGN_REFRESH_HOUR_UTC8`）。
+ *    早上开机那一轮（这台机器上通常是 07:1x）看到的还是昨天那一轮，于是这个渠道
+ *    整天只回「今天尚未刷新」，而自动签到只跑启动那一轮，过了 10:00 没人再试
+ *    —— 用户看到的就是「Qoder 一直不会自动签到，只能手动一键领取」。
+ * ② 原来也没有「第二天再跑」的排期：宿主一直开着不重启时，跨过零点之后第二天
+ *    根本不会签。这个补签顺带把这条补上。
+ *
+ * 时刻取 10:05（UTC+8），留 5 分钟给上游刷新。
+ */
+var AUTO_CHECKIN_TOPUP_HOUR_UTC8 = 10;
+var AUTO_CHECKIN_TOPUP_BUFFER_MS = 5 * 6e4;
+function msUntilAutoCheckinTopup(nowMs = Date.now()) {
+  const utc8Ms = nowMs + QODER_BILLING_UTC_OFFSET_MS;
+  const target = new Date(utc8Ms);
+  target.setUTCHours(AUTO_CHECKIN_TOPUP_HOUR_UTC8, 0, 0, 0);
+  let delta = target.getTime() + AUTO_CHECKIN_TOPUP_BUFFER_MS - utc8Ms;
+  if (delta <= 0) delta += 24 * 36e5;
+  return delta;
+}
 function describeChannel(summary) {
   const parts = [];
   if (summary.claimed > 0) {
@@ -60993,7 +61049,27 @@ function createAutoCheckin(deps) {
   let running2 = false;
   let inflight = null;
   let pending = null;
+  let topup = null;
+  let topupDate = "";
   const today = () => utc8DateString(now());
+
+  /**
+   * 排下（或续上）每天 10:05 的补签。同一天只会排一个：`topupDate` 按目标日
+   * 记着，回调里先 `armTopup()` 重排下一天再跑补签，所以它自己会一直续下去。
+   */
+  function armTopup() {
+    if (!doc.enabled) return;
+    const waitMs = msUntilAutoCheckinTopup(now());
+    const targetDate = utc8DateString(now() + waitMs);
+    if (topup !== null && topupDate === targetDate) return;
+    topup?.cancel?.();
+    topup = (deps.schedule ?? defaultSchedule)(() => {
+      topup = null;
+      armTopup();
+      void runIfDue({ force: true });
+    }, waitMs);
+    topupDate = targetDate;
+  }
   function state() {
     return {
       enabled: doc.enabled,
@@ -61102,20 +61178,24 @@ function createAutoCheckin(deps) {
     }
     deps.warn?.(`[channel-pack] \u81EA\u52A8\u7B7E\u5230\u5B8C\u6210\uFF08${today()}\uFF09\uFF1A${doc.lastResult}`);
   }
-  function runIfDue() {
+  function runIfDue(options) {
+    // `force` 只有每日补签用：那一轮的意义就是「今天已经记过一次，但 Qoder 的
+    // 新活动要等到 10:00 之后才出现」，所以必须绕过 lastDate 的当日短路。
+    const force = options?.force === true;
     if (inflight !== null) return inflight;
     if (!doc.enabled) return Promise.resolve();
     if (retryDate !== today()) {
       retryDate = today();
       retryBudget = AUTO_CHECKIN_MAX_RETRY;
     }
-    if (doc.lastDate !== "" && doc.lastDate === today()) return Promise.resolve();
+    if (!force && doc.lastDate !== "" && doc.lastDate === today()) return Promise.resolve();
     running2 = true;
     const task = performRun().catch((error) => {
       deps.warn?.(`[channel-pack] \u81EA\u52A8\u7B7E\u5230\u5F02\u5E38: ${String(error)}`);
     }).finally(() => {
       running2 = false;
       inflight = null;
+      armTopup();
     });
     inflight = task;
     return task;
@@ -61125,10 +61205,21 @@ function createAutoCheckin(deps) {
     async setEnabled(enabled) {
       doc = { ...doc, enabled };
       await deps.store.save(doc);
-      if (enabled) void runIfDue();
+      if (enabled) {
+        armTopup();
+        void runIfDue();
+      } else {
+        topup?.cancel?.();
+        topup = null;
+        topupDate = "";
+      }
       return state();
     },
     start() {
+      // 先把今天的补签排上，再排启动那一轮：宿主 13:00 才起来、今天已经签过的
+      // 情况下 runIfDue 会直接短路，那一次 `finally` 不会跑，只有这里排的补签
+      // 能保证第二天（以及明天 10:05 Qoder 的新活动）还有人管。
+      armTopup();
       if (pending !== null) return;
       const ms = deps.delayMs ?? autoCheckinDelayMs();
       const fire = () => {
@@ -61154,6 +61245,9 @@ function createAutoCheckin(deps) {
     stop() {
       pending?.cancel();
       pending = null;
+      topup?.cancel();
+      topup = null;
+      topupDate = "";
     }
   };
 }
