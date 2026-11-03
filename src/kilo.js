@@ -20,6 +20,7 @@
  */
 
 import { CODE, UpstreamError, classifyFailure, classifyStreamFailure, readHead, readSse, replayStream, sniffBody, transportCause } from './http.js'
+import { APP_USER_AGENT } from './ua.js'
 import { egressFetch } from './egress.js'
 
 const LISTING_TIMEOUT_MS = 15000
@@ -47,7 +48,7 @@ export async function fetchKiloListing({ signal, timeoutMs = LISTING_TIMEOUT_MS 
   signal?.addEventListener('abort', onCallerAbort, { once: true })
   try {
     const response = await kiloFetch(`${KILO_BASE}/models`, {
-      headers: { accept: 'application/json', 'user-agent': 'dsh-get-it-for-free' },
+      headers: { accept: 'application/json', 'user-agent': APP_USER_AGENT },
       redirect: 'error',
       signal: controller.signal,
     })
@@ -83,7 +84,7 @@ export async function postKiloStreamed({ body, signal, onData, timeoutMs = TURN_
   try {
     response = await kiloFetch(`${KILO_BASE}/chat/completions`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', accept: 'text/event-stream', 'user-agent': 'dsh-get-it-for-free' },
+      headers: { 'content-type': 'application/json', accept: 'text/event-stream', 'user-agent': APP_USER_AGENT },
       body: bodyText,
       redirect: 'error',
       signal,

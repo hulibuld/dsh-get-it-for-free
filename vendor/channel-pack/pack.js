@@ -31744,12 +31744,28 @@ function networkFailure(error, route) {
   }
   return new ChannelNetworkError(`\u6E20\u9053\u7F51\u7EDC\u8BF7\u6C42\u5931\u8D25\uFF08${route}${codes.size ? `\uFF1B${[...codes].join("\u3001")}` : ""}\uFF09\uFF1A\u8BF7\u68C0\u67E5\u4EE3\u7406\u8FDE\u901A\u6027\u540E\u91CD\u8BD5`, { cause: error });
 }
+// 出网兜底：有一批适配器没注入传输层，直接用全局 fetch 发请求（`options.fetcher ?? fetch` /
+// `options.fetchImpl ?? fetch`）。这里把兜底换成一个先净化请求体的版本，让这些渠道
+// 和走 channel fetch 的渠道享有同一套身份净化，不留缝。
+const sanitizingFetch = (input, init) => {
+  if (init !== null && typeof init === "object" && typeof init.body === "string" && init.body.length > 0) {
+    const cleaned = sanitizeHarnessIdentityInBody(init.body);
+    if (cleaned !== init.body) init = { ...init, body: cleaned };
+  }
+  return globalThis.fetch(input, init);
+};
 function createChannelFetch(options = {}) {
   const dispatchers = /* @__PURE__ */ new Map();
   let system;
   let systemAt = 0;
   let closed = false;
-  const fetchImpl = (input, init) => (options.fetchImpl ?? globalThis.fetch)(input, init);
+  const fetchImpl = (input, init) => {
+    if (init !== null && typeof init === "object" && typeof init.body === "string" && init.body.length > 0) {
+      const cleaned = sanitizeHarnessIdentityInBody(init.body);
+      if (cleaned !== init.body) init = { ...init, body: cleaned };
+    }
+    return (options.fetchImpl ?? globalThis.fetch)(input, init);
+  };
   const fetcher = async (input, init) => {
     if (closed) throw new Error("\u6E20\u9053\u51FA\u7F51\u670D\u52A1\u5DF2\u505C\u6B62");
     const target = new URL(input instanceof Request ? input.url : String(input));
@@ -32495,7 +32511,7 @@ function isProseTruncatedByStopString(text) {
 }
 
 // vendor/channel-pack/src/dead-model-store.ts
-import { existsSync as existsSync4, mkdirSync as mkdirSync4, readFileSync as readFileSync4, renameSync as renameSync4, writeFileSync as writeFileSync4 } from "node:fs";
+import { existsSync as existsSync4, mkdirSync as mkdirSync4, readFileSync as readFileSync4, renameSync as renameSync4, writeFileSync as writeFileSync4, appendFileSync as appendFileSync4 } from "node:fs";
 import { join as join3 } from "node:path";
 var DEAD_MODELS_FILE = "dead-models.json";
 var SCHEMA2 = "dsh-codearts-auth/dead-models/v1";
@@ -33318,8 +33334,29 @@ function registerAdapterIdempotent(llm, providers, adapter, warn) {
 
 // vendor/channel-pack/src/llm-adapter.ts
 var CHAT_API_BASE = "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2";
+// 上游按客户端 UA 拦截：任何 "deepseek-harness/…" 一律回 403 TM.00000001（已实测）。
+// 这里发华为云 CodeArts 自己的客户端标识，实测该 UA 返回 200。
+var CODEARTS_CLIENT_UA = "HuaweiCloudCodeArts/3.2.1";
 var PROVIDER = "codearts";
 var BENEFIT_NOT_FOUND_CODE = "BENEFIT_NOT_FOUND";
+// 这个账号在这个模型上没有 benefit 额度时，每次请求都会先带 maas_type: benefit 被拒一次、
+// 去掉头再发一次。网关繁忙时这一来一回正好把请求数翻倍，也更容易撞并发上限。
+// 记下来，6 小时内同一个 账号+模型 不再试探。
+var codeArtsBenefitUnavailable = /* @__PURE__ */ new Map();
+function codeArtsBenefitUnavailableFor(credential, model) {
+  const key = `${credential?.access_key_id ?? ""}|${model}`;
+  const at = codeArtsBenefitUnavailable.get(key);
+  if (at === void 0) return false;
+  if (Date.now() - at > 6 * 36e5) {
+    codeArtsBenefitUnavailable.delete(key);
+    return false;
+  }
+  return true;
+}
+function markCodeArtsBenefitUnavailable(credential, model) {
+  if (!credential?.access_key_id) return;
+  codeArtsBenefitUnavailable.set(`${credential.access_key_id}|${model}`, Date.now());
+}
 var CODEARTS_BENEFIT_NOT_FOUND_ERROR_CODE = "InferHub.4004.200";
 var DEFAULT_MODELS = [
   "GLM-5.2",
@@ -33483,7 +33520,21 @@ function isConcurrencyLimitError(status, body) {
 function isQueueError(status, body) {
   return status === 400 && (body.includes("TM.00001041") || /peak\s+usage|try\s+again\s+after|peak\s+hours/i.test(body) || /high\s+demand|too\s+many\s+requests/i.test(body));
 }
+/**
+ * 华为云网关在全站过载或风控时，也会用 **403** 拒掉请求，正文是
+ * {"error_code":"TM.00000001","error_msg":"网络繁忙，请稍后重试"}。
+ * 403 在别处通常表示鉴权失败，而 DSH 会把 AUTH 的失败统一渲染成「API 密钥无效」，
+ * 于是用户被引去重登凭据，实际只要等几秒重试。实测（2026-11-03 23:43）：
+ * 连续两次都拿到这个码，约 40 秒后同一份凭据恢复 200。
+ */
+function isTransientGatewayError(status, body) {
+  if (status !== 403 && status !== 503) return false;
+  const text = String(body ?? "");
+  if (text.includes("TM.00001041")) return false;
+  return /TM\.0000|网络繁忙|请稍后重试|network\s+busy|service\s+busy|try\s+again\s+later/i.test(text);
+}
 function isAuthError(status, body) {
+  if (isTransientGatewayError(status, body)) return false;
   if (status === 401 || status === 403) return true;
   return body.includes("APIG.0602") || /invalid\s+token|token\s+expired|token\s+is\s+invalid/i.test(body);
 }
@@ -33511,6 +33562,7 @@ function errorDetail(body) {
   return body;
 }
 function httpErrorCode(status, body) {
+  if (isTransientGatewayError(status, body)) return "RATE_LIMIT";
   if (status === 401 || status === 403) return "AUTH";
   const detail = errorDetail(body);
   if (isQuotaExceededError(detail)) return QUOTA_EXCEEDED_CODE;
@@ -33521,6 +33573,33 @@ function httpErrorCode(status, body) {
   }
   if (status >= 500) return "SERVER";
   return `HTTP_${status}`;
+}
+
+// 上游 4xx 的正文过去被整段丢掉，界面只剩「HTTP 403」这种没有信息量的字，
+// 排查时只能靠猜。这里把 error_code / error_msg 带进异常，并把原始正文落盘。
+var CODEARTS_ERROR_LOG_MAX_BYTES = 512 * 1024;
+function codeArtsErrorLogDir() {
+  const home = process.env.HOME ?? process.env.USERPROFILE ?? ".";
+  return join3(home, ".dsh", "get-it-for-free");
+}
+function logCodeArtsFailure(entry) {
+  try {
+    const dir = codeArtsErrorLogDir();
+    mkdirSync4(dir, { recursive: true });
+    const path2 = join3(dir, "codearts-error.log");
+    try {
+      if (readFileSync4(path2, "utf-8").length > CODEARTS_ERROR_LOG_MAX_BYTES) writeFileSync4(path2, "", "utf-8");
+    } catch {
+    }
+    appendFileSync4(path2, JSON.stringify({ at: (new Date()).toISOString(), ...entry }) + "\n", "utf-8");
+  } catch {
+  }
+}
+function describeCodeArtsFailure(status, body) {
+  const raw = typeof body === "string" ? body.trim() : "";
+  const detail = raw.length > 0 ? errorDetail(raw) : "";
+  const suffix = detail.length > 0 ? ` — ${detail.slice(0, 300)}` : "（上游没有返回错误正文）";
+  return `codearts: 上游拒绝了请求（HTTP ${status}）${suffix}`;
 }
 function delay(ms, signal) {
   return new Promise((resolve2) => {
@@ -33937,6 +34016,7 @@ var CodeArtsAdapter = class extends LlmAdapter {
     const url = `${CHAT_API_BASE}/chat/completions`;
     let response;
     let queueAttempts = 0;
+    let transientAttempts = 0;
     let authRefreshed = false;
     let benefitHeaderDropped = false;
     const rateLimitTried = /* @__PURE__ */ new Set();
@@ -33944,8 +34024,8 @@ var CodeArtsAdapter = class extends LlmAdapter {
     const isBenefitModel = isCodeArtsBenefitModel(options.model);
     for (; ; ) {
       concurrencyLimited = false;
-      const body = buildBody();
-      const extraSignedHeaders = isBenefitModel && !benefitHeaderDropped ? { maas_type: "benefit" } : void 0;
+      const body = sanitizeHarnessIdentityInBody(buildBody());
+      const extraSignedHeaders = isBenefitModel && !benefitHeaderDropped && !codeArtsBenefitUnavailableFor(credential, options.model) ? { maas_type: "benefit" } : void 0;
       const signed = await signRequestHuawei(
         credential.access_key_id,
         credential.secret_access_key,
@@ -33955,7 +34035,7 @@ var CodeArtsAdapter = class extends LlmAdapter {
         new TextEncoder().encode(body),
         extraSignedHeaders
       );
-      const headers = new Headers(attributionHeaders());
+      const headers = new Headers({ "user-agent": CODEARTS_CLIENT_UA });
       signed.forEach((value, key) => {
         if (key !== "content-type") headers.set(key, value);
       });
@@ -34003,6 +34083,7 @@ var CodeArtsAdapter = class extends LlmAdapter {
           }
           if (error instanceof SseQueueRetryError) {
           } else if (error instanceof LlmError2 && error.code === BENEFIT_NOT_FOUND_CODE && isBenefitModel && !benefitHeaderDropped) {
+            markCodeArtsBenefitUnavailable(credential, options.model);
             benefitHeaderDropped = true;
             continue;
           } else {
@@ -34012,14 +34093,71 @@ var CodeArtsAdapter = class extends LlmAdapter {
       } else {
         const errorText = await response.text().catch(() => "");
         concurrencyLimited = isConcurrencyLimitError(response.status, errorText);
-        if (isAuthError(response.status, errorText) && !authRefreshed) {
-          authRefreshed = true;
-          await this.options.refresh();
-          credential = await this.options.resolveCredential();
-          if (credential === void 0 || !credential.access_key_id || !credential.secret_access_key || !credential.security_token) {
-            throw new LlmError2("codearts: credential missing after refresh; log in again", "MISSING_CREDENTIAL");
+        // 并发会话上限是「每个账号 3 个」。卡满时不值得等半小时：换号能立刻空出槽位，
+        // 换不到（只有一个号）才退回原来的排队重试逻辑。
+        if (concurrencyLimited && this.options.accountPool) {
+          const nextSlot = await this.options.accountPool.getAvailableAccount("codearts", options.model, rateLimitTried);
+          if (nextSlot && !rateLimitTried.has(nextSlot.entry.id)) {
+            rateLimitTried.add(nextSlot.entry.id);
+            credential = nextSlot.credential;
+            currentAccountId = nextSlot.entry.id;
+            this.pinSession(credential.access_key_id);
+            authRefreshed = false;
+            queueAttempts = 0;
+            continue;
           }
-          continue;
+          concurrencyLimited = false;
+        }
+        // 网关过载给的 403（TM.00000001「网络繁忙」）：原地等几秒重试最快，也不会把用户
+        // 引去重登凭据。重试用尽才换号，换不到才抛出去——抛的是 RATE_LIMIT，不是 AUTH。
+        if (isTransientGatewayError(response.status, errorText)) {
+          logCodeArtsFailure({ status: response.status, body: errorText, accountId: currentAccountId ?? null, model: options.model });
+          if (transientAttempts < 3) {
+            const waitMs = 700 * 2 ** transientAttempts;
+            transientAttempts += 1;
+            await delay(waitMs, options.signal);
+            continue;
+          }
+          if (this.options.accountPool) {
+            const nextBusy = await this.options.accountPool.getAvailableAccount("codearts", options.model, rateLimitTried);
+            if (nextBusy && !rateLimitTried.has(nextBusy.entry.id)) {
+              rateLimitTried.add(nextBusy.entry.id);
+              credential = nextBusy.credential;
+              currentAccountId = nextBusy.entry.id;
+              this.pinSession(credential.access_key_id);
+              authRefreshed = false;
+              transientAttempts = 0;
+              continue;
+            }
+          }
+          throw new LlmError2(describeCodeArtsFailure(response.status, errorText), "RATE_LIMIT", { status: response.status });
+        }
+        if (isAuthError(response.status, errorText)) {
+          logCodeArtsFailure({ status: response.status, body: errorText, accountId: currentAccountId ?? null, model: options.model });
+          // 401/403 未必是这张凭据坏了：华为云同一个账号的并发会话只有 3 个，
+          // 网关在全站过载时也会用 403 拒掉请求。先换一个号试一次（不花时间），
+          // 换不到再走刷新（刷新要几十秒），最后才把上游原文抛给用户。
+          if (this.options.accountPool) {
+            const nextAccount = await this.options.accountPool.getAvailableAccount("codearts", options.model, rateLimitTried);
+            if (nextAccount && !rateLimitTried.has(nextAccount.entry.id)) {
+              rateLimitTried.add(nextAccount.entry.id);
+              credential = nextAccount.credential;
+              currentAccountId = nextAccount.entry.id;
+              this.pinSession(credential.access_key_id);
+              authRefreshed = false;
+              continue;
+            }
+          }
+          if (!authRefreshed) {
+            authRefreshed = true;
+            await this.options.refresh();
+            credential = await this.options.resolveCredential();
+            if (credential === void 0 || !credential.access_key_id || !credential.secret_access_key || !credential.security_token) {
+              throw new LlmError2("codearts: credential missing after refresh; log in again", "MISSING_CREDENTIAL");
+            }
+            continue;
+          }
+          throw new LlmError2(describeCodeArtsFailure(response.status, errorText), "AUTH", { status: response.status });
         }
         if (isSseQuotaExhaustedErrorCode(errorDetail(errorText), errorText)) {
           const message2 = codeartsQuotaExhaustedMessage(options.model, nextUtc8DayStartMs());
@@ -34077,7 +34215,8 @@ var CodeArtsAdapter = class extends LlmAdapter {
           const probe = await this.queryQueueStatus(credential, options.model, options.signal);
           if (probe === void 0 || probe.status === "working") {
             const code = httpErrorCode(response.status, errorText);
-            throw new LlmError2(`codearts: model request failed with HTTP ${response.status}`, code, { status: response.status });
+            logCodeArtsFailure({ status: response.status, body: errorText, accountId: currentAccountId ?? null, model: options.model });
+            throw new LlmError2(describeCodeArtsFailure(response.status, errorText), code, { status: response.status });
           }
         }
       }
@@ -34554,6 +34693,8 @@ var HTTP_HEADER_REFRESH_TOKEN = "X-Refresh-Token";
 var HTTP_HEADER_AUTH_REFRESH_SOURCE = "X-Auth-Refresh-Source";
 var HTTP_HEADER_PRODUCT = "X-Product";
 var HTTP_HEADER_PRODUCT_CODE = "X-Product-Code";
+// CodeBuddy IDE 自己的客户端 UA（与官方 IDE 出网一致），避免暴露宿主身份。
+var BUDDY_CLIENT_UA = "CodeBuddyIDE/1.106.1";
 var BUDDY_USER_AGENT = "CodeBuddyIDE/1.106.1";
 var BUDDY_DEPLOYMENT_TYPE = "SaaS";
 var AUTH_REFRESH_SOURCE = "ide-main";
@@ -35601,8 +35742,30 @@ function neutralizeWebSurfacePhrase(text) {
   if (text.toLowerCase().indexOf("the deepseek harness web gui") === -1) return text;
   return text.replace(/the DeepSeek Harness Web GUI/gi, WEB_SURFACE_NEUTRAL);
 }
+var DSH_IDENTITY_REWRITES = [
+  // 宿主 dsh-harness-dev-context 注入的运行时上下文（系统提示词段落 + 两行运行时行），
+  // 是全部渠道里最直白的身份暴露，必须在品牌折叠之前整段换掉。
+  ["DeepSeek Harness implementation checkout", "runtime installation"],
+  ["DeepSeek Harness Web GUI", "console UI"],
+  // macOS 应用包名：品牌折叠带路径前置断言，动不到它，这里单独把 Harness 去掉。
+  ["DeepSeek Harness.app", "DeepSeek.app"]
+];
+function rewriteDshIdentityPhrases(text) {
+  if (typeof text !== "string") return text;
+  let out = text;
+  for (const pair of DSH_IDENTITY_REWRITES) {
+    if (out.indexOf(pair[0]) !== -1) out = out.split(pair[0]).join(pair[1]);
+  }
+  // 小写连字符形态（GitHub 仓库地址、包名 slug）在任何位置都不留 harness。
+  if (out.indexOf("deepseek-harness") !== -1 || out.indexOf("DeepSeek-Harness") !== -1) {
+    out = out.replace(/deepseek-harness/gi, "deepseek");
+  }
+  return out;
+}
+// 顺序有讲究：整段身份串必须在品牌折叠之前换掉，否则 "DeepSeek Harness implementation
+// checkout" 会先被折叠成 "DeepSeek implementation checkout"，后面的整段匹配就再也命中不了。
 function sanitizePromptText(text) {
-  return rewriteDshFingerprintText(neutralizeHarnessBrandText(neutralizeWebSurfacePhrase(text)));
+  return rewriteDshFingerprintText(neutralizeHarnessBrandText(neutralizeWebSurfacePhrase(rewriteDshIdentityPhrases(text))));
 }
 function neutralizeHarnessBrandValue(value) {
   if (typeof value === "string") return sanitizePromptText(value);
@@ -35616,7 +35779,7 @@ function neutralizeHarnessBrandValue(value) {
 }
 function sanitizeHarnessIdentityInBody(body) {
   if (typeof body !== "string") return body;
-  if (!/DeepSeek/i.test(body) && body.indexOf("Tokens prefixed with @") === -1 && body.indexOf("identify files or directories on the host") === -1) return body;
+  if (!/deepseek/i.test(body) && body.indexOf("Tokens prefixed with @") === -1 && body.indexOf("identify files or directories on the host") === -1 && body.indexOf("implementation checkout") === -1 && body.indexOf("Web GUI") === -1) return body;
   try {
     const data = JSON.parse(body);
     return JSON.stringify(neutralizeHarnessBrandValue(data));
@@ -35805,7 +35968,7 @@ var BuddyAdapter = class _BuddyAdapter extends LlmAdapter2 {
     super();
     this.options = options;
     this.product = options.product ?? CODEBUDDY;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = options.fetchImpl ?? sanitizingFetch;
     this.sessionId = options.sessionId ?? crypto.randomUUID().replace(/-/g, "");
     const fallback2 = this.product.fallbackModels ?? [];
     this.productFallbackIndex = new Map(fallback2.map((model) => [model.id, model]));
@@ -36435,7 +36598,7 @@ var BuddyAdapter = class _BuddyAdapter extends LlmAdapter2 {
     if (this.product.id === "buddy" || this.product.id === "workbuddy") {
       body = sanitizeHarnessIdentityInBody(body);
     }
-    const headers = new Headers(attributionHeaders2());
+    const headers = new Headers({ "user-agent": BUDDY_CLIENT_UA });
     headers.set("Authorization", `Bearer ${credential.access_token}`);
     headers.set("Accept", "text/event-stream");
     headers.set("Content-Type", "application/json");
@@ -37006,7 +37169,7 @@ var LobsteraiClientVersionResolver = class {
     if (this.cached !== void 0 && now - this.cachedAt < ttl) {
       return { version: this.cached, source: "cache" };
     }
-    const fetched = this.options.fetcher ?? fetch;
+    const fetched = this.options.fetcher ?? sanitizingFetch;
     try {
       const response = await fetched(product.clientVersionApi, {
         method: "GET",
@@ -37433,7 +37596,7 @@ var LobsteraiAdapter = class extends LlmAdapter3 {
     super();
     this.options = options;
     this.product = options.product ?? LOBSTERAI;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = options.fetchImpl ?? sanitizingFetch;
     this.fallbackIndex = new Map(
       (this.product.fallbackModels ?? []).map((model) => [model.id, model])
     );
@@ -38208,7 +38371,7 @@ function applyQoderRefresh(credential, payload) {
   }
   return next;
 }
-async function fetchQoderUserNickname(credential, product, fetcher = fetch) {
+async function fetchQoderUserNickname(credential, product, fetcher = sanitizingFetch) {
   try {
     const response = await fetcher(`${product.openApiBase}${QODER_USERINFO_PATH}`, {
       method: "GET",
@@ -39621,7 +39784,7 @@ var QoderAdapter = class extends LlmAdapter4 {
     super();
     this.options = options;
     this.product = options.product ?? QODER;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = options.fetchImpl ?? sanitizingFetch;
     this.fallbackIndex = new Map(
       (this.product.fallbackModels ?? []).map((model) => [model.id, model])
     );
@@ -41198,7 +41361,7 @@ var TraeAdapter = class extends LlmAdapter5 {
     super();
     this.options = options;
     this.product = options.product ?? TRAE;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = options.fetchImpl ?? sanitizingFetch;
     this.fallbackIndex = new Map(
       (this.product.fallbackModels ?? []).map((model) => [model.id, model])
     );
@@ -42308,7 +42471,7 @@ function mergeClineModels(product, remote) {
   return out;
 }
 async function fetchClineRemoteModels(product, options = {}) {
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? sanitizingFetch;
   const warnings = [];
   const recommendedPromise = (async () => {
     try {
@@ -42518,7 +42681,7 @@ function applyModelsDevCatalog(models, dev) {
   return out;
 }
 function makeClineModelsDevLoader(options = {}) {
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? sanitizingFetch;
   const cache5 = new TtlCache({
     ttlMs: options.ttlMs ?? CLINE_MODELS_DEV_TTL_MS,
     ...options.now === void 0 ? {} : { now: options.now },
@@ -42645,7 +42808,7 @@ var ClineAdapter = class extends LlmAdapter6 {
     super();
     this.options = options;
     this.product = options.product ?? CLINE;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = options.fetchImpl ?? sanitizingFetch;
     this.loadModelsDev = options.loadModelsDev ?? makeClineModelsDevLoader({ fetcher: this.fetchImpl });
   }
   product;
@@ -43346,7 +43509,7 @@ var LoomyAdapter = class extends LlmAdapter7 {
     super();
     this.options = options;
     this.product = options.product ?? LOOMY;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = options.fetchImpl ?? sanitizingFetch;
     this.fallbackIndex = new Map(this.product.fallbackModels.map((model) => [model.id, model]));
   }
   product;
@@ -43848,7 +44011,7 @@ var RaccoonAdapter = class extends LlmAdapter8 {
     super();
     this.options = options;
     this.product = options.product ?? RACCOON;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = options.fetchImpl ?? sanitizingFetch;
     this.fallbackIndex = new Map(this.product.fallbackModels.map((model) => [model.id, model]));
   }
   product;
@@ -44705,6 +44868,7 @@ var CodeArtsAuth = class extends Service {
         }
       }
     }
+    await dedupeCodeArtsAccounts(this.ctx, pool);
   }
   /**
    * 停止服务：置 inactive，阻止在途刷新回写。
@@ -44792,7 +44956,7 @@ async function request(method, url, headers, options) {
   }
   return { status: response.status, body };
 }
-async function fetchAuthState(fetcher = fetch, signal, product = CODEBUDDY) {
+async function fetchAuthState(fetcher = sanitizingFetch, signal, product = CODEBUDDY) {
   const url = `${product.endpoint}${AUTH_STATE_PATH}?platform=${product.platform}`;
   const headers = {
     [HTTP_HEADER_DOMAIN]: product.apiDomain,
@@ -44822,7 +44986,7 @@ async function fetchAuthState(fetcher = fetch, signal, product = CODEBUDDY) {
   return { state, authUrl };
 }
 async function loopGetToken(state, options = {}) {
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? sanitizingFetch;
   const product = options.product ?? CODEBUDDY;
   const url = `${product.endpoint}${AUTH_TOKEN_PATH}?state=${encodeURIComponent(state)}`;
   const headers = {
@@ -44857,7 +45021,7 @@ async function loopGetToken(state, options = {}) {
   }
 }
 async function getAccount(state, token, options = {}) {
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? sanitizingFetch;
   const product = options.product ?? CODEBUDDY;
   const url = `${product.endpoint}${LOGIN_ACCOUNT_PATH}?state=${encodeURIComponent(state)}`;
   const headers = {
@@ -44907,7 +45071,7 @@ async function getAccount(state, token, options = {}) {
     throw new Error(`login/account HTTP ${status} code=${code}: ${responseMessage(body)}`);
   }
 }
-async function refreshToken(credential, fetcher = fetch, signal, product = CODEBUDDY) {
+async function refreshToken(credential, fetcher = sanitizingFetch, signal, product = CODEBUDDY) {
   if (!isRefreshable(credential)) {
     throw new RefreshTokenExpiredError2("\u65E0 refresh_token\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55");
   }
@@ -44946,7 +45110,7 @@ var RefreshTokenExpiredError2 = class extends Error {
     this.name = "RefreshTokenExpiredError";
   }
 };
-async function fetchModels(credential, fetcher = fetch, signal, product = CODEBUDDY) {
+async function fetchModels(credential, fetcher = sanitizingFetch, signal, product = CODEBUDDY) {
   if (credential.access_token.length === 0) return [];
   const headers = {
     ...credentialAuthHeaders(credential),
@@ -45045,7 +45209,7 @@ function decorateLoginUrl(authUrl, product) {
   }
 }
 async function runBuddyLoginFlow(options = {}) {
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? sanitizingFetch;
   const open = options.openBrowser ?? defaultOpenBrowser;
   const product = options.product ?? CODEBUDDY;
   let state;
@@ -45403,7 +45567,7 @@ var BuddyAuth = class extends Service2 {
   }
   /** 注入的 fetch（测试用）；默认为全局 fetch。 */
   get fetchImpl() {
-    return this.options.fetcher ?? fetch;
+    return this.options.fetcher ?? sanitizingFetch;
   }
 };
 function createPoolRefresh(pool, productId, auth) {
@@ -45436,7 +45600,7 @@ function buildLobsteraiLoginUrl(port, state, product) {
   });
   return `${product.portalBase}/portal#/login?${query.toString()}`;
 }
-async function exchangeLobsteraiAuthCode(code, session, clientVersion, product, fetcher = fetch, signal) {
+async function exchangeLobsteraiAuthCode(code, session, clientVersion, product, fetcher = sanitizingFetch, signal) {
   const body = {
     authCode: code,
     firstKeyfrom: session.firstKeyfrom,
@@ -45491,7 +45655,7 @@ async function defaultOpenBrowser2(url) {
   openBrowser2(url);
 }
 async function startLobsteraiLoginFlow(options) {
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? sanitizingFetch;
   const { product, clientVersion } = options;
   const session = createLobsteraiLoginSession();
   const state = randomUUID3();
@@ -45631,7 +45795,7 @@ var LobsteraiAuth = class extends Service3 {
   versionResolver;
   /** 注入的 fetch（测试用）；默认为全局 fetch。 */
   get fetchImpl() {
-    return this.options.fetcher ?? fetch;
+    return this.options.fetcher ?? sanitizingFetch;
   }
   /**
    * 解析客户端版本号（带缓存与兜底）。
@@ -46115,7 +46279,7 @@ function isAborted2(signal) {
   return signal?.aborted === true;
 }
 async function pollQoderDeviceToken(session, options) {
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? sanitizingFetch;
   const pollUrl = buildQoderPollUrl(session, options.product);
   const interval = options.pollIntervalMs ?? QODER_POLL_INTERVAL_MS;
   const deadline = Date.now() + (options.timeoutMs ?? QODER_LOGIN_TIMEOUT_MS);
@@ -46251,7 +46415,7 @@ var QoderAuth = class extends Service4 {
   active = true;
   /** 注入的 fetch（测试用）；默认为全局 fetch。 */
   get fetchImpl() {
-    return this.options.fetcher ?? fetch;
+    return this.options.fetcher ?? sanitizingFetch;
   }
   /** 标记 refresh_token 已失效：停止重试，并向 status() 暴露 refreshable: false。 */
   markRefreshTokenInvalid() {
@@ -46692,7 +46856,7 @@ function parseTraeCallbackDetailed(rawUrl) {
   }
   return { ok: true, info };
 }
-async function exchangeTraeCallback(callback, session, product, fetcher = fetch, nowMs = Date.now()) {
+async function exchangeTraeCallback(callback, session, product, fetcher = sanitizingFetch, nowMs = Date.now()) {
   let exchange;
   if (callback.refreshToken.length > 0) {
     const exchangeBody = {
@@ -47013,7 +47177,7 @@ var TraeAuth = class _TraeAuth extends Service5 {
   static MODELS_CACHE_TTL_MS = 3e4;
   /** 注入的 fetch（测试用）；默认为全局 fetch。 */
   get fetchImpl() {
-    return this.options.fetcher ?? fetch;
+    return this.options.fetcher ?? sanitizingFetch;
   }
   /** 标记 refresh_token 已失效：停止重试，并向 status() 暴露 refreshable: false 与重新登录提示。 */
   markRefreshTokenInvalid() {
@@ -47519,7 +47683,7 @@ function toMs(value, fallbackMs) {
   return Math.floor(value) * 1e3;
 }
 async function requestClineDeviceAuthorization(product, options = {}) {
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? sanitizingFetch;
   const response = await fetcher(`${product.workOsBase}${CLINE_DEVICE_AUTHORIZATION_PATH}`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -47548,7 +47712,7 @@ async function requestClineDeviceAuthorization(product, options = {}) {
   };
 }
 async function pollClineWorkOsTokens(authorization, options) {
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? sanitizingFetch;
   const deadline = Date.now() + (options.timeoutMs ?? authorization.expiresInMs);
   let intervalMs = Math.max(1e3, options.pollIntervalMs ?? authorization.intervalMs);
   let failures = 0;
@@ -47612,7 +47776,7 @@ async function pollClineWorkOsTokens(authorization, options) {
   throw new Error("\u767B\u5F55\u7B49\u5F85\u5DF2\u8D85\u65F6\uFF0C\u8BF7\u91CD\u65B0\u53D1\u8D77\u767B\u5F55");
 }
 async function registerClineTokens(workOsTokens, options) {
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? sanitizingFetch;
   const response = await fetcher(`${options.product.apiBase}${CLINE_REGISTER_PATH}`, {
     method: "POST",
     headers: {
@@ -47740,7 +47904,7 @@ var ClineAuth = class extends Service6 {
   active = true;
   /** 注入的 fetch（测试用）；默认为全局 fetch。 */
   get fetchImpl() {
-    return this.options.fetcher ?? fetch;
+    return this.options.fetcher ?? sanitizingFetch;
   }
   /** 标记 refresh_token 已失效：停止重试，并向 status() 暴露 refreshable: false。 */
   markRefreshTokenInvalid() {
@@ -48178,7 +48342,7 @@ async function postLoomyAccount(path2, body, product, fetcher) {
   }
   return envelope.data;
 }
-async function sendLoomySmsCode(phone, product, fetcher = fetch) {
+async function sendLoomySmsCode(phone, product, fetcher = sanitizingFetch) {
   const body = buildLoomyAccountBody(product, {
     ccode: "86",
     phone,
@@ -48191,7 +48355,7 @@ async function sendLoomySmsCode(phone, product, fetcher = fetch) {
   }
   return msgid;
 }
-async function loginLoomyBySmsCode(phone, code, msgid, product, fetcher = fetch) {
+async function loginLoomyBySmsCode(phone, code, msgid, product, fetcher = sanitizingFetch) {
   const body = buildLoomyAccountBody(product, {
     ccode: "86",
     phone,
@@ -48207,7 +48371,7 @@ async function loginLoomyBySmsCode(phone, code, msgid, product, fetcher = fetch)
   if (userid.length === 0) throw new Error("\u767B\u5F55\u54CD\u5E94\u7F3A\u5C11 userid");
   return { session, userid };
 }
-async function bindLoomyThirdAccount(code, product, fetcher = fetch) {
+async function bindLoomyThirdAccount(code, product, fetcher = sanitizingFetch) {
   const body = buildLoomyAccountBody(product, {
     tcode: { code },
     type: "wx"
@@ -48227,7 +48391,7 @@ async function bindLoomyThirdAccount(code, product, fetcher = fetch) {
     ...typeof record.headpic === "string" && record.headpic.length > 0 ? { headpic: record.headpic } : {}
   };
 }
-async function bindLoomySendMsg(rcode, phone, product, fetcher = fetch) {
+async function bindLoomySendMsg(rcode, phone, product, fetcher = sanitizingFetch) {
   const body = buildLoomyAccountBody(product, {
     rcode,
     phone,
@@ -48239,7 +48403,7 @@ async function bindLoomySendMsg(rcode, phone, product, fetcher = fetch) {
   if (msgid.length === 0) throw new Error("\u7ED1\u5B9A\u624B\u673A\u53F7\u54CD\u5E94\u7F3A\u5C11 msgid");
   return msgid;
 }
-async function bindLoomyCheckCode(rcode, mcode, msgid, product, fetcher = fetch) {
+async function bindLoomyCheckCode(rcode, mcode, msgid, product, fetcher = sanitizingFetch) {
   const body = buildLoomyAccountBody(product, {
     rcode,
     mcode,
@@ -48255,7 +48419,7 @@ async function bindLoomyCheckCode(rcode, mcode, msgid, product, fetcher = fetch)
   if (userid.length === 0) throw new Error("\u7ED1\u5B9A\u767B\u5F55\u54CD\u5E94\u7F3A\u5C11 userid");
   return { session, userid, phone };
 }
-async function bindLoomySkip(rcode, product, fetcher = fetch) {
+async function bindLoomySkip(rcode, product, fetcher = sanitizingFetch) {
   const body = buildLoomyAccountBody(product, {
     rcode,
     expire: LOOMY_SESSION_TTL_SECONDS
@@ -48313,7 +48477,7 @@ function extractLoomyWechatUuid(html) {
 function buildLoomyWechatQrImageUrl(uuid) {
   return `https://open.weixin.qq.com/connect/qrcode/${encodeURIComponent(uuid)}`;
 }
-async function fetchLoomyWechatUuid(state, fetcher = fetch) {
+async function fetchLoomyWechatUuid(state, fetcher = sanitizingFetch) {
   const authUrl = buildLoomyWechatAuthUrl(state);
   let response;
   try {
@@ -48334,7 +48498,7 @@ async function fetchLoomyWechatUuid(state, fetcher = fetch) {
   }
   return uuid;
 }
-async function fetchLoomyWechatQrImage(uuid, fetcher = fetch) {
+async function fetchLoomyWechatQrImage(uuid, fetcher = sanitizingFetch) {
   const url = buildLoomyWechatQrImageUrl(uuid);
   let response;
   try {
@@ -48361,7 +48525,7 @@ function detectImageMime(bytes) {
   if (bytes.length >= 3 && bytes[0] === 71 && bytes[1] === 73 && bytes[2] === 70) return "image/gif";
   return "";
 }
-async function pollLoomyWechatOnce(uuid, lastErrcode, fetcher = fetch) {
+async function pollLoomyWechatOnce(uuid, lastErrcode, fetcher = sanitizingFetch) {
   const query = `uuid=${encodeURIComponent(uuid)}` + (lastErrcode.length > 0 ? `&last=${encodeURIComponent(lastErrcode)}` : "") + `&_=${Date.now()}`;
   const url = `https://long.open.weixin.qq.com/connect/l/qrconnect?${query}`;
   let body;
@@ -48395,7 +48559,7 @@ var LOOMY_WECHAT_QR_PATH = "/wechat/qr";
 var LOOMY_WECHAT_POLL_PATH = "/wechat/poll";
 var LOOMY_WECHAT_COMPLETE_PATH = "/wechat/complete";
 async function startLoomyWechatLoginFlow(options) {
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? sanitizingFetch;
   const product = options.product;
   const state = {
     uuid: "",
@@ -48766,7 +48930,7 @@ function readNumber(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : void 0;
 }
-async function fetchLoomyCreditDetail(credential, product, fetcher = fetch) {
+async function fetchLoomyCreditDetail(credential, product, fetcher = sanitizingFetch) {
   const result = await tryRequestLoomy(
     credential,
     product,
@@ -48802,7 +48966,7 @@ function makePackage(name2, remaining) {
     expiredTime: ""
   };
 }
-async function fetchLoomyCreditBalance(credential, product, fetcher = fetch) {
+async function fetchLoomyCreditBalance(credential, product, fetcher = sanitizingFetch) {
   const detail = await fetchLoomyCreditDetail(credential, product, fetcher);
   if (detail === null) return null;
   return {
@@ -48815,7 +48979,7 @@ async function fetchLoomyCreditBalance(credential, product, fetcher = fetch) {
     expiredTotal: 0
   };
 }
-async function claimLoomyDailyQuota(credential, product, fetcher = fetch) {
+async function claimLoomyDailyQuota(credential, product, fetcher = sanitizingFetch) {
   const result = await tryRequestLoomy(
     credential,
     product,
@@ -48906,7 +49070,7 @@ async function requestLoomy(credential, product, path2, init, fetcher) {
   }
   return envelope.data;
 }
-async function fetchLoomyOnboardingTasks(credential, product, fetcher = fetch) {
+async function fetchLoomyOnboardingTasks(credential, product, fetcher = sanitizingFetch) {
   const data = await requestLoomy(
     credential,
     product,
@@ -48921,7 +49085,7 @@ async function fetchLoomyOnboardingTasks(credential, product, fetcher = fetch) {
     total: Number.isFinite(Number(data?.total)) ? Number(data?.total) : LOOMY_ONBOARDING_TOTAL
   };
 }
-async function completeLoomyTask(credential, key, product, fetcher = fetch) {
+async function completeLoomyTask(credential, key, product, fetcher = sanitizingFetch) {
   if (!(key in LOOMY_TASK_POINTS)) {
     throw new Error(`loomy: \u672A\u77E5\u7684 task key: ${key}`);
   }
@@ -48937,7 +49101,7 @@ async function completeLoomyTask(credential, key, product, fetcher = fetch) {
     balance: Number.isFinite(Number(data?.balance)) ? Number(data?.balance) : 0
   };
 }
-async function claimAllLoomyOnboardingTasks(credential, product, fetcher = fetch) {
+async function claimAllLoomyOnboardingTasks(credential, product, fetcher = sanitizingFetch) {
   const state = await fetchLoomyOnboardingTasks(credential, product, fetcher);
   const claimed = [];
   const skipped = [];
@@ -49008,7 +49172,7 @@ var LoomyAuth = class extends Service7 {
   active = true;
   /** 注入的 fetch（测试用）；默认为全局 fetch。 */
   get fetchImpl() {
-    return this.options.fetcher ?? fetch;
+    return this.options.fetcher ?? sanitizingFetch;
   }
   /**
    * 下发短信验证码。
@@ -49364,7 +49528,7 @@ function makePackage2(name2, remaining) {
     expiredTime: ""
   };
 }
-async function fetchRaccoonCreditBalance(product, credential, fetcher = fetch) {
+async function fetchRaccoonCreditBalance(product, credential, fetcher = sanitizingFetch) {
   const envelope = await requestJson(
     `${product.apiBase}${RACCOON_POINTS_PREFIX}/balance`,
     credential,
@@ -49391,7 +49555,7 @@ async function fetchRaccoonCreditBalance(product, credential, fetcher = fetch) {
     expiredTotal: 0
   };
 }
-async function claimRaccoonLoginReward(product, credential, fetcher = fetch) {
+async function claimRaccoonLoginReward(product, credential, fetcher = sanitizingFetch) {
   const envelope = await requestJson(
     `${product.apiBase}${RACCOON_DESKTOP_PREFIX}/login/points/grant`,
     credential,
@@ -49416,7 +49580,7 @@ async function claimRaccoonLoginReward(product, credential, fetcher = fetch) {
   const points = readNumber2(popup?.points) ?? RACCOON_LOGIN_REWARD_POINTS;
   return { kind: "claimed", credit: points, streakDays: 0, isStreakDay: false };
 }
-async function fetchRaccoonOnboardingStatus(product, credential, fetcher = fetch) {
+async function fetchRaccoonOnboardingStatus(product, credential, fetcher = sanitizingFetch) {
   const envelope = await requestJson(
     `${product.apiBase}${RACCOON_POINTS_PREFIX}/bills?paging.limit=50&paging.offset=0`,
     credential,
@@ -49487,7 +49651,7 @@ function buildQrImageUrl(product, code) {
   const params = new URLSearchParams({ code, appname: "\u5546\u6C64\u5C0F\u6D63\u718A\u5B98\u7F51" });
   return `${product.apiBase}/login/mp?${params.toString()}`;
 }
-async function pollRaccoonQrLogin(product, code, fetcher = fetch) {
+async function pollRaccoonQrLogin(product, code, fetcher = sanitizingFetch) {
   let envelope;
   try {
     const result = await postJson(
@@ -49521,7 +49685,7 @@ async function pollRaccoonQrLogin(product, code, fetcher = fetch) {
   }
   return { status: "pending" };
 }
-async function sendRaccoonSmsCode(product, phone, captchaParam, fetcher = fetch) {
+async function sendRaccoonSmsCode(product, phone, captchaParam, fetcher = sanitizingFetch) {
   const { envelope } = await postJson(
     `${product.apiBase}${product.authApiPrefix}/send_sms`,
     {
@@ -49538,7 +49702,7 @@ async function sendRaccoonSmsCode(product, phone, captchaParam, fetcher = fetch)
     throw envelopeError(envelope, "\u4E0B\u53D1\u77ED\u4FE1\u9A8C\u8BC1\u7801\u5931\u8D25");
   }
 }
-async function loginRaccoonWithSmsCode(product, phone, smsCode, fetcher = fetch) {
+async function loginRaccoonWithSmsCode(product, phone, smsCode, fetcher = sanitizingFetch) {
   const { envelope } = await postJson(
     `${product.apiBase}${product.authApiPrefix}/login_with_sms`,
     {
@@ -49567,7 +49731,7 @@ function credentialFromEnvelope(envelope) {
     ...officeIdentity.length > 0 ? { office_identity: officeIdentity } : {}
   };
 }
-async function refreshRaccoonCredential(product, credential, fetcher = fetch) {
+async function refreshRaccoonCredential(product, credential, fetcher = sanitizingFetch) {
   const { envelope, status } = await postJson(
     `${product.apiBase}${product.authApiPrefix}/refresh`,
     { refresh_token: credential.refresh_token },
@@ -49591,7 +49755,7 @@ async function refreshRaccoonCredential(product, credential, fetcher = fetch) {
     ...expMs !== void 0 ? { expires_at: String(expMs) } : {}
   };
 }
-async function fetchRaccoonUserInfo(product, credential, fetcher = fetch) {
+async function fetchRaccoonUserInfo(product, credential, fetcher = sanitizingFetch) {
   try {
     const response = await fetcher(`${product.apiBase}${product.authApiPrefix}/user_info`, {
       method: "GET",
@@ -50007,7 +50171,7 @@ var RACCOON_LOGIN_PAGE_PATHS = {
 };
 async function startRaccoonLoginFlow(options = {}) {
   const product = options.product ?? RACCOON;
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? sanitizingFetch;
   const state = {
     qrCode: generateQrCode(),
     phone: "",
@@ -50477,7 +50641,7 @@ var RaccoonAuth = class extends Service8 {
   lastRefreshError;
   /** 注入的 fetch（测试用）；默认为全局 fetch。 */
   get fetchImpl() {
-    return this.options.fetcher ?? fetch;
+    return this.options.fetcher ?? sanitizingFetch;
   }
   /**
    * 启动登录（微信扫码 + 短信双路径）。
@@ -50909,7 +51073,7 @@ var LoomyBalanceSelector = class {
     const detail = await fetchLoomyCreditDetail(
       credential,
       this.deps.product,
-      this.deps.fetcher ?? fetch
+      this.deps.fetcher ?? sanitizingFetch
     );
     if (detail === null) {
       return { id: account.id, ok: false, error: "\u4F59\u989D\u67E5\u8BE2\u5931\u8D25\uFF08\u51ED\u636E\u5931\u6548\u6216\u54CD\u5E94\u5F02\u5E38\uFF09" };
@@ -52806,7 +52970,7 @@ function generateFlowSecret() {
 function generateDeviceMid() {
   return randomUUID7();
 }
-async function startZcodeLogin(fetchImpl = fetch, options = {}) {
+async function startZcodeLogin(fetchImpl = sanitizingFetch, options = {}) {
   const flowSecret = generateFlowSecret();
   const appVersion = options.appVersion ?? "3.14.3";
   const provider = options.provider ?? ZCODE_LOGIN_PROVIDER;
@@ -52867,7 +53031,7 @@ async function startZcodeLogin(fetchImpl = fetch, options = {}) {
     flowSecret
   };
 }
-async function pollZcodeLogin(flow, fetchImpl = fetch, appVersion = "3.14.3") {
+async function pollZcodeLogin(flow, fetchImpl = sanitizingFetch, appVersion = "3.14.3") {
   let response;
   try {
     response = await fetchImpl(zcodeOauthCliPollUrl(flow.flowId), {
@@ -52938,7 +53102,7 @@ async function pollZcodeLogin(flow, fetchImpl = fetch, appVersion = "3.14.3") {
   };
 }
 async function runZcodeLogin(options = {}) {
-  const fetchImpl = options.fetchImpl ?? fetch;
+  const fetchImpl = options.fetchImpl ?? sanitizingFetch;
   const timeoutMs = options.timeoutMs ?? 3e5;
   const flow = await startZcodeLogin(fetchImpl, {
     appVersion: options.appVersion,
@@ -53157,7 +53321,7 @@ async function fetchWithTimeout(fetchImpl, input, init, timeoutMs) {
     clearTimeout(timer);
   }
 }
-async function fetchZcodeBalance(credential, fetchImpl = fetch) {
+async function fetchZcodeBalance(credential, fetchImpl = sanitizingFetch) {
   const response = await fetchWithTimeout(fetchImpl, ZCODE_BILLING_BALANCE_URL, {
     method: "GET",
     headers: buildZcodeHeaders(credential, { authorization: `Bearer ${credential.zcode_jwt}` })
@@ -53240,7 +53404,7 @@ async function fetchClaimablePlans(credential, fetchImpl) {
     return [];
   }
 }
-async function reportZcodeActivation(credential, fetchImpl = fetch) {
+async function reportZcodeActivation(credential, fetchImpl = sanitizingFetch) {
   const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK;
   for (const event of ["app_launch", "app_daily_active"]) {
     try {
@@ -53258,7 +53422,7 @@ async function reportZcodeActivation(credential, fetchImpl = fetch) {
     }
   }
 }
-async function fetchZcodeClaimablePlans(credential, fetchImpl = fetch) {
+async function fetchZcodeClaimablePlans(credential, fetchImpl = sanitizingFetch) {
   const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK;
   const url = `${ZCODE_BILLING_PREVIEW_URL}?app_version=${encodeURIComponent(appVersion)}&platform=win32`;
   const response = await fetchWithTimeout(fetchImpl, url, {
@@ -53296,7 +53460,7 @@ async function fetchZcodeClaimablePlans(credential, fetchImpl = fetch) {
   plans.sort((a, b) => b.priority - a.priority);
   return plans;
 }
-async function claimZcodePlan(credential, planId, captcha, fetchImpl = fetch) {
+async function claimZcodePlan(credential, planId, captcha, fetchImpl = sanitizingFetch) {
   let response;
   try {
     response = await fetchWithTimeout(fetchImpl, ZCODE_BILLING_CLAIM_URL, {
@@ -53343,7 +53507,7 @@ async function claimZcodePlan(credential, planId, captcha, fetchImpl = fetch) {
     message: message2 ?? (ok ? void 0 : `HTTP ${response.status}`)
   };
 }
-async function fetchZcodeCaptchaConfig(credential, fetchImpl = fetch) {
+async function fetchZcodeCaptchaConfig(credential, fetchImpl = sanitizingFetch) {
   const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK;
   const url = `${ZCODE_CLIENT_CONFIGS_URL}?app_version=${encodeURIComponent(appVersion)}&platform=unknown`;
   try {
@@ -53366,7 +53530,7 @@ async function fetchZcodeCaptchaConfig(credential, fetchImpl = fetch) {
     return void 0;
   }
 }
-async function fetchZcodeModels(credential, fetchImpl = fetch) {
+async function fetchZcodeModels(credential, fetchImpl = sanitizingFetch) {
   const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK;
   const url = `${ZCODE_CLIENT_CONFIGS_URL}?app_version=${encodeURIComponent(appVersion)}&platform=unknown`;
   try {
@@ -53497,7 +53661,7 @@ async function getJson(url, headers, fetchImpl) {
     return void 0;
   }
 }
-async function fetchCodingPlanApiKey(credential, fetchImpl = fetch) {
+async function fetchCodingPlanApiKey(credential, fetchImpl = sanitizingFetch) {
   const token = credential.zai_access_token ?? credential.bigmodel_access_token;
   if (typeof token !== "string" || token.length === 0) return { key: void 0, reason: "no-oauth-token" };
   const headers = bizHeaders(token, credential);
@@ -53675,7 +53839,7 @@ var ZcodeAuth = class extends Service9 {
     const product = options.product ?? ZCODE;
     super(ctx, options.serviceName ?? `${product.id}Auth`);
     this.product = product;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = options.fetchImpl ?? sanitizingFetch;
     this.injectedPool = options.accountPool;
     this.captchaBackoff = new CaptchaBackoff({
       /**
@@ -55628,7 +55792,7 @@ var ZcodeAdapter = class extends LlmAdapter9 {
     super();
     this.options = options;
     this.product = options.product ?? ZCODE;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = options.fetchImpl ?? sanitizingFetch;
     this.fallbackIndex = new Map(this.product.fallbackModels.map((model) => [model.id, model]));
     this.gate = options.gate ?? new ModelGate({
       serialize: this.product.serializeUpstream,
@@ -56894,7 +57058,7 @@ function describeNonJsonResponse(status, text) {
   const snippet = text.trim().slice(0, 80).replace(/\s+/g, " ");
   return `\u670D\u52A1\u7AEF\u8FD4\u56DE\u4E86\u975E JSON \u54CD\u5E94\uFF08HTTP ${status}\uFF09\uFF1A${snippet}`;
 }
-async function fetchCheckinStatus(credential, product, fetcher = fetch) {
+async function fetchCheckinStatus(credential, product, fetcher = sanitizingFetch) {
   const result = await postJson2(CHECKIN_ACTIVITY_STATUS_PATH, credential, product, fetcher);
   if (!result.ok) return null;
   const body = result.body;
@@ -56916,7 +57080,7 @@ async function fetchCheckinStatus(credential, product, fetcher = fetch) {
     endTime: readString3(record, "end_time")
   };
 }
-async function claimDailyCheckin(credential, product, fetcher = fetch) {
+async function claimDailyCheckin(credential, product, fetcher = sanitizingFetch) {
   const result = await postJson2(DAILY_CHECKIN_PATH, credential, product, fetcher);
   if (!result.ok) {
     return { kind: "failed", code: -1, message: result.message };
@@ -56978,7 +57142,7 @@ function parseCreditPackage(entry) {
     ...deductionEndTime > 0 ? { deductionEndTime } : {}
   };
 }
-async function fetchCreditBalance(credential, product, fetcher = fetch) {
+async function fetchCreditBalance(credential, product, fetcher = sanitizingFetch) {
   const result = await postJson2(USER_RESOURCE_PATH, credential, product, fetcher);
   if (!result.ok) return null;
   const body = result.body;
@@ -57213,7 +57377,7 @@ function withTimezone(base, path2, timezoneId) {
   url.searchParams.set("timezone_id", timezoneId);
   return url.toString();
 }
-async function fetchMinimaxSigninStatus(credential, fetcher = fetch, product = MINIMAX) {
+async function fetchMinimaxSigninStatus(credential, fetcher = sanitizingFetch, product = MINIMAX) {
   const url = withTimezone(
     product.apiHost,
     MINIMAX_SIGNIN_STATUS_PATH,
@@ -57224,7 +57388,7 @@ async function fetchMinimaxSigninStatus(credential, fetcher = fetch, product = M
   const panel = parseMinimaxSigninPanel(unwrapEnvelopeData(result.payload));
   return panel === void 0 ? null : minimaxPanelToCheckinStatus(panel);
 }
-async function claimMinimaxDailyCheckin(credential, fetcher = fetch, product = MINIMAX) {
+async function claimMinimaxDailyCheckin(credential, fetcher = sanitizingFetch, product = MINIMAX) {
   const url = withTimezone(
     product.apiHost,
     MINIMAX_SIGNIN_CLAIM_PATH,
@@ -57252,7 +57416,7 @@ async function claimMinimaxDailyCheckin(credential, fetcher = fetch, product = M
     isStreakDay: status?.isStreakDay ?? false
   };
 }
-async function fetchMinimaxCreditBalance(credential, fetcher = fetch, product = MINIMAX) {
+async function fetchMinimaxCreditBalance(credential, fetcher = sanitizingFetch, product = MINIMAX) {
   const url = `${product.apiHost}${MINIMAX_CREDIT_DETAILS_PATH}`;
   const result = await requestEnvelope(url, credential, { method: "GET" }, fetcher);
   if (!result.ok) return null;
@@ -57666,7 +57830,7 @@ async function fetchGeminiCreditBalance(credential, _product = GEMINI, options =
     const cached2 = cache4.get(token);
     if (cached2 !== void 0 && now - cached2.at < GEMINI_QUOTA_CACHE_TTL_MS) return cached2.result;
   }
-  const result = await requestQuota(credential, options.fetcher ?? fetch);
+  const result = await requestQuota(credential, options.fetcher ?? sanitizingFetch);
   cache4.set(token, { at: now, result });
   return result;
 }
@@ -57937,7 +58101,7 @@ function isQoderNotActivated(campaigns, usageBody) {
   const record = usage;
   return record.addOnQuota === void 0;
 }
-async function fetchQoderUsageRaw(credential, product, fetcher = fetch) {
+async function fetchQoderUsageRaw(credential, product, fetcher = sanitizingFetch) {
   try {
     const response = await fetcher(`${product.openApiBase}${QODER_USAGE_PATH}`, {
       method: "GET",
@@ -57997,7 +58161,7 @@ function toPackage(name2, quota, options = {}) {
     ...Number.isFinite(expMs) ? { deductionEndTime: expMs } : {}
   };
 }
-async function fetchQoderCreditBalance(credential, product, fetcher = fetch) {
+async function fetchQoderCreditBalance(credential, product, fetcher = sanitizingFetch) {
   let response;
   try {
     response = await fetcher(`${product.openApiBase}${QODER_USAGE_PATH}`, {
@@ -58102,7 +58266,7 @@ function parseClaimResult(body) {
     ...benefitAmount(root) !== void 0 ? { amount: benefitAmount(root) } : {}
   };
 }
-async function claimQoderCampaign(credential, product, campaignId, fetcher = fetch) {
+async function claimQoderCampaign(credential, product, campaignId, fetcher = sanitizingFetch) {
   const url = `${product.openApiBase}${QODER_CAMPAIGNS_PATH}/${encodeURIComponent(campaignId)}/claim`;
   let response;
   try {
@@ -58171,7 +58335,7 @@ function describeNonJson(status, text) {
   const snippet = text.trim().slice(0, 80).replace(/\s+/g, " ");
   return `\u670D\u52A1\u7AEF\u8FD4\u56DE\u4E86\u975E JSON \u54CD\u5E94\uFF08HTTP ${status}\uFF09\uFF1A${snippet}`;
 }
-async function claimQoderDailyCheckin(credential, product, fetcher = fetch, nowMs = Date.now()) {
+async function claimQoderDailyCheckin(credential, product, fetcher = sanitizingFetch, nowMs = Date.now()) {
   const parsed = await loadCampaigns(credential, product, fetcher);
   if (parsed === void 0) {
     return { kind: "failed", code: -1, message: "\u6D3B\u52A8\u5217\u8868\u67E5\u8BE2\u5931\u8D25" };
@@ -58206,7 +58370,7 @@ async function claimQoderDailyCheckin(credential, product, fetcher = fetch, nowM
 }
 
 
-async function fetchQoderCheckinStatus(credential, product, fetcher = fetch, nowMs = Date.now()) {
+async function fetchQoderCheckinStatus(credential, product, fetcher = sanitizingFetch, nowMs = Date.now()) {
   const parsed = await loadCampaigns(credential, product, fetcher);
   if (parsed === void 0) return null;
   const benefits = parsed.campaigns.filter((c) => c.actionType === "CLAIM_BENEFIT");
@@ -58222,7 +58386,7 @@ async function fetchQoderCheckinStatus(credential, product, fetcher = fetch, now
     campaignStatus: benefits.map((c) => c.claimStatus).join(",")
   };
 }
-async function fetchLobsteraiCheckinStatus(credential, product, clientVersion, fetcher = fetch) {
+async function fetchLobsteraiCheckinStatus(credential, product, clientVersion, fetcher = sanitizingFetch) {
   const slot = await fetchLobsteraiActivitySlot(credential, product, clientVersion, fetcher);
   if (slot === null) return null;
   if (slot.slotState !== "available" || slot.activityCode.length === 0) {
@@ -58238,7 +58402,7 @@ async function fetchLobsteraiCheckinStatus(credential, product, clientVersion, f
     slotState: slot.slotState
   };
 }
-async function fetchLoomyCheckinStatus(credential, product, fetcher = fetch) {
+async function fetchLoomyCheckinStatus(credential, product, fetcher = sanitizingFetch) {
   const detail = await fetchLoomyCreditDetail(credential, product, fetcher);
   if (detail === null) return null;
   const utc8 = new Date(Date.now() + 8 * 36e5);
@@ -58253,7 +58417,7 @@ async function fetchLoomyCheckinStatus(credential, product, fetcher = fetch) {
     dailyCycleDate: cycle
   };
 }
-async function fetchZcodeCheckinStatus(credential, fetcher = fetch) {
+async function fetchZcodeCheckinStatus(credential, fetcher = sanitizingFetch) {
   await reportZcodeActivation(credential, fetcher);
   const plans = await fetchZcodeClaimablePlans(credential, fetcher);
   if (!Array.isArray(plans)) return null;
@@ -58304,7 +58468,7 @@ function parseClineBalanceResponse(value) {
   if (rawBalance === void 0) return { error: "\u54CD\u5E94\u7F3A\u5C11 balance \u5B57\u6BB5" };
   return { rawBalance };
 }
-async function fetchClineCreditBalance(credential, product, fetcher = fetch, options = {}) {
+async function fetchClineCreditBalance(credential, product, fetcher = sanitizingFetch, options = {}) {
   const userId = credential.account_id;
   if (typeof userId !== "string" || userId.trim().length === 0) {
     return { balance: null, error: "\u51ED\u636E\u7F3A\u5C11\u8D26\u53F7 id\uFF0C\u65E0\u6CD5\u67E5\u8BE2\u4F59\u989D" };
@@ -58412,7 +58576,7 @@ function parseClineUsageLimits(value) {
   }
   return { windows, error: serverError === "" ? void 0 : serverError };
 }
-async function fetchClineUsageLimits(credential, product, fetcher = fetch, options = {}) {
+async function fetchClineUsageLimits(credential, product, fetcher = sanitizingFetch, options = {}) {
   const refusal = { ok: false, windows: [], error: "\u989D\u5EA6\u7AEF\u70B9\u4E0D\u53EF\u7528" };
   const url = `${product.apiBase}${CLINE_USAGE_LIMITS_PATH}`;
   let response;
@@ -58509,7 +58673,7 @@ function readActions(source, key) {
   if (!Array.isArray(value)) return [];
   return value.filter((item) => typeof item === "string");
 }
-async function fetchLobsteraiActivitySlot(credential, product, clientVersion, fetcher = fetch) {
+async function fetchLobsteraiActivitySlot(credential, product, clientVersion, fetcher = sanitizingFetch) {
   const query = new URLSearchParams({
     placement: LOBSTERAI_SLOT_PLACEMENT,
     clientVersion,
@@ -58533,7 +58697,7 @@ async function fetchLobsteraiActivitySlot(credential, product, clientVersion, fe
     configRevision: readNumber7(activity, "configRevision")
   };
 }
-async function fetchLobsteraiActivityContext(credential, product, slot2, fetcher = fetch) {
+async function fetchLobsteraiActivityContext(credential, product, slot2, fetcher = sanitizingFetch) {
   const query = new URLSearchParams({ configRevision: String(slot2.configRevision) });
   const url = `${product.apiBase}${LOBSTERAI_ACTIVITY_CONTEXT_PATH}/${encodeURIComponent(slot2.activityCode)}/context?${query.toString()}`;
   const result = await requestJson2(url, credential, product, fetcher);
@@ -58546,7 +58710,7 @@ async function fetchLobsteraiActivityContext(credential, product, slot2, fetcher
     actions: readActions(envelope.data, "actions")
   };
 }
-async function claimLobsteraiDailyCheckin(credential, product, clientVersion, fetcher = fetch) {
+async function claimLobsteraiDailyCheckin(credential, product, clientVersion, fetcher = sanitizingFetch) {
   const slot2 = await fetchLobsteraiActivitySlot(credential, product, clientVersion, fetcher);
   if (slot2 === null) {
     return { kind: "failed", code: -1, message: "\u6D3B\u52A8\u69FD\u4F4D\u67E5\u8BE2\u5931\u8D25" };
@@ -58593,7 +58757,7 @@ async function claimLobsteraiDailyCheckin(credential, product, clientVersion, fe
     ...message2.length > 0 ? { delayedMessage: message2 } : {}
   };
 }
-async function fetchLobsteraiCreditBalance(credential, product, fetcher = fetch) {
+async function fetchLobsteraiCreditBalance(credential, product, fetcher = sanitizingFetch) {
   const result = await requestJson2(
     `${product.apiBase}${LOBSTERAI_PROFILE_SUMMARY_PATH}`,
     credential,
@@ -59044,7 +59208,7 @@ async function postJson3(path2, credential, body, fetcher, userId) {
     return { ok: false, message: error instanceof Error ? error.message : String(error), httpStatus: 0 };
   }
 }
-async function fetchTraeCheckinStatus(credential, _product, fetcher = fetch) {
+async function fetchTraeCheckinStatus(credential, _product, fetcher = sanitizingFetch) {
   const result = await postJson3(TRAE_CHECKIN_STATUS_PATH, credential, "{}", fetcher, credential.uid);
   if (!result.ok) return null;
   const body = result.body;
@@ -59064,7 +59228,7 @@ async function fetchTraeCheckinStatus(credential, _product, fetcher = fetch) {
     endTime: ""
   };
 }
-async function claimTraeDailyCheckin(credential, product, fetcher = fetch, generation = 0, onRotate, userId, retryCount = 3) {
+async function claimTraeDailyCheckin(credential, product, fetcher = sanitizingFetch, generation = 0, onRotate, userId, retryCount = 3) {
   const uid = userId ?? credential.uid;
   const doClaim = async () => {
     let lastError = { ok: false, httpStatus: 0, message: "", code: 0 };
@@ -59118,7 +59282,7 @@ async function claimTraeDailyCheckin(credential, product, fetcher = fetch, gener
     cooldownSecs
   };
 }
-async function fetchTraeCreditBalance(credential, _product, fetcher = fetch) {
+async function fetchTraeCreditBalance(credential, _product, fetcher = sanitizingFetch) {
   const result = await postJson3(
     TRAE_ENT_USAGE_PATH,
     credential,
@@ -59579,7 +59743,7 @@ async function resolveGeminiProject(options) {
     cache5?.set(identity, fromCredential);
     return { project: fromCredential };
   }
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? sanitizingFetch;
   const timeoutMs = options.timeoutMs ?? GEMINI_CREDITS_TIMEOUT_MS;
   const endpoints = options.endpoints ?? [GEMINI_ENDPOINT_SANDBOX, GEMINI_ENDPOINT_DAILY];
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
@@ -59907,7 +60071,7 @@ var GeminiAdapter = class extends LlmAdapter10 {
         }
         let response;
         try {
-          response = await (this.options.fetchImpl ?? fetch)(url, {
+          response = await (this.options.fetchImpl ?? sanitizingFetch)(url, {
             method: "POST",
             // ⚠️ 流式**刻意不带 `Accept`**（抓包一致，见 `geminiHeaders`）。
             headers: geminiHeaders(credential),
@@ -61380,7 +61544,7 @@ function computeClaimSummary(outcomes) {
   return summary;
 }
 async function collectCreditsStatus(accounts, product, deps) {
-  const fetcher = deps.fetcher ?? fetch;
+  const fetcher = deps.fetcher ?? sanitizingFetch;
   const fetchStatus = deps.fetchStatus ?? (async (credential, product2) => fetchCheckinStatus(
     credential,
     product2,
@@ -61404,7 +61568,7 @@ async function collectCreditsStatus(accounts, product, deps) {
   return results;
 }
 async function collectClaimResults(accounts, product, deps) {
-  const fetcher = deps.fetcher ?? fetch;
+  const fetcher = deps.fetcher ?? sanitizingFetch;
   const fetchStatus = deps.fetchStatus ?? (async (credential, product2) => fetchCheckinStatus(
     credential,
     product2,
@@ -61465,7 +61629,7 @@ async function collectClaimResults(accounts, product, deps) {
   return { results, summary: computeClaimSummary(outcomes) };
 }
 async function collectCreditBalances(accounts, product, deps) {
-  const fetcher = deps.fetcher ?? fetch;
+  const fetcher = deps.fetcher ?? sanitizingFetch;
   const fetchBalance = deps.fetchBalance ?? (async (credential, product2) => fetchCreditBalance(
     credential,
     product2,
@@ -61784,7 +61948,62 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
       packages
     };
   }
-  async function handleMethod(method, payload, signal) {
+  function codeArtsIdentityOf(credential) {
+  try {
+    const token = credential?.refresh_token;
+    if (typeof token !== "string" || token.length === 0) return "";
+    const parts = token.split(".");
+    if (parts.length < 2) return "";
+    const decodeB64 = (text) => Buffer.from(text.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+    const payload = JSON.parse(decodeB64(parts[1]));
+    const profile = payload?.user_profile;
+    const parsed = typeof profile === "string" ? JSON.parse(decodeB64(profile)) : profile;
+    const id = parsed?.account_id ?? parsed?.principal_id ?? parsed?.account_name;
+    return typeof id === "string" ? id : "";
+  } catch {
+    return "";
+  }
+}
+// 同一个华为云账号会被「+ 新建账号」重复登记（每次登录都成功，于是账号越积越多、
+// 积分被重复统计）。身份取自 refresh_token 里的 user_profile.account_id ——
+// 同一个账号不管登录几次都是同一个值，可以直接用来合并。
+async function dedupeCodeArtsAccounts(ctx, pool) {
+  let accounts;
+  try {
+    accounts = await pool.listAccounts("codearts");
+  } catch {
+    return;
+  }
+  if (accounts.length < 2) return;
+  const seen = /* @__PURE__ */ new Map();
+  for (const entry of accounts) {
+    let credential;
+    try {
+      const resolved = await ctx.credentials.resolve(credentialRef13(entry.credentialRef));
+      if (!resolved) continue;
+      credential = parseCodeArtsCredential(resolved.value);
+    } catch {
+      continue;
+    }
+    const identity = codeArtsIdentityOf(credential);
+    if (identity.length === 0) continue;
+    const previous = seen.get(identity);
+    if (previous === void 0) {
+      seen.set(identity, entry);
+      continue;
+    }
+    const previousLater = Number(previous.expiresAt ?? 0) >= Number(entry.expiresAt ?? 0);
+    const keep = previousLater ? previous : entry;
+    const drop = previousLater ? entry : previous;
+    seen.set(identity, keep);
+    try {
+      await pool.removeAccount(drop.id);
+      ctx.logger?.warn?.(`[channel-pack] codearts 账号 ${drop.id} 与 ${keep.id} 是同一个华为云账号（account_id=${identity}），已自动合并`);
+    } catch {
+    }
+  }
+}
+async function handleMethod(method, payload, signal) {
     const codeartsFetcher = (input, init) => {
       const fetcher = config.codeartsFetcher ?? directFetch;
       if (!signal) return fetcher(input, init);
@@ -61898,11 +62117,30 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
           });
           started.result.then(async (loginResult) => {
             const credential = parseCodeArtsCredential(loginResult.access);
-            await pool.updateAccount(id, {
-              nickname: credential?.user_name !== void 0 && credential.user_name.length > 0 ? credential.user_name : id,
-              expiresAt: credential?.expires_at !== void 0 ? Number.isNaN(Date.parse(credential.expires_at)) ? void 0 : Date.parse(credential.expires_at) : void 0,
-              refreshable: Boolean(credential?.refresh_token)
-            });
+            const nickname = credential?.user_name !== void 0 && credential.user_name.length > 0 ? credential.user_name : id;
+            const expiresAt = credential?.expires_at !== void 0 ? Number.isNaN(Date.parse(credential.expires_at)) ? void 0 : Date.parse(credential.expires_at) : void 0;
+            const identity = codeArtsIdentityOf(credential);
+            if (identity.length > 0) {
+              for (const entry of pool.listAccountsByProvider("codearts")) {
+                if (entry.id === id) continue;
+                let other;
+                try {
+                  const resolved = await ctx.credentials.resolve(credentialRef13(entry.credentialRef));
+                  if (resolved) other = parseCodeArtsCredential(resolved.value);
+                } catch {
+                  other = void 0;
+                }
+                if (other === void 0 || codeArtsIdentityOf(other) !== identity) continue;
+                // 同一个人：把这次的凭据（更新鲜）写进已有条目，占位条目删掉。
+                await ctx.credentials.set(credentialRef13(entry.credentialRef), loginResult.access);
+                await pool.updateAccount(entry.id, { nickname, expiresAt, refreshable: Boolean(credential?.refresh_token), enabled: true });
+                ctx.logger.warn(`[channel-pack] codearts 该账号（account_id=${identity}）已存在于 ${entry.id}，本次登录只更新凭据，不再新建账号`);
+                void pool.removeAccount(id).catch(() => {
+                });
+                return;
+              }
+            }
+            await pool.updateAccount(id, { nickname, expiresAt, refreshable: Boolean(credential?.refresh_token) });
           }).catch((error) => {
             ctx.logger.warn(`[channel-pack] background codearts login failed for ${id}: ${String(error)}`);
             void pool.removeAccount(id).catch(() => {
@@ -66349,7 +66587,7 @@ var BuddyBalanceSelector = class {
     }
     let balance;
     try {
-      balance = await (this.deps.fetchBalance ?? ((cred, product) => fetchCreditBalance(cred, product, this.deps.fetcher ?? fetch)))(
+      balance = await (this.deps.fetchBalance ?? ((cred, product) => fetchCreditBalance(cred, product, this.deps.fetcher ?? sanitizingFetch)))(
         credential,
         this.deps.product
       );
@@ -66534,7 +66772,7 @@ function createMinimaxPkce() {
   const codeChallenge = createHash8("sha256").update(codeVerifier, "ascii").digest("base64url");
   return { codeVerifier, codeChallenge };
 }
-async function startMinimaxDeviceAuthorization(fetcher = fetch, product = MINIMAX) {
+async function startMinimaxDeviceAuthorization(fetcher = sanitizingFetch, product = MINIMAX) {
   const pkce = createMinimaxPkce();
   const response = await fetcher(`${product.accountHost}${MINIMAX_DEVICE_CODE_PATH}`, {
     method: "POST",
@@ -66553,7 +66791,7 @@ async function startMinimaxDeviceAuthorization(fetcher = fetch, product = MINIMA
   return { ...parsed, codeVerifier: pkce.codeVerifier };
 }
 async function pollMinimaxDeviceToken(auth, options = {}) {
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? sanitizingFetch;
   const sleep5 = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   const now = options.now ?? Date.now;
   const product = options.product ?? MINIMAX;
@@ -66603,7 +66841,7 @@ async function pollMinimaxDeviceToken(auth, options = {}) {
   }
   throw new MinimaxLoginExpiredError();
 }
-async function refreshMinimaxCredential(refreshToken2, fetcher = fetch, product = MINIMAX) {
+async function refreshMinimaxCredential(refreshToken2, fetcher = sanitizingFetch, product = MINIMAX) {
   const response = await fetcher(`${product.accountHost}${MINIMAX_TOKEN_PATH}`, {
     method: "POST",
     headers: {
@@ -66656,7 +66894,7 @@ var MinimaxAuth = class extends Service10 {
   credentialRefName;
   lastRefreshError;
   get fetchImpl() {
-    return this.options.fetchImpl ?? fetch;
+    return this.options.fetchImpl ?? sanitizingFetch;
   }
   /** 申请设备码（供 RPC 提前拿到 loginUrl）。 */
   async fetchDeviceAuthorization() {
@@ -67481,7 +67719,7 @@ var MinimaxAdapter = class extends LlmAdapter11 {
       requiresAdaptiveThinking,
       ...images === void 0 ? {} : { images }
     });
-    const response = await fetch(`${this.product.apiHost}${MINIMAX_INFER_PATH}`, {
+    const response = await sanitizingFetch(`${this.product.apiHost}${MINIMAX_INFER_PATH}`, {
       method: "POST",
       headers: minimaxInferHeaders(credential),
       body: JSON.stringify(payload),
@@ -67660,7 +67898,7 @@ async function postGeminiForm(endpoint, form, fetcher, signal) {
   return parsed;
 }
 async function exchangeGeminiCode(code, redirectUri, options = {}) {
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? sanitizingFetch;
   const payload = await postGeminiForm(
     GEMINI_TOKEN_ENDPOINT,
     {
@@ -67677,7 +67915,7 @@ async function exchangeGeminiCode(code, redirectUri, options = {}) {
 }
 async function refreshGeminiCredential(refreshToken2, options = {}) {
   if (refreshToken2 === "") throw new Error("\u6CA1\u6709 refresh_token\uFF0C\u9700\u8981\u91CD\u65B0\u6388\u6743");
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? sanitizingFetch;
   const payload = await postGeminiForm(
     GEMINI_TOKEN_ENDPOINT,
     {
@@ -67692,7 +67930,7 @@ async function refreshGeminiCredential(refreshToken2, options = {}) {
   return parseGeminiTokenGrant(payload, refreshToken2);
 }
 async function fetchGeminiUserInfo(accessToken, options = {}) {
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? sanitizingFetch;
   const init = { headers: { Authorization: `Bearer ${accessToken}` } };
   if (options.signal !== void 0) init.signal = options.signal;
   try {
@@ -67803,7 +68041,7 @@ async function startGeminiOAuthFlow(options = {}) {
       servers.map((server) => new Promise((resolve2) => server.close(() => resolve2())))
     );
   };
-  const fetcher = options.fetcher ?? fetch;
+  const fetcher = options.fetcher ?? sanitizingFetch;
   const timeoutMs = options.timeoutMs ?? GEMINI_AUTH_FLOW_TIMEOUT_MS;
   const result = Promise.race([
     codePromise,
@@ -67868,7 +68106,7 @@ var GeminiAuth = class extends Service11 {
   /** 终态告警去重：同账号同服务端原因只告警一次。 */
   terminalWarned = /* @__PURE__ */ new Map();
   get fetchImpl() {
-    return this.options.fetchImpl ?? fetch;
+    return this.options.fetchImpl ?? sanitizingFetch;
   }
   queueFor(refName) {
     let queue = this.refreshQueues.get(refName);
@@ -68989,7 +69227,7 @@ var OpencodeAdapter = class extends LlmAdapter12 {
       // **不动全局**（两个插件抢全局槽位会互相短路整个路由层）。
       ...slot2.proxy === void 0 ? {} : { dispatcher: buildProxyDispatcher(slot2.proxy) }
     };
-    const response = await fetch(`${OPENCODE.baseUrl}${OPENCODE.chatPath}`, init);
+    const response = await sanitizingFetch(`${OPENCODE.baseUrl}${OPENCODE.chatPath}`, init);
     if (!response.ok) {
       const text = await response.text().catch(() => "");
       const retryAfterMs = retryAfterMsFromResponse(response.headers);

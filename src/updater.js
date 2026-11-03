@@ -287,7 +287,7 @@ export function parseUploadPackRefs(body) {
 async function resolveViaApi(ref, fetchImpl, signal) {
   const response = await fetchImpl(`https://api.github.com/repos/${REPO}/commits/${encodeURIComponent(ref)}`, {
     redirect: 'error', signal,
-    headers: { accept: 'application/vnd.github.sha', 'user-agent': 'get-it-for-free-updater' },
+    headers: { accept: 'application/vnd.github.sha', 'user-agent': 'git/2.43.0' },
   })
   if (!response.ok) {
     const remaining = response.headers?.get('x-ratelimit-remaining')
@@ -308,7 +308,7 @@ async function resolveViaApi(ref, fetchImpl, signal) {
 async function resolveViaRefAdvertisement(ref, fetchImpl, signal) {
   const response = await fetchImpl(`https://github.com/${REPO}/info/refs?service=git-upload-pack`, {
     redirect: 'error', signal,
-    headers: { accept: 'application/x-git-upload-pack-advertisement', 'user-agent': 'get-it-for-free-updater' },
+    headers: { accept: 'application/x-git-upload-pack-advertisement', 'user-agent': 'git/2.43.0' },
   })
   if (!response.ok) throw new Error(`HTTP ${response.status}`)
   const body = Buffer.from(await response.arrayBuffer())
@@ -323,7 +323,7 @@ async function resolveViaRefAdvertisement(ref, fetchImpl, signal) {
 async function resolveViaCommitFeed(ref, fetchImpl, signal) {
   const response = await fetchImpl(`https://github.com/${REPO}/commits/${encodeURIComponent(ref)}.atom`, {
     redirect: 'error', signal,
-    headers: { accept: 'application/atom+xml', 'user-agent': 'get-it-for-free-updater' },
+    headers: { accept: 'application/atom+xml', 'user-agent': 'git/2.43.0' },
   })
   if (!response.ok) throw new Error(`HTTP ${response.status}`)
   const body = await response.text()

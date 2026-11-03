@@ -47,5 +47,5 @@ export async function resolveAttributionUserAgent(logger) {
     const message = error instanceof Error ? error.message : String(error)
     logger?.debug?.(`get-it-for-free: attribution module unavailable (${message})`)
   }
-  return 'deepseek-harness/0.1.7 (+https://github.com/deepseek-ai/deepseek-harness)'
+  return ''
 }

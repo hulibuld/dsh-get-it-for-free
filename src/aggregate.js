@@ -50,6 +50,7 @@
  */
 
 import { CODE, UpstreamError, classifyFailure, classifyStreamFailure, readHead, readSse, replayStream, sniffBody, transportCause } from './http.js'
+import { APP_USER_AGENT } from './ua.js'
 import { egressFetch } from './egress.js'
 import { chatEndpoint, defaultHeaders, getProvider, modelsEndpoint, providerModelId } from './providers/index.js'
 import { displayModelName } from './catalog.js'
@@ -81,7 +82,7 @@ const DEFAULT_MAX_OUTPUT = 32768
 const SNIFF_BYTES = 4096
 const LISTING_TIMEOUT_MS = 15000
 const TURN_TIMEOUT_MS = 300000
-const USER_AGENT = 'dsh-get-it-for-free'
+const USER_AGENT = APP_USER_AGENT
 
 /** A trimmed non-empty string, or ''. */
 function text(value) {

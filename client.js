@@ -3357,16 +3357,24 @@ window.__ModuleLoader__.load({
       const describeEnvelope = value => {
         try {
           const keys = value === null || typeof value !== 'object' ? String(value) : Object.keys(value).join(',')
-          return `rpc-failed（{${keys}}${value?.type === undefined ? '' : ` type=${String(value.type)}`}）`
+          const reason = value?.error?.message ?? value?.message ?? value?.error
+          const detail = typeof reason === 'string' && reason !== '' ? `：${reason}` : ''
+          return `rpc-failed（{${keys}}${value?.type === undefined ? '' : ` type=${String(value.type)}`}）${detail}`
         } catch {
           return 'rpc-failed'
         }
       }
+      // 业务结果自己也可能带 `ok` 字段：account.test / degrade.test 失败时回的是
+      // {accountId, modelId, ok:false, message}，把它当信封错误抛出去，真实原因
+      // 就被换成了一串键名（用户看到的就是「操作失败：rpc-failed（{accountId,…}）」）。
+      // 真正的 RPC 信封错误一定带 error 对象（或至少 code），用它来区分。
+      const isRpcFailure = value => value !== null && typeof value === 'object' && value.ok === false &&
+        (value.error !== undefined || value.code !== undefined)
       const unwrapEnvelope = value => {
         let current = value
         for (let depth = 0; depth < 4; depth++) {
           if (current === null || typeof current !== 'object') return current
-          if (current.ok === false) throw new Error(describeEnvelope(current))
+          if (isRpcFailure(current)) throw new Error(describeEnvelope(current))
           if (current.ok === true && 'value' in current) { current = current.value; continue }
           if (current.type === 'server-response' && 'value' in current) { current = current.value; continue }
           return current
@@ -3397,10 +3405,10 @@ window.__ModuleLoader__.load({
           lastRaw = `status=${response.status} ${rawText.slice(0, 200)}`
           let body
           try { body = rawText === '' ? {} : JSON.parse(rawText) } catch { body = {} }
-          if (body?.type === 'server-response' && body.ok === false) throw new Error(describeEnvelope(body))
+          if (body?.type === 'server-response' && isRpcFailure(body)) throw new Error(describeEnvelope(body))
           const inner = body?.value ?? body
-          if (inner?.ok === true) return unwrapEnvelope(inner.value)
-          if (inner?.ok === false) throw new Error(describeEnvelope(inner))
+          if (isRpcFailure(inner)) throw new Error(describeEnvelope(inner))
+          if (inner?.ok === true && 'value' in inner) return unwrapEnvelope(inner.value)
           return inner
         } finally { clearTimeout(timer) }
       }, [])
@@ -3411,8 +3419,8 @@ window.__ModuleLoader__.load({
           const bridged = await post('/rpc', { method, payload }, timeoutMs)
           if (bridged?.ok === false) throw new Error(bridged.error ?? 'bridge-failed')
           const inner = unwrapEnvelope(bridged?.reply)
-          if (inner?.ok === true) { lastTransportKind = 'bridge'; return inner.value }
-          if (inner?.ok === false) throw new Error(describeEnvelope(inner))
+          if (isRpcFailure(inner)) throw new Error(describeEnvelope(inner))
+          if (inner?.ok === true && 'value' in inner) { lastTransportKind = 'bridge'; return inner.value }
           lastTransportKind = 'bridge'
           return inner
         } catch { /* 桥不通，落到下面的浏览器侧通道 */ }
@@ -3422,8 +3430,8 @@ window.__ModuleLoader__.load({
         const timer = setTimeout(() => controller.abort(), timeoutMs)
         try {
           const result = await latest.call.call(latest.connection.rpc, '/api', 'channel-pack', { method, payload }, controller.signal)
-          if (result?.ok === true) { lastTransportKind = 'rpc'; return unwrapEnvelope(result.value) }
-          if (result?.ok === false) throw new Error(describeEnvelope(result))
+          if (isRpcFailure(result)) throw new Error(describeEnvelope(result))
+          if (result?.ok === true && 'value' in result) { lastTransportKind = 'rpc'; return unwrapEnvelope(result.value) }
           lastTransportKind = 'rpc'
           return result
         } catch (error) {

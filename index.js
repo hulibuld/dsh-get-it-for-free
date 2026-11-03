@@ -30,9 +30,8 @@ import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { externalUrl, openExternal } from './src/open-external.js'
 import { ROUTE_LABELS, ROUTE_MAIN, ROUTE_REGION } from './src/adapter.js'
-import { DATA_DIR_NAME, LEGACY_DATA_DIR_NAME, resolveDshHome, publicModelVisibility, validateModelVisibility, isModelHidden, dayKey } from './src/store.js'
+import { DATA_DIR_NAME, LEGACY_DATA_DIR_NAME, resolveDshHome, publicModelVisibility, validateModelVisibility, isModelHidden } from './src/store.js'
 import { isEacEntry, isKiloEntry } from './src/catalog.js'
-import { STATE } from './src/probe.js'
 import { generateKey, rankLanAddresses, startForwardServer, startLanRelay } from './src/forward.js'
 import { chanGatewayCredential, chanGatewayEnabled, chanGatewayPort, startChanRelay } from './src/chan-relay.js'
 import { CODE, UpstreamError } from './src/http.js'
@@ -41,7 +40,7 @@ import { directFetch } from './src/eac.js'
 import { clearEacUser, readEacUser, writeEacUser } from './src/eac-user.js'
 import { createEacLoginPoller } from './src/eac-login.js'
 import { unlockSealedLane } from './src/vault.js'
-import { DEFAULT_LEVEL, budgetLadder, hasDeclaredEffortMenu } from './src/effort.js'
+import { budgetLadder } from './src/effort.js'
 import { modelAvailability } from './src/model-test.js'
 import { AnnouncementFeed } from './src/feed.js'
 import { createPickStats } from './src/picks.js'
@@ -50,10 +49,10 @@ import { selfReload, watchPackage, isReloading } from './src/reload.js'
 import { createPushHub } from './src/push.js'
 import { rejectionFor, isLoopbackHost, connectionAdmissionView } from './src/trust.js'
 import { resolveAttributionUserAgent } from './adapter/kernel.js'
-import { buildAggregateCatalog, fetchProviderModels, isAggregateEntry, testProvider } from './src/aggregate.js'
-import { buildComboCatalog, isComboEntry, normalizeCombos, pruneRotation } from './src/combos.js'
+import { fetchProviderModels, isAggregateEntry, testProvider } from './src/aggregate.js'
+import { buildComboCatalog, isComboEntry, normalizeCombos } from './src/combos.js'
 import { getProvider, listProviders } from './src/providers/index.js'
-import { addSavings, describeSavingsTotal, emptySavings, saverConfig, savingsPercent } from './src/token-saver/index.js'
+import { saverConfig } from './src/token-saver/index.js'
 import { CAVEMAN_LEVELS, PONYTAIL_LEVELS } from './src/token-saver/prompts.js'
 import { OPTIMIZATIONS } from './src/local-optimize.js'
 import { createModelRuntime, createRuntimeStores } from './src/core/runtime.js'
@@ -185,9 +184,8 @@ export function apply(ctx, config) {
   if (!fs.existsSync(dataDir) && fs.existsSync(legacyDataDir)) {
     try {
       fs.cpSync(legacyDataDir, dataDir, { recursive: true, preserveTimestamps: true })
-    } catch (error) {
+    } catch {
       // 迁移失败不阻塞启动：插件会按空目录重新初始化。
-      void error
     }
   }
   fs.mkdirSync(dataDir, { recursive: true })
@@ -293,7 +291,7 @@ export function apply(ctx, config) {
   // relationship with that gate. The token never reaches the browser: the page
   // sees a login name and a verdict, the file and the signed wire keep the
   // credential. `cached` is the sync bit /summary can carry.
-  const eacAuthCache = { at: 0, data: { available: false, authorized: false, login: '' } }
+  const eacAuthCache = { data: { available: false, authorized: false, login: '' } }
   const eacAuthRootOf = credential => credential.base.replace(/\/v1\/?$/, '')
   async function eacAuthStatus() {
     const credential = sealedCredentialOf()
@@ -329,14 +327,12 @@ export function apply(ctx, config) {
         repo: typeof data.repo === 'string' ? data.repo : '',
         checkedAt: Date.now(),
       }
-      eacAuthCache.at = Date.now()
       eacAuthCache.data = result
       return result
     } catch {
       // The gateway did not answer: report what this machine holds, marked
       // unverified, rather than claiming an authorization nobody confirmed.
       const fallback = { ...base, authorized: local !== null, unverified: true, checkedAt: Date.now() }
-      eacAuthCache.at = Date.now()
       eacAuthCache.data = fallback
       return fallback
     }
@@ -463,7 +459,7 @@ export function apply(ctx, config) {
   const modelRuntime = createModelRuntime({
     ...stores,
     logger,
-    attributionUserAgent: 'deepseek-harness',
+    attributionUserAgent: '',
     resolveImage: imageResolver(ctx, logger),
     sealedCredential: sealedCredentialOf,
     onSealedUnavailable: () => logger.warn?.('get-it-for-free: the sealed lane is not available in this composition (no recognized host profile); its models stay hidden'),
@@ -644,10 +640,8 @@ export function apply(ctx, config) {
   async function syncForwardOnce() {
     const desired = settings.get().forward ?? {}
     const wanted = desired.enabled === true
-    // A listener already bound where the settings want it is left alone. Two
-    // callers reconcile the same state — the boot refresh and every settings
-    // POST — and the second one used to close and re-bind the port anyway,
-    // resetting whatever request was in flight on the old socket.
+    // An already-bound listener is left alone: closing and re-binding resets
+    // whatever request is in flight on the old socket.
     if (forward !== null && wanted
       && forward.host === (desired.host || '127.0.0.1')
       && forward.requestedPort === (Number.isFinite(Number(desired.port)) ? Math.trunc(Number(desired.port)) : 0)) return
@@ -919,16 +913,9 @@ export function apply(ctx, config) {
     }
   }
 
-
   // ── egress outlet ───────────────────────────────────────────────────────────
   /** One gateway round trip at a time; the panel polls, the throttle decides. */
   let latencyMeasureInFlight = null
-  /**
-   * Which node the outlet is carrying traffic on, and what it costs to reach the
-   * gateway through it. Purely informational: every failure is a missing reading,
-   * never an error, because the outlet itself may be perfectly healthy while the
-   * controller call that describes it is not.
-   */
   /**
    * The settings page asks "how long does opencode take to answer right now", and
    * the honest answer is a real round trip through the outlet — not the age of the
@@ -948,6 +935,12 @@ export function apply(ctx, config) {
     try { await run } finally { if (latencyMeasureInFlight === run) latencyMeasureInFlight = null }
   }
 
+  /**
+   * Which node the outlet is carrying traffic on, and what it costs to reach the
+   * gateway through it. Purely informational: every failure is a missing reading,
+   * never an error, because the outlet itself may be perfectly healthy while the
+   * controller call that describes it is not.
+   */
   async function readOutletStatus() {
     const relay = outletRelay
     if (relay === null) {
@@ -1711,7 +1704,7 @@ export function apply(ctx, config) {
         logger.warn?.(`get-it-for-free: 进程内刷新失败，改走 RPC（${error?.message ?? error}）`)
       }
     }
-    const call = optional('connection')?.rpc?.call
+    const call = connectionRpcCall()
     if (typeof call !== 'function') {
       logger.warn?.(`get-it-for-free: 渠道模型刷新跳过（既没有 pack 句柄，也没有 connection.rpc：${reason}）`)
       return false
@@ -1788,8 +1781,8 @@ export function apply(ctx, config) {
     return () => clearTimeout(first)
   }, 'get-it-for-free: first update check')
 
-  // Keep the module-level "notified" marker in sync with the stored one so a
-  // reload does not re-toast the same version.
+  // Feed arrivals re-read the update status, so a newly published release reaches
+  // the page without waiting for the next periodic check.
   refreshUpdatePush = () => pushUpdate(false)
 
   function emitTopology() {
@@ -1818,7 +1811,8 @@ function httpError(statusCode, message) {
  * user edits by hand (the only way in on a headless composition) can carry
  * anything. Both timers below take their period from a stored number, so the
  * guard belongs here rather than in each caller.
- */function positiveOr(value, fallback, floor = 1) {
+ */
+function positiveOr(value, fallback, floor = 1) {
   const number = Number(value)
   if (!Number.isFinite(number) || number <= 0) return fallback
   return Math.max(floor, Math.trunc(number))
@@ -1892,15 +1886,6 @@ function imageResolver(ctx, logger) {
   }
 }
 
-/**
- * The settings page's HTTP surface.
- *
- * Every route runs the trust fence first: the connection service's own
- * admission when the composition mounts it (the same check the kernel applies
- * to `/api`), otherwise the structural replica in src/trust.js. The plugin's
- * prefix outranks `/api` in webServer's longest-prefix dispatch, so without
- * this fence these routes would answer callers the app itself would refuse.
- */
 /** The fixed failure classes the pool proxy may surface to the client. */
 const POOL_REASONS = new Set(['no-lane', 'gateway-status', 'malformed', 'unreachable'])
 
@@ -1937,7 +1922,15 @@ function noteRpcBridge(method, durationMs, reply, error) {
   }
 }
 
-
+/**
+ * The settings page's HTTP surface.
+ *
+ * Every route runs the trust fence first: the connection service's own
+ * admission when the composition mounts it (the same check the kernel applies
+ * to `/api`), otherwise the structural replica in src/trust.js. The plugin's
+ * prefix outranks `/api` in webServer's longest-prefix dispatch, so without
+ * this fence these routes would answer callers the app itself would refuse.
+ */
 export function createApiRoutes(deps) {
   return async function handler(req, res) {
     const url = new URL(req.url ?? '/', 'http://localhost')
@@ -1977,7 +1970,9 @@ export function createApiRoutes(deps) {
         const body = await readJson(req)
         const name = typeof body?.method === 'string' ? body.method : ''
         if (name === '') return send(400, { error: 'method required' })
-        const rpc = typeof deps.rpcCall === 'function' ? deps.rpcCall() : deps.connection?.rpc?.call
+        // `deps.connection` is the admission view (an `admit` getter only), never
+        // the real service, so the RPC entry point must come from `rpcCall`.
+        const rpc = typeof deps.rpcCall === 'function' ? deps.rpcCall() : undefined
         if (typeof rpc !== 'function') return send(503, { error: 'connection.rpc unavailable' })
         const startedAt = Date.now()
         try {
@@ -1997,7 +1992,6 @@ export function createApiRoutes(deps) {
       if (method === 'GET' && routePath === '/stats') {
         return send(200, buildStats(deps.stats.get(), deps.catalog()))
       }
-      // ── MiMo（小米桌面端额度）────────────────────────────────────────────────
       // ── CodeBuddy CLI 通道 ───────────────────────────────────────────────────
       if (routePath === '/cli-lane/status') {
         const force = url.searchParams.get('refresh') === '1'
@@ -2016,6 +2010,7 @@ export function createApiRoutes(deps) {
           return send(500, { ok: false, code: 'CLI_SELFTEST_FAILED', message: String(error?.message ?? error).slice(0, 300) })
         }
       }
+      // ── MiMo（小米桌面端额度）────────────────────────────────────────────────
       if (routePath === '/mimo/status') {
         const force = url.searchParams.get('refresh') === '1'
         try {
@@ -2358,7 +2353,6 @@ async function readJson(req) {
     throw httpError(400, `invalid JSON body (${error?.message ?? error})`)
   }
 }
-
 
 /**
  * The token-saver section as the browser may see it.

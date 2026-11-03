@@ -385,12 +385,70 @@ function userAgentWith(_attribution) {
   return CLIENT_UA
 }
 
+/*
+ * 上游看到的正文里不该带宿主身份。
+ *
+ * 宿主会把 DSH 的系统提示词和两行运行时上下文（checkout 路径、Web GUI 地址）
+ * 原样塞进 `options.system`，适配器照抄进 messages 就一起出去了。这里在序列化
+ * 之前逐级改写字符串。
+ *
+ * 词表与 vendor/channel-pack/pack.js 的 `sanitizeHarnessIdentityInBody` 是同一套。
+ * 那份是 vendored 单文件、import 不进来，所以两边各存一份 —— 改词表要两边一起改，
+ * 交接文档 §4.16 记了这条。
+ */
+const TRACE_PHRASE_REWRITES = [
+  ['DeepSeek Harness implementation checkout', 'runtime installation'],
+  ['DeepSeek Harness Web GUI', 'console UI'],
+  ['DeepSeek Harness.app', 'DeepSeek.app'],
+  ['the DeepSeek Harness Web GUI', 'the local console UI'],
+]
+
+const TRACE_BRAND_RE = /(?<![\\/])(DeepSeek)[\s\u00A0\u200B\u200C\u200D\uFEFF]*Harness(?![\\/])/gi
+
+function scrubTraceString(text) {
+  if (typeof text !== 'string' || text === '') return text
+  let out = text
+  for (const [from, to] of TRACE_PHRASE_REWRITES) {
+    if (out.includes(from)) out = out.split(from).join(to)
+  }
+  if (out.includes('deepseek-harness') || out.includes('DeepSeek-Harness')) out = out.replace(/deepseek-harness/gi, 'deepseek')
+  return out.replace(TRACE_BRAND_RE, '$1')
+}
+
+function scrubTraceValue(value) {
+  if (typeof value === 'string') return scrubTraceString(value)
+  if (Array.isArray(value)) {
+    let changed = false
+    const next = value.map(item => {
+      const scrubbed = scrubTraceValue(item)
+      if (scrubbed !== item) changed = true
+      return scrubbed
+    })
+    return changed ? next : value
+  }
+  if (value !== null && typeof value === 'object') {
+    let changed = false
+    const next = {}
+    for (const key of Object.keys(value)) {
+      const scrubbed = scrubTraceValue(value[key])
+      if (scrubbed !== value[key]) changed = true
+      next[key] = scrubbed
+    }
+    return changed ? next : value
+  }
+  return value
+}
+
+export function sanitizeOutboundBody(body) {
+  return scrubTraceValue(body)
+}
+
 export async function postStreamed({ path, body, session, attributionUserAgent, signal, onData, timeoutMs = 300000 }) {
   const headers = gatewayHeaders({ session: truncateSession(session), stream: true })
   headers['user-agent'] = userAgentWith(attributionUserAgent)
   let response
   try {
-    response = await egressFetch(`${UPSTREAM_BASE}${path}`, { method: 'POST', headers, body: JSON.stringify(body), redirect: 'error', signal })
+    response = await egressFetch(`${UPSTREAM_BASE}${path}`, { method: 'POST', headers, body: JSON.stringify(sanitizeOutboundBody(body)), redirect: 'error', signal })
   } catch (error) {
     // The signal's own reason is what fetch rejects with, and Node's is a
     // `TimeoutError`/user Error rather than `AbortError` — testing the name alone

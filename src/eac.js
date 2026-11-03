@@ -22,13 +22,14 @@
  */
 
 import crypto from 'node:crypto'
+import { APP_USER_AGENT } from './ua.js'
 import https from 'node:https'
 import http from 'node:http'
 import { Readable } from 'node:stream'
 // Web-stream adapter: http.js's readHead/readSse speak getReader(), so the
 // node:http response is converted into a proper WHATWG ReadableStream.
 import { ReadableStream } from 'node:stream/web'
-import { CODE, UpstreamError, classifyFailure, classifyStreamFailure, readHead, readSse, replayStream, sniffBody, transportCause } from './http.js'
+import { CODE, UpstreamError, classifyFailure, classifyStreamFailure, readHead, readSse, replayStream, sniffBody, transportCause, sanitizeOutboundBody } from './http.js'
 import { readEacUser } from './eac-user.js'
 
 const LISTING_TIMEOUT_MS = 15000
@@ -144,7 +145,7 @@ function headersFor(credential, method, fullUrl, body) {
   const headers = {
     'content-type': 'application/json',
     'accept': method === 'POST' ? 'text/event-stream' : 'application/json',
-    'user-agent': 'dsh-get-it-for-free',
+    'user-agent': APP_USER_AGENT,
   }
   if (credential.mode === 'worker') {
     const path = new URL(fullUrl).pathname
@@ -206,7 +207,7 @@ export async function fetchSealedListing(credential, { signal, timeoutMs = LISTI
  * fingerprints, request ids, the pooled-credential UA.
  */
 export async function postSealedStreamed({ credential, body, signal, onData, timeoutMs = TURN_TIMEOUT_MS }) {
-  const bodyText = JSON.stringify(body)
+  const bodyText = JSON.stringify(sanitizeOutboundBody(body))
   const turnUrl = `${credential.base}/chat/completions`
   let response
   try {

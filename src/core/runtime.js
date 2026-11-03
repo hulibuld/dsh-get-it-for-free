@@ -58,7 +58,7 @@ export function createRuntimeStores({ dataDir, logger = console }) {
 export function createModelRuntime({
   settings, stats, availability, catalogStore,
   logger = console,
-  attributionUserAgent = 'get-it-for-free',
+  attributionUserAgent = '',
   resolveImage,
   sealedCredential = () => null,
   onSealedUnavailable = () => {},
