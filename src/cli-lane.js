@@ -228,10 +228,26 @@ const CLI_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 /** Display names for the composer's effort menu. */
 const EFFORT_NAMES = { minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'XHigh', max: 'Max' }
 
+/**
+ * 回合没指定思考档位时发给 CLI 的档位。
+ *
+ * 不传 `--effort` 时 CLI 用它自己的默认（medium）。实测 deepseek-v4.1-flash
+ * 在这个档位上会先吐几百 KB 的 thinking_delta 才落第一个字：一个 413 KB 的
+ * 输出文件里 473 条全是 thinking_delta，整轮 900 秒打满仍在思考，最后报
+ * 「CodeBuddy CLI 在 900 秒内没有返回」。这条通道是当模型端点用的，把上游
+ * 当成一个「收到对话就回答」的接口，不需要长链推理，所以默认压到 low。
+ * 想要更快可设 `GET_IT_FOR_FREE_CLI_EFFORT=minimal`；用户在输入框里显式
+ * 选的档位永远优先于这个默认值。
+ */
+const DEFAULT_CLI_EFFORT = (() => {
+  const raw = String(process.env.GET_IT_FOR_FREE_CLI_EFFORT ?? '').trim().toLowerCase()
+  return CLI_EFFORTS.includes(raw) ? raw : 'low'
+})()
+
 function effortFlag(value) {
   const id = typeof value === 'string' ? value.trim().toLowerCase() : ''
   if (id === 'off' || id === 'none' || id === 'disabled') return 'minimal'
-  return CLI_EFFORTS.includes(id) ? id : ''
+  return CLI_EFFORTS.includes(id) ? id : DEFAULT_CLI_EFFORT
 }
 
 /**
