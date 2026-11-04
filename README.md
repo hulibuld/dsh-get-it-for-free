@@ -95,6 +95,10 @@ CLI 三分钟不出字就直说。有一次模型在正文里要求调用 bash�
 
 `vendor/channel-pack/` 里的第三方代码保留各自原许可证，见同目录的 `NOTICE.md`。
 
+## 已知问题与修复记录
+
+累计的修复、现象、原因与修法记在 [docs/FIXES.md](docs/FIXES.md)。以后每修一次加一行，别攒着。
+
 ## 许可
 
 MIT。
