@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 先看 README 的「已知问题与修复记录」
+    url: https://github.com/hulibuld/dsh-get-it-for-free
+    about: 装不上、连不通这类问题大多已经写在里面了
+  - name: 看仓库里的版本记录
+    url: https://github.com/hulibuld/dsh-get-it-for-free/releases
+    about: 这个插件只通过 GitHub 分发，版本以这里的标签为准
