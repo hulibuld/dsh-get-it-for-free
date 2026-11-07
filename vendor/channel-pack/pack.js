@@ -33527,10 +33527,14 @@ function isQueueError(status, body) {
  * 于是用户被引去重登凭据，实际只要等几秒重试。实测（2026-11-03 23:43）：
  * 连续两次都拿到这个码，约 40 秒后同一份凭据恢复 200。
  */
+// 502/504 是华为云网关自己回的（HTML 错误页 / APIG.0203 Backend timeout）：
+// 请求已经到了上游，只是后端那台机器当时不可用。早期只认 403/503，
+// 于是这类几秒钟的抖动被当成硬失败直接抛给用户。
 function isTransientGatewayError(status, body) {
-  if (status !== 403 && status !== 503) return false;
   const text = String(body ?? "");
   if (text.includes("TM.00001041")) return false;
+  if (status >= 500 && status <= 599) return true;
+  if (status !== 403) return false;
   return /TM\.0000|网络繁忙|请稍后重试|network\s+busy|service\s+busy|try\s+again\s+later/i.test(text);
 }
 function isAuthError(status, body) {
@@ -33595,8 +33599,14 @@ function logCodeArtsFailure(entry) {
   } catch {
   }
 }
+// 网关自己挂掉时回的是 HTML（502 Bad Gateway / CW）。把整段标签塞进对话
+// 没任何用处，只会让人以为是插件坏了，识别出来就换一句人话。
+var HTML_ERROR_PAGE_RE = /^\s*<(?:!doctype|html|head|body|center)/i;
 function describeCodeArtsFailure(status, body) {
   const raw = typeof body === "string" ? body.trim() : "";
+  if (HTML_ERROR_PAGE_RE.test(raw)) {
+    return `codearts: 上游网关暂时不可用（HTTP ${status}）—— 华为云那一侧的错误页，不是密钥或插件的问题`;
+  }
   const detail = raw.length > 0 ? errorDetail(raw) : "";
   const suffix = detail.length > 0 ? ` — ${detail.slice(0, 300)}` : "（上游没有返回错误正文）";
   return `codearts: 上游拒绝了请求（HTTP ${status}）${suffix}`;
@@ -34113,7 +34123,7 @@ var CodeArtsAdapter = class extends LlmAdapter {
         if (isTransientGatewayError(response.status, errorText)) {
           logCodeArtsFailure({ status: response.status, body: errorText, accountId: currentAccountId ?? null, model: options.model });
           if (transientAttempts < 3) {
-            const waitMs = 700 * 2 ** transientAttempts;
+            const waitMs = (response.status >= 500 ? 1500 : 700) * 2 ** transientAttempts;
             transientAttempts += 1;
             await delay(waitMs, options.signal);
             continue;

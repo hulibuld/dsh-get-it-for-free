@@ -844,6 +844,9 @@ function diagnoseFailure(text) {
       'CodeBuddy CLI 登录已失效，请在终端里运行 codebuddy 重新登录', 'CLI_AUTH', false],
     [AUTH_ERROR_RE,
       'CodeBuddy CLI 登录已失效（令牌被上游拒绝，401），请到设置页重新登录这个账号', 'CLI_AUTH', false],
+    [/(?:prompt is too long|context_length_exceeded|maximum context|too many tokens|token.{0,12}limit)/iu,
+      '这轮对话太长，超出了 CodeBuddy 通道的上下文上限（约 100 万 token）：先压缩会话或新开一个对话再试',
+      'CLI_CONTEXT_TOO_LONG', false],
     [/(?:service_unavailable|API key verification service temporarily unavailable)/iu,
       'CodeBuddy 服务端暂时不可用（过一会儿再试即可）', 'CLI_UPSTREAM', true],
     [/^\s*(?:Error:\s*)?50[0234]\b/imu,
@@ -965,7 +968,17 @@ function parseAnswer(stdout, stderr) {
   // several, and the final one is the answer that matters.
   const final = finals[finals.length - 1]
   if (final.is_error === true || String(final.subtype ?? '').startsWith('error')) {
-    const detail = typeof final.result === 'string' && final.result !== '' ? final.result : ''
+    // 真正的死因在 result / errors / errors_info 里（比如 `400 prompt is too long`），
+    // stdout 前 4000 字只有开头的增量记录，以前正好把这段最有用的话丢掉了。
+    const detail = [
+      typeof final.result === 'string' ? final.result : '',
+      ...(Array.isArray(final.errors) ? final.errors : []),
+      ...(Array.isArray(final.errors_info)
+        ? final.errors_info.map(row => (row !== null && typeof row === 'object' ? row.details ?? row.code ?? '' : ''))
+        : []),
+    ]
+      .filter(value => typeof value === 'string' && value !== '')
+      .join('\n')
     throw cliError(diagnoseFailure(`${final.subtype ?? ''}\n${detail}\n${stderr}\n${text.slice(0, 4000)}`))
   }
   const answer = final.structured_output ?? final.result
@@ -993,6 +1006,65 @@ function parseAnswer(stdout, stderr) {
  * The conversation goes in as data, not as instructions — that framing is what
  * stops a coding agent from deciding it should start editing files.
  */
+/** 粗估一段内容的 token 数：中文按 1 字 1 个算，其余按 3.5 字符 1 个。 */
+function estimateTokens(value) {
+  const text = typeof value === 'string' ? value : JSON.stringify(value ?? '')
+  let cjk = 0
+  for (const ch of text) {
+    const code = ch.codePointAt(0)
+    if (
+      (code >= 0x3400 && code <= 0x9fff)
+      || (code >= 0xf900 && code <= 0xfaff)
+      || (code >= 0x3000 && code <= 0x303f)
+      || (code >= 0xff00 && code <= 0xffef)
+    ) cjk += 1
+  }
+  return Math.ceil(cjk + (text.length - cjk) / 3.5)
+}
+
+/**
+ * 这个通道的上下文上限是 1048576 token，超一点上游就回
+ * `400 prompt is too long`，整轮直接失败。留出余量主动裁掉最老的对话，
+ * 比让用户对着同一句话反复重试有用：他当时的现场都在最近几轮里。
+ */
+const CLI_TOKEN_BUDGET = Number.parseInt(process.env.GET_IT_FOR_FREE_CLI_TOKEN_BUDGET ?? '', 10) || 850000
+
+/** 就地裁剪 envelope，返回是否动过刀。 */
+function fitEnvelope(envelope) {
+  const messages = envelope.messages
+  if (!Array.isArray(messages) || messages.length === 0) return { trimmed: false, dropped: 0 }
+  const sizes = messages.map(message => estimateTokens(message))
+  let total = sizes.reduce((sum, size) => sum + size, 0) + estimateTokens(envelope.system ?? '') + 4000
+  if (total <= CLI_TOKEN_BUDGET) return { trimmed: false, dropped: 0 }
+  let head = 0
+  while (head < messages.length - 2 && total > CLI_TOKEN_BUDGET) {
+    total -= sizes[head]
+    head += 1
+  }
+  if (head > 0) messages.splice(0, head)
+  // 单条就超预算（常见于一次超长工具输出）时截短它，而不是整轮失败。
+  let guard = 0
+  while (total > CLI_TOKEN_BUDGET && guard < 200) {
+    guard += 1
+    let worst = -1
+    let worstSize = 0
+    for (let index = 0; index < messages.length; index += 1) {
+      const content = messages[index] === null ? undefined : messages[index].content
+      if (typeof content !== 'string' || content.length < 4000) continue
+      const size = estimateTokens(content)
+      if (size > worstSize) {
+        worst = index
+        worstSize = size
+      }
+    }
+    if (worst < 0) break
+    const content = messages[worst].content
+    messages[worst].content = `${content.slice(0, Math.max(2000, Math.floor(content.length / 2)))}\n…（此处内容过长，已按上下文上限截断）…`
+    total -= Math.max(1, Math.floor(worstSize / 2))
+  }
+  return { trimmed: true, dropped: head }
+}
+
 function buildPrompt(options, tools) {
   const messages = (options.messages ?? []).map(message => {
     if (message === null || typeof message !== 'object') return { role: 'unknown', content: String(message) }
@@ -1011,10 +1083,14 @@ function buildPrompt(options, tools) {
     tools,
     responseSchema: answerSchema(),
   })
+  const fitting = fitEnvelope(envelope)
   return [
     '处理下面的请求：用 StructuredOutput 提交恰好一个对象，形如 {"text":"回复内容","toolCalls":[]}。',
     '需要客户端执行工具时，把 {"name":"工具名","arguments":{…}} 放进 toolCalls；不需要就留空数组。',
     '不要在普通文字里输出协议 JSON，也不要提交第二个版本。',
+    ...(fitting.trimmed
+      ? [`（这轮对话在进入这个通道前被裁剪过：丢掉最早 ${fitting.dropped} 条消息并截短过长内容，以适配 ${CLI_TOKEN_BUDGET} token 的输入预算。）`]
+      : []),
     '',
     JSON.stringify(envelope),
   ].join('\n')
