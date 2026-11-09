@@ -3295,7 +3295,7 @@ window.__ModuleLoader__.load({
       trae: { claim: true, status: true },
       cline: { unit: 'dollars' },
       loomy: { claim: true, status: true },
-      raccoon: {},
+      raccoon: { claim: true, status: true },
       minimax: { claim: true, status: true },
       zcode: { claim: true, status: true, unit: 'tokens' },
       gemini: {},

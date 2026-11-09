@@ -33602,8 +33602,24 @@ function logCodeArtsFailure(entry) {
 // 网关自己挂掉时回的是 HTML（502 Bad Gateway / CW）。把整段标签塞进对话
 // 没任何用处，只会让人以为是插件坏了，识别出来就换一句人话。
 var HTML_ERROR_PAGE_RE = /^\s*<(?:!doctype|html|head|body|center)/i;
+// 华为云的临时凭证（security_token）有寿命：到点后网关回 400
+// `APIG.0602 Bad request: the security token has expired`。
+// 这句话既不是密钥坏，也不是插件错 —— 用 refresh_token 续期一次就能继续用。
+// 必须单独认出来：混进「401/403 密钥无效」那条路会把用户引去重登，
+// 混进普通 400 会让人以为是请求写错了。
+function isCodeArtsSecurityTokenExpired(status, body) {
+  if (status !== 400) return false;
+  const text = typeof body === "string" ? body : "";
+  if (!text.includes("APIG.0602")) return false;
+  // 只认「过期」。同样带 APIG.0602 的 `invalid token format` 是凭据本身被写坏
+  //（换行/截断），续期也救不回来，应当原样上报而不是伪装成「已自动续期」。
+  return /expired/i.test(text);
+}
 function describeCodeArtsFailure(status, body) {
   const raw = typeof body === "string" ? body.trim() : "";
+  if (isCodeArtsSecurityTokenExpired(status, raw)) {
+    return "codearts: 华为云临时令牌已过期（APIG.0602）—— 插件已尝试自动续期并重发；仍失败请点该账号行的「续期」，或重新登录这个账号";
+  }
   if (HTML_ERROR_PAGE_RE.test(raw)) {
     return `codearts: 上游网关暂时不可用（HTTP ${status}）—— 华为云那一侧的错误页，不是密钥或插件的问题`;
   }
@@ -34166,6 +34182,37 @@ var CodeArtsAdapter = class extends LlmAdapter {
               throw new LlmError2("codearts: credential missing after refresh; log in again", "MISSING_CREDENTIAL");
             }
             continue;
+          }
+          throw new LlmError2(describeCodeArtsFailure(response.status, errorText), "AUTH", { status: response.status });
+        }
+        // 华为云临时令牌过期（HTTP 400 + APIG.0602 the security token has expired）。
+        // 它既不是 401/403 的「密钥坏」，也不是普通请求错误：换一份新凭据重发就能继续。
+        // 顺序与 auth 分支一致 —— 先换号（不用等几十秒的续期），换不到再强制续期当前账号。
+        if (isCodeArtsSecurityTokenExpired(response.status, errorText)) {
+          logCodeArtsFailure({ status: response.status, body: errorText, accountId: currentAccountId ?? null, model: options.model });
+          if (this.options.accountPool) {
+            const nextExpired = await this.options.accountPool.getAvailableAccount("codearts", options.model, rateLimitTried);
+            if (nextExpired && !rateLimitTried.has(nextExpired.entry.id)) {
+              rateLimitTried.add(nextExpired.entry.id);
+              credential = nextExpired.credential;
+              currentAccountId = nextExpired.entry.id;
+              this.pinSession(credential.access_key_id);
+              authRefreshed = false;
+              continue;
+            }
+          }
+          if (!authRefreshed) {
+            authRefreshed = true;
+            try {
+              await this.options.refresh?.({ force: true });
+            } catch (error) {
+              console.warn("[codearts] 临时令牌过期后强制续期失败（不影响诊断）:", error);
+            }
+            const renewed = await this.options.resolveCredential();
+            if (renewed !== void 0 && renewed.security_token) {
+              credential = renewed;
+              continue;
+            }
           }
           throw new LlmError2(describeCodeArtsFailure(response.status, errorText), "AUTH", { status: response.status });
         }
@@ -44698,14 +44745,17 @@ var CodeArtsAuth = class extends Service {
    *
    * @param pool 账号池；提供时把新 `expiresAt` / `refreshable` 写回。
    * @param accountId 账号 id，调用方已知时显式传入（反查会跳过已停用账号）。
+   * @param options `force: true` 时不看有效期直接续一次 —— 面板的「续期」按钮与
+   *   「上游说 security_token 已过期」的兜底都必须用这个，因为临时令牌可能**提前**
+   *   失效（实际失效时间比凭据里的 `expires_at` 早），只按有效期判断会续不到。
    */
-  async refreshAccountCredential(refName, pool, accountId) {
+  async refreshAccountCredential(refName, pool, accountId, options = {}) {
     await this.queueFor(refName).run(async () => {
       const ref = credentialRef2(refName);
       const credential = await this.readCredential(refName);
       if (credential === void 0) throw new Error("\u51ED\u636E\u672A\u914D\u7F6E");
       if (!isCodeArtsRefreshable(credential)) throw new Error("\u65E0 refresh_token\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55");
-      if (!shouldRefreshNow(CODEARTS_EXPIRY_ACCESSORS.expiresAtOf(credential))) {
+      if (options.force !== true && !shouldRefreshNow(CODEARTS_EXPIRY_ACCESSORS.expiresAtOf(credential))) {
         await syncAccountExpiry({
           pool,
           provider: "codearts",
@@ -49615,6 +49665,235 @@ async function fetchRaccoonOnboardingStatus(product, credential, fetcher = sanit
     break;
   }
   return { claimed, points };
+}
+
+// ── 商汤（Raccoon / 小浣熊）签到 ──────────────────────────────────────────
+//
+// 商汤这家**没有「点一下签到」这个动作**：每日积分由服务端按 UTC+8 自然日发放
+// （账单单据 `biz_type=daily_grant` / `每日积分发放`，实测两个账号各 +300），
+// 当日 24:00 清零；应用内 i18n 原文就是「每日积分每天 00:00 发放，默认当日 24:00 清零」。
+//
+// 所以这里的「签到」= 两件事：
+//   1. 读今天的发放记录，徽章显示「今日已领 +300」（和别的渠道同一条渲染路径）；
+//   2. 「一键领取」只处理**还没领的桌面端登录奖励**（一次性 3000 积分，
+//      走 `/api/web/desktop/v1/login/points/grant`，实测已领时回 granted:false）；
+//      今天的每日积分已经自动到账时如实报「已发放」，不谎报成领取成功。
+var RACCOON_DAILY_GRANT_BIZ = "daily_grant";
+var RACCOON_UTC8_OFFSET_MS = 8 * 36e5;
+var RACCOON_BILL_PAGE_LIMIT = 100;
+/** 今天（UTC+8 自然日）的起止毫秒。 */
+function raccoonTodayRangeUtc8(nowMs = Date.now()) {
+  const local = nowMs + RACCOON_UTC8_OFFSET_MS;
+  const startLocal = Math.floor(local / 864e5) * 864e5;
+  return { start: startLocal - RACCOON_UTC8_OFFSET_MS, end: startLocal - RACCOON_UTC8_OFFSET_MS + 864e5 };
+}
+function raccoonBillTimeMs(value) {
+  return typeof value === "string" && value.length > 0 ? Date.parse(value) : Number.NaN;
+}
+/**
+ * 今天的每日积分是否已发放。账单按时间倒序，翻页到「最旧一条早于今天 0 点」为止。
+ *
+ * @returns `{ granted, credit }`；接口异常返回 `null`（区分「没发放」与「查不到」——
+ *   两者混成同一个返回值就会长出假徽章，ZCode 踩过这个坑）。
+ */
+async function fetchRaccoonTodayDailyGrant(product, credential, fetcher = sanitizingFetch) {
+  const { start, end } = raccoonTodayRangeUtc8();
+  let offset = 0;
+  for (let page = 0; page < 4; page += 1) {
+    const envelope = await requestJson(
+      `${product.apiBase}${RACCOON_POINTS_PREFIX}/bills?paging.limit=${RACCOON_BILL_PAGE_LIMIT}&paging.offset=${offset}`,
+      credential,
+      product,
+      { method: "GET" },
+      fetcher
+    );
+    if (!envelope.ok || envelope.data === void 0) return null;
+    const items = Array.isArray(envelope.data.items) ? envelope.data.items : [];
+    let credit = 0;
+    let granted = false;
+    let oldestMs = Number.POSITIVE_INFINITY;
+    for (const raw of items) {
+      if (typeof raw !== "object" || raw === null || Array.isArray(raw)) continue;
+      const at = raccoonBillTimeMs(raw.created_at);
+      if (Number.isFinite(at) && at < oldestMs) oldestMs = at;
+      if (raw.biz_type !== RACCOON_DAILY_GRANT_BIZ) continue;
+      if (!Number.isFinite(at) || at < start || at >= end) continue;
+      granted = true;
+      const points = readNumber2(raw.points);
+      if (points !== void 0 && points > 0) credit += points;
+    }
+    if (granted) return { granted: true, credit };
+    if (items.length < RACCOON_BILL_PAGE_LIMIT) return { granted: false, credit: 0 };
+    if (Number.isFinite(oldestMs) && oldestMs < start) return { granted: false, credit: 0 };
+    offset += RACCOON_BILL_PAGE_LIMIT;
+  }
+  return { granted: false, credit: 0 };
+}
+/**
+ * 网页端「签到」的实际触发方式（2026-11-09 用真账号实测）。
+ *
+ * 商汤**没有**一个叫 `checkin` 的接口：账单里那条 `daily_grant / 每日积分发放`
+ * 的 `grant_at` 写的是当天 00:00，但真正落库的时刻是「这个账号当天第一次以
+ * **网页客户端**身份访问办公接口」的那一秒 —— `client_type` 字段就是 `web`。
+ * 实测证据（账号 `RaccoonMatthew`，当天在网页版没动过，账单为空）：
+ *
+ * ```
+ * 12:11 用 desktop UA 调 /api/web/points/v1/balance、user_info   → 无账单
+ * 13:38 换成 Chrome UA + Origin/Referer，依次 GET
+ *        /api/web/auth/v1/user_info
+ *        /api/web/office/v3/online_activities
+ *        /api/web/office/v3/setting_info
+ *        /api/web/office/v3/projects                             → 立刻出现
+ *        daily_grant 每日积分发放 +300（created_at 13:38:19，grant_at 当天 00:00）
+ * ```
+ *
+ * 另有一个账号当天在网页版打开过（同一时刻 13:19:06 同样落了一条 +300）。
+ * 也就是说：**插件只要模仿网页客户端的请求头，打一次办公接口，每日 300 就到账。**
+ * 别做成假按钮，也别去猜 `daily/grant` 之类的路径（那些全是 404）。
+ */
+var RACCOON_WEB_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
+function raccoonWebHeaders(credential) {
+  return {
+    Accept: "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    Authorization: `Bearer ${credential.access_token}`,
+    Origin: RACCOON_API_BASE,
+    Referer: `${RACCOON_API_BASE}/work/home`,
+    "User-Agent": RACCOON_WEB_UA,
+    "X-Raccoon-Language": "zh",
+    ...credential.office_identity ? { "X-Org-Code": credential.office_identity } : {}
+  };
+}
+/**
+ * 打一遍网页端办公接口，让服务端把当天的每日积分落库。
+ *
+ * 顺序照网页首屏的请求来；四个都是**只读 GET**，失败只记不抛 —— 真正的判据是
+ * 调用之后账单里有没有出现今天的 `daily_grant`。
+ */
+async function probeRaccoonWebActivity(product, credential, fetcher = sanitizingFetch) {
+  const paths = [
+    "/api/web/auth/v1/user_info",
+    "/api/web/office/v3/online_activities",
+    "/api/web/office/v3/setting_info",
+    "/api/web/office/v3/projects"
+  ];
+  const headers = raccoonWebHeaders(credential);
+  let okCount = 0;
+  for (const path of paths) {
+    try {
+      const response = await fetcher(`${product.apiBase}${path}`, {
+        method: "GET",
+        headers,
+        signal: AbortSignal.timeout(RACCOON_REQUEST_TIMEOUT_MS)
+      });
+      if (response.ok) okCount += 1;
+    } catch {
+    }
+  }
+  return okCount;
+}
+/**
+ * 领当天的每日积分：先看账单，没有再模拟网页活动，然后按账单确认。
+ *
+ * 注意「查不到」和「没发放」严格分开：账单接口异常返回 `null`，直接报失败，
+ * 不谎称已领（ZCode 假徽章的教训）。
+ */
+async function claimRaccoonDailyGrant(product, credential, fetcher = sanitizingFetch) {
+  const before = await fetchRaccoonTodayDailyGrant(product, credential, fetcher);
+  if (before === null) {
+    return { kind: "failed", code: -1, message: "积分账单查询失败（接口没有正常返回）" };
+  }
+  if (before.granted) {
+    const amount = before.credit > 0 ? `（+${before.credit} 积分）` : "";
+    return { kind: "already-claimed", message: `今日积分已经发放过了${amount}` };
+  }
+  const okCount = await probeRaccoonWebActivity(product, credential, fetcher);
+  if (okCount === 0) {
+    return { kind: "failed", code: -1, message: "模拟网页端活动失败（办公接口全部请求失败）" };
+  }
+  // 发放是服务端异步入账，稍等一下再看账单；三次都没有就是今天不满足发放条件。
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await delay(1200);
+    const after = await fetchRaccoonTodayDailyGrant(product, credential, fetcher);
+    if (after === null) continue;
+    if (after.granted) {
+      const amount = after.credit > 0 ? `（+${after.credit} 积分）` : "";
+      return { kind: "claimed", credit: after.credit, unit: "credit", message: `已领取今日积分${amount}` };
+    }
+  }
+  return { kind: "inactive", message: "已模拟网页端活动，但服务端这次没有发放每日积分（今天可能不满足发放条件）" };
+}
+
+/**
+ * 商汤的签到状态（形状对齐 WorkBuddy / CodeArts 的 `todayCheckedIn` / `todayCredit`）。
+ *
+ * `claimable` 只代表**有一次性的桌面端登录奖励可以领**，不代表每天能点出积分；
+ * 前端拿它决定「一键领取」点了之后说什么，不要把自动发放说成手动领取。
+ */
+async function fetchRaccoonCheckinStatus(product, credential, fetcher = sanitizingFetch) {
+  const daily = await fetchRaccoonTodayDailyGrant(product, credential, fetcher);
+  if (daily === null) return null;
+  const tasks = await requestJson(
+    `${product.apiBase}${RACCOON_POINTS_PREFIX}/tasks`,
+    credential,
+    product,
+    { method: "GET" },
+    fetcher
+  );
+  let loginRewardPending = false;
+  if (tasks.ok && tasks.data !== void 0) {
+    const states = Array.isArray(tasks.data.new_user_task_states) ? tasks.data.new_user_task_states : [];
+    const state = states.find((item) => typeof item === "object" && item !== null && item.key === "desktop_login");
+    loginRewardPending = state !== void 0 && state.status !== "completed";
+  }
+  return {
+    active: true,
+    todayCheckedIn: daily.granted === true,
+    todayCredit: daily.granted === true ? daily.credit : 0,
+    dailyCredit: daily.granted === true ? daily.credit : 0,
+    // 今天还没发放时，点「一键领取」会模拟一次网页端活动把它领下来；
+    // 有未领的一次性登录奖励时，那一项排在前面。
+    claimable: loginRewardPending || daily.granted !== true,
+    loginRewardPending,
+    dailyGranted: daily.granted === true,
+    // 「签到」= 模拟网页客户端活动，由服务端落库每日积分（见 probeRaccoonWebActivity）。
+    autoGranted: false,
+    webTriggered: true
+  };
+}
+/**
+ * 「一键领取」：有未领的登录奖励就领它，没有就如实报今天的发放状态。
+ *
+ * ⚠️ 永不抛：异常统一成 failed + 原文，面板与自动签到调度器读同一套字段。
+ */
+async function claimRaccoonDailyReward(product, credential, fetcher = sanitizingFetch) {
+  try {
+    const status = await fetchRaccoonCheckinStatus(product, credential, fetcher);
+    if (status === null) {
+      return { kind: "failed", code: -1, message: "签到状态查询失败（积分账单接口没有正常返回）" };
+    }
+    // 一次性桌面端登录奖励优先（若账号还没领过）。
+    if (status.loginRewardPending) {
+      const outcome = await claimRaccoonLoginReward(product, credential, fetcher);
+      if (outcome.kind === "claimed") {
+        return { ...outcome, message: `已领取桌面端登录奖励（+${outcome.credit} 积分）` };
+      }
+      if (outcome.kind !== "already-claimed") return outcome;
+    }
+    if (status.todayCheckedIn) {
+      const amount = status.todayCredit > 0 ? `（+${status.todayCredit} 积分）` : "";
+      return { kind: "already-claimed", message: `今日积分已经发过了${amount}` };
+    }
+    return await claimRaccoonDailyGrant(product, credential, fetcher);
+  } catch (error) {
+    return {
+      kind: "failed",
+      ok: false,
+      status: "failed",
+      code: -1,
+      message: error instanceof Error ? error.message : String(error)
+    };
+  }
 }
 
 // vendor/channel-pack/src/raccoon-oauth.ts
@@ -58913,7 +59192,7 @@ function unwrapSnapEnvelope(raw) {
   }
   return { ok: true, data: raw };
 }
-async function signedSnapRequest(method, url, credential, body, fetcher) {
+async function signedSnapRequest(method, url, credential, body, fetcher, renew) {
   const { access_key_id: ak, secret_access_key: sk, security_token: st } = credential;
   if (!ak || !sk) {
     return { ok: false, code: -1, message: "\u51ED\u636E\u7F3A\u5C11 AK/SK" };
@@ -58934,6 +59213,17 @@ async function signedSnapRequest(method, url, credential, body, fetcher) {
     });
     const text = await response.text();
     if (!response.ok) {
+      // 临时令牌过期：拿到调用方注入的续期回调就换一份新凭据原地重发一次。
+      // 只重发一次 —— 续期后还判过期说明凭据真坏了，再绕就成死循环。
+      if (typeof renew === "function" && isCodeArtsSecurityTokenExpired(response.status, text)) {
+        try {
+          const next = await renew(credential);
+          if (next !== void 0 && typeof next.security_token === "string" && next.security_token.length > 0) {
+            return await signedSnapRequest(method, url, next, body, fetcher, void 0);
+          }
+        } catch {
+        }
+      }
       return { ok: false, code: response.status, message: describeHttpFailure(response.status, text) };
     }
     let parsed;
@@ -58991,9 +59281,9 @@ function parseCreditBalance(metrics) {
   );
   return { total, packages, expiredTotal: 0 };
 }
-async function fetchCodeArtsAccountInfoDetailed(credential, fetcher = directFetch) {
+async function fetchCodeArtsAccountInfoDetailed(credential, fetcher = directFetch, renew) {
   const url = `${CODEARTS_SNAP_ENGINE_URL}${CODEARTS_PACKAGE_INFO_PATH}`;
-  const result = await signedSnapRequest("GET", url, credential, void 0, fetcher);
+  const result = await signedSnapRequest("GET", url, credential, void 0, fetcher, renew);
   if (!result.ok) return { ok: false, message: result.message };
   const data = result.data;
   const pkg = readRecord(data, "package");
@@ -59024,9 +59314,9 @@ function parseActivity(item) {
     amount: readNumber8(item, "benefitAmount") || readNumber8(item, "amount") || readNumber8(item, "creditAmount")
   };
 }
-async function fetchCodeArtsOpsActivitiesDetailed(credential, fetcher = directFetch) {
+async function fetchCodeArtsOpsActivitiesDetailed(credential, fetcher = directFetch, renew) {
   const url = `${CODEARTS_SNAP_ENGINE_URL}${CODEARTS_OPS_DELIVERY_PATH}?channel=${CODEARTS_OPS_CHANNEL}`;
-  const result = await signedSnapRequest("GET", url, credential, void 0, fetcher);
+  const result = await signedSnapRequest("GET", url, credential, void 0, fetcher, renew);
   if (!result.ok) return { ok: false, message: result.message };
   const items = result.data.items;
   if (!Array.isArray(items)) return { ok: false, message: "\u54CD\u5E94\u7F3A\u5C11 items \u5B57\u6BB5" };
@@ -59048,14 +59338,14 @@ function findDailyCheckinActivity(activities) {
  * 判据来自活动列表本身：`claimable === false` 且 `status` 落在 CLAIMED_STATUSES
  * 里，才算今天已领；`claimable === true` 是还没领，徽章不显示。
  */
-async function fetchCodeArtsCheckinStatus(credential, fetcher = directFetch) {
-  const infoResult = await fetchCodeArtsAccountInfoDetailed(credential, fetcher);
+async function fetchCodeArtsCheckinStatus(credential, fetcher = directFetch, renew) {
+  const infoResult = await fetchCodeArtsAccountInfoDetailed(credential, fetcher, renew);
   if (!infoResult.ok) return null;
   const info = infoResult.info;
   if (!info.isCreditPackage) {
     return { active: false, todayCheckedIn: false, todayCredit: 0 };
   }
-  const activitiesResult = await fetchCodeArtsOpsActivitiesDetailed(credential, fetcher);
+  const activitiesResult = await fetchCodeArtsOpsActivitiesDetailed(credential, fetcher, renew);
   if (!activitiesResult.ok) return null;
   const activity = findDailyCheckinActivity(activitiesResult.activities);
   if (activity === void 0) {
@@ -59071,12 +59361,12 @@ async function fetchCodeArtsCheckinStatus(credential, fetcher = directFetch) {
     campaignStatus: activity.status
   };
 }
-async function claimCodeArtsDailyCheckin(credential, fetcher = directFetch) {
+async function claimCodeArtsDailyCheckin(credential, fetcher = directFetch, renew) {
   // 签到必须**永不抛**：抛出去的错在 collectClaimResults 里会被压成一个没有
   // 上下文的 code:-1，面板只剩「操作失败」。这里把整条流程包起来，任何异常都
   // 变成一条带原文的 failed 结果，面板和自动签到调度器都读得到原因。
   try {
-    const outcome = await claimCodeArtsDailyCheckinInner(credential, fetcher);
+    const outcome = await claimCodeArtsDailyCheckinInner(credential, fetcher, renew);
     return { ok: outcome.kind === "claimed", status: outcome.kind, ...outcome };
   } catch (error) {
     return {
@@ -59088,8 +59378,8 @@ async function claimCodeArtsDailyCheckin(credential, fetcher = directFetch) {
     };
   }
 }
-async function claimCodeArtsDailyCheckinInner(credential, fetcher = directFetch) {
-  const infoResult = await fetchCodeArtsAccountInfoDetailed(credential, fetcher);
+async function claimCodeArtsDailyCheckinInner(credential, fetcher = directFetch, renew) {
+  const infoResult = await fetchCodeArtsAccountInfoDetailed(credential, fetcher, renew);
   if (!infoResult.ok) {
     return { kind: "failed", code: -1, message: `\u8D26\u6237\u4FE1\u606F\u67E5\u8BE2\u5931\u8D25\uFF1A${infoResult.message}` };
   }
@@ -59100,7 +59390,7 @@ async function claimCodeArtsDailyCheckinInner(credential, fetcher = directFetch)
       message: info.isTokenPackage ? "Token \u8BA1\u8D39\u8D26\u6237\uFF0C\u4E0D\u5728\u79EF\u5206\u6D3B\u52A8\u8303\u56F4" : "\u975E\u79EF\u5206\u8BA1\u8D39\u8D26\u6237\uFF0C\u4E0D\u5728\u79EF\u5206\u6D3B\u52A8\u8303\u56F4"
     };
   }
-  const activitiesResult = await fetchCodeArtsOpsActivitiesDetailed(credential, fetcher);
+  const activitiesResult = await fetchCodeArtsOpsActivitiesDetailed(credential, fetcher, renew);
   if (!activitiesResult.ok) {
     return { kind: "failed", code: -1, message: `\u6D3B\u52A8\u5217\u8868\u67E5\u8BE2\u5931\u8D25\uFF1A${activitiesResult.message}` };
   }
@@ -59119,7 +59409,8 @@ async function claimCodeArtsDailyCheckinInner(credential, fetcher = directFetch)
     `${CODEARTS_SNAP_ENGINE_URL}${CODEARTS_OPS_CLAIM_PATH}`,
     credential,
     JSON.stringify({ campaignId: activity.campaignId, channel: CODEARTS_OPS_CHANNEL }),
-    fetcher
+    fetcher,
+    renew
   );
   if (!claimResult.ok) {
     return { kind: "failed", code: claimResult.code, message: claimResult.message };
@@ -59131,7 +59422,8 @@ async function claimCodeArtsDailyCheckinInner(credential, fetcher = directFetch)
       `${CODEARTS_SNAP_ENGINE_URL}${CODEARTS_OPS_CONFIRM_PATH}`,
       credential,
       JSON.stringify({ campaignId: activity.campaignId }),
-      fetcher
+      fetcher,
+      renew
     );
   }
   const claimCredit = readNumber8(claimResult.data, "benefitAmount") || readNumber8(claimResult.data, "credit") || readNumber8(claimResult.data, "credits") || readNumber8(claimResult.data, "creditAmount") || readNumber8(claimResult.data, "amount");
@@ -61564,10 +61856,13 @@ async function collectCreditsStatus(accounts, product, deps) {
   for (const entry of accounts) {
     let status = null;
     try {
+      // prepare：发请求前的按需续期钩子（CodeArts 的临时令牌两小时一换，
+      // 面板一打开就查余额/状态时最容易撞到过期）。其它渠道不传就跳过。
+      if (deps.prepare !== void 0) await deps.prepare(entry);
       const resolved = await deps.resolve(credentialRef13(entry.credentialRef));
       if (resolved !== void 0) {
         const credential = JSON.parse(resolved.value);
-        status = await fetchStatus(credential, product);
+        status = await fetchStatus(credential, product, entry);
       }
     } catch (error) {
       deps.warn?.(`[channel-pack] credits.status \u8D26\u53F7 ${entry.id} \u5931\u8D25: ${String(error)}`);
@@ -61595,6 +61890,7 @@ async function collectClaimResults(accounts, product, deps) {
   for (const entry of accounts) {
     let outcome;
     try {
+      if (deps.prepare !== void 0) await deps.prepare(entry);
       const resolved = await deps.resolve(credentialRef13(entry.credentialRef));
       if (resolved === void 0) {
         outcome = { kind: "failed", code: -1, message: "\u51ED\u636E\u672A\u914D\u7F6E" };
@@ -61652,19 +61948,20 @@ async function collectCreditBalances(accounts, product, deps) {
     let error;
     let extra;
     try {
+      if (deps.prepare !== void 0) await deps.prepare(entry);
       const resolved = await deps.resolve(credentialRef13(entry.credentialRef));
       if (resolved === void 0) {
         error = "\u51ED\u636E\u672A\u914D\u7F6E";
       } else {
         const credential = JSON.parse(resolved.value);
         if (fetchDetailed !== void 0) {
-          const detailed = await fetchDetailed(credential, product);
+          const detailed = await fetchDetailed(credential, product, entry);
           balance = detailed.balance;
           error = detailed.error;
           extra = detailed.extra;
           if (balance === null && error === void 0) error = "\u4F59\u989D\u67E5\u8BE2\u5931\u8D25";
         } else {
-          balance = await fetchBalance(credential, product);
+          balance = await fetchBalance(credential, product, entry);
           if (balance === null) error = "\u4F59\u989D\u67E5\u8BE2\u5931\u8D25";
         }
       }
@@ -62012,6 +62309,55 @@ async function dedupeCodeArtsAccounts(ctx, pool) {
     } catch {
     }
   }
+}
+/**
+ * 读接口发请求前先按需续期一次（CodeArts）。
+ *
+ * 余额 / 签到状态 / 领取三条 RPC 过去直接拿存储里的凭据出网。CodeArts 的
+ * security_token 只有约两小时寿命，而续期调度器是每 30 分钟一轮 ——
+ * 宿主刚启动、面板立刻打开时，这两者必然撞车，界面上就是
+ * 「HTTP 400：APIG.0602 Bad request: the security token has expired」
+ * （2026-11-08 实测：App 21:38 启动，21:43 打开设置页，账单一栏全部报过期；
+ * 同一时刻 30 分钟续期任务才刚换到新凭据，新凭据直连 200）。
+ *
+ * `refreshAccountCredential` 自带「距过期不足 1 小时才真发请求」的过滤，
+ * 所以这里无脑调用不会每个面板都烧一次 refresh_token。
+ */
+async function ensureCodeArtsAccountFresh(ctx, codearts, pool, entry) {
+  try {
+    await codearts.refreshAccountCredential(entry.credentialRef, pool, entry.id);
+  } catch (error) {
+    ctx.logger?.warn?.(
+      `[channel-pack] codearts \u8D26\u53F7 ${entry.id} \u9884\u7EED\u671F\u5931\u8D25\uFF08\u4E0D\u5F71\u54CD\u672C\u6B21\u8BF7\u6C42\uFF09\uFF1A${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+/**
+ * 上游判「临时令牌过期」时的强制续期回调：换新凭据后**重新读一遍存储**再返回。
+ *
+ * ⚠️ 用 `force: true`：临时令牌可能比凭据里的 `expires_at` 更早失效，
+ * 只按有效期判断会续不到，重发仍然是 0602。
+ *
+ * @returns 新凭据；续期失败返回 undefined，调用方按原错误上报。
+ */
+function codeArtsRenewer(ctx, codearts, pool, entry) {
+  return async () => {
+    try {
+      await codearts.refreshAccountCredential(entry.credentialRef, pool, entry.id, { force: true });
+    } catch (error) {
+      ctx.logger?.warn?.(
+        `[channel-pack] codearts \u8D26\u53F7 ${entry.id} \u5F3A\u5236\u7EED\u671F\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`
+      );
+      return void 0;
+    }
+    const resolved = await ctx.credentials.resolve(credentialRef13(entry.credentialRef));
+    if (resolved === void 0) return void 0;
+    try {
+      return JSON.parse(resolved.value);
+    } catch {
+      return void 0;
+    }
+  };
 }
 async function handleMethod(method, payload, signal) {
     const codeartsFetcher = (input, init) => {
@@ -62527,7 +62873,9 @@ async function handleMethod(method, payload, signal) {
           if (!entry) throw new Error(`Account ${req.accountId} not found`);
           switch (entry.provider) {
             case "codearts":
-              await codearts.refreshAccountCredential(entry.credentialRef, pool, entry.id);
+              // 面板上的「续期」是用户明确要换一份新令牌，必须强制续：
+              // 按有效期判断的话，令牌还有一小时寿命时点了等于没点（真实报障）。
+              await codearts.refreshAccountCredential(entry.credentialRef, pool, entry.id, { force: true });
               break;
             case "buddy":
               await buddy.refreshAccountCredential(entry.credentialRef, pool, entry.id);
@@ -62929,7 +63277,12 @@ async function handleMethod(method, payload, signal) {
           const codeartsStatusAccounts = await pool.listAccounts(req.provider);
           const value = await collectCreditsStatus(codeartsStatusAccounts, void 0, {
             resolve: (ref) => ctx.credentials.resolve(ref),
-            fetchStatus: (credential) => fetchCodeArtsCheckinStatus(credential, codeartsFetcher),
+            prepare: (entry) => ensureCodeArtsAccountFresh(ctx, codearts, pool, entry),
+            fetchStatus: (credential, _product, entry) => fetchCodeArtsCheckinStatus(
+              credential,
+              codeartsFetcher,
+              entry === void 0 ? void 0 : codeArtsRenewer(ctx, codearts, pool, entry)
+            ),
             warn: (msg) => ctx.logger?.warn?.(msg)
           });
           return { ok: true, value: { accounts: value } };
@@ -63006,6 +63359,15 @@ async function handleMethod(method, payload, signal) {
           );
           return { ok: true, value: { accounts: value } };
         }
+        if (req.provider === RACCOON.id) {
+          const raccoonStatusAccounts = await pool.listAccounts(req.provider);
+          const raccoonValue = await collectCreditsStatus(raccoonStatusAccounts, RACCOON, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchStatus: (credential, product2) => fetchRaccoonCheckinStatus(product2 ?? RACCOON, credential),
+            warn: (msg) => ctx.logger?.warn?.(msg)
+          });
+          return { ok: true, value: { accounts: raccoonValue } };
+        }
         const product = productById(req.provider);
         if (product === void 0) {
           return { ok: false, error: { code: "bad-request", message: `unsupported provider: ${req.provider}` } };
@@ -63034,7 +63396,12 @@ async function handleMethod(method, payload, signal) {
         if (req.provider === "codearts") {
           const value2 = await collectClaimResults(accounts, void 0, {
             resolve: (ref) => ctx.credentials.resolve(ref),
-            claim: (credential) => claimCodeArtsDailyCheckin(credential, codeartsFetcher),
+            prepare: (entry) => ensureCodeArtsAccountFresh(ctx, codearts, pool, entry),
+            claim: (credential, _product, entry) => claimCodeArtsDailyCheckin(
+              credential,
+              codeartsFetcher,
+              entry === void 0 ? void 0 : codeArtsRenewer(ctx, codearts, pool, entry)
+            ),
             precheckStatus: false,
             warn: (msg) => ctx.logger?.warn?.(msg)
           });
@@ -63127,13 +63494,18 @@ async function handleMethod(method, payload, signal) {
           };
         }
         if (req.provider === RACCOON.id) {
-          return {
-            ok: false,
-            error: {
-              code: "bad-request",
-              message: "Raccoon Work \u4E0D\u652F\u6301\u6BCF\u65E5\u7B7E\u5230\uFF08\u6BCF\u65E5\u79EF\u5206\u7531\u670D\u52A1\u7AEF\u81EA\u52A8\u53D1\u653E\uFF1B\u767B\u5F55\u5956\u52B1\u8BF7\u5728\u300C\u65B0\u624B\u4EFB\u52A1\u300D\u4E2D\u9886\u53D6\uFF09"
-            }
-          };
+          // 商汤没有「点一下签到」的接口：每日积分由服务端按 UTC+8 自然日自动发放。
+          // 这里把「今天发了没有」当成签到状态，一键领取只处理还没领的桌面端登录奖励
+          //（一次性 3000 积分），已经发过的就如实报「已发放」。
+          const raccoonValue = await collectClaimResults(accounts, RACCOON, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchStatus: (credential, product2) => fetchRaccoonCheckinStatus(product2 ?? RACCOON, credential),
+            claim: (credential, product2) => claimRaccoonDailyReward(product2 ?? RACCOON, credential),
+            // 领取流程内部自己先查状态（决定是领奖励还是报已发放），不必外部再查一次。
+            precheckStatus: false,
+            warn: (msg) => ctx.logger?.warn?.(msg)
+          });
+          return { ok: true, value: raccoonValue };
         }
         if (req.provider === MINIMAX.id) {
           const value2 = await collectClaimResults(accounts, void 0, {
@@ -63198,8 +63570,11 @@ async function handleMethod(method, payload, signal) {
         if (req.provider === "codearts") {
           const values2 = await collectCreditBalances(accounts, void 0, {
             resolve: (ref) => ctx.credentials.resolve(ref),
-            fetchBalanceDetailed: async (credential) => {
-              const result = await fetchCodeArtsAccountInfoDetailed(credential, codeartsFetcher);
+            // 查余额前先按需续期，撞上 0602 再强制续期重发一次（见函数注释）。
+            prepare: (entry) => ensureCodeArtsAccountFresh(ctx, codearts, pool, entry),
+            fetchBalanceDetailed: async (credential, _product, entry) => {
+              const renew = entry === void 0 ? void 0 : codeArtsRenewer(ctx, codearts, pool, entry);
+              const result = await fetchCodeArtsAccountInfoDetailed(credential, codeartsFetcher, renew);
               if (!result.ok) return { balance: null, error: `\u8D26\u6237\u4FE1\u606F\u67E5\u8BE2\u5931\u8D25\uFF1A${result.message}` };
               const info = result.info;
               if (!info.isCreditPackage) {
@@ -69423,9 +69798,15 @@ function apply(ctx, config = {}) {
     // 续期按**账号池里的具体账号**走：`refreshAccountCredential` 读写的是
     // `CODEARTS_ACCOUNT_XXX`，而旧的 `service.refresh()` 读写的是已废弃的
     // 单凭据 ref —— 那会刷到另一个（不存在的）凭据上。
-    refresh: async () => {
+    refresh: async (opts = {}) => {
       const available2 = await pool.getAvailableAccount("codearts", "");
-      if (available2) await service.refreshAccountCredential(available2.entry.credentialRef, pool, available2.entry.id);
+      if (available2) {
+        // force：上游判「security_token 已过期」时的兜底，不能按有效期过滤
+        //（临时令牌可能比 expires_at 更早失效）。
+        await service.refreshAccountCredential(available2.entry.credentialRef, pool, available2.entry.id, {
+          force: opts?.force === true
+        });
+      }
     },
     fetchRemoteModels: () => service.refreshModels(pool),
     accountPool: pool
