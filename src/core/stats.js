@@ -3,11 +3,22 @@ import { describeSavingsTotal, emptySavings, savingsPercent } from '../token-sav
 
 export function buildStats(stats, catalog) {
   const days = stats.days ?? {}
-  const series = Object.keys(days).sort().map(day => ({
-    day,
-    total: days[day].total ?? 0,
-    models: Object.entries(days[day].models ?? {}).map(([model, value]) => ({ model, ...value })),
-  }))
+  // 每天的缓存命中率：cacheRead / input。cacheRead 是 input 里被前缀缓存命中的部分
+  // （DSH 的 usage 口径：prompt_tokens 含缓存命中），所以分母用 input，不再加一遍。
+  // input 为 0 时返回 null —— 没有请求就不该显示 0%，那是「没数据」不是「全未命中」。
+  const series = Object.keys(days).sort().map(day => {
+    const models = Object.entries(days[day].models ?? {}).map(([model, value]) => ({ model, ...value }))
+    const input = models.reduce((sum, row) => sum + (Number.isSafeInteger(row.input) ? row.input : 0), 0)
+    const cacheRead = models.reduce((sum, row) => sum + (Number.isSafeInteger(row.cacheRead) ? row.cacheRead : 0), 0)
+    return {
+      day,
+      total: days[day].total ?? 0,
+      input,
+      cacheRead,
+      cacheHitRate: input > 0 ? cacheRead / input : null,
+      models,
+    }
+  })
   const totals = {}
   for (const entry of series) for (const row of entry.models) {
     const previous = totals[row.model] ?? {
@@ -19,6 +30,7 @@ export function buildStats(stats, catalog) {
       input: previous.input + row.input,
       output: previous.output + row.output,
       reasoning: previous.reasoning + row.reasoning,
+      cacheRead: (previous.cacheRead ?? 0) + (row.cacheRead ?? 0),
       calls: previous.calls + row.calls,
       failed: previous.failed + row.failed,
       ttftMs: previous.ttftMs + (row.ttftMs ?? 0),

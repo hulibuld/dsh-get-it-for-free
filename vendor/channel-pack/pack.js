@@ -33334,6 +33334,19 @@ function registerAdapterIdempotent(llm, providers, adapter, warn) {
 
 // vendor/channel-pack/src/llm-adapter.ts
 var CHAT_API_BASE = "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2";
+// CodeArts 哪些模型真能读图，我们手里没有实测证据。默认一律按纯文本声明；
+// 需要时用 GET_IT_FOR_FREE_CODEARTS_VISION_MODELS（逗号分隔的模型 id）打开。
+// 贸然对所有模型声明 image，用户一贴图就会收到上游 400，比不支持更难解释。
+var CODEARTS_VISION_MODELS = new Set(
+  String(process.env.GET_IT_FOR_FREE_CODEARTS_VISION_MODELS ?? "").split(",").map((id) => id.trim()).filter((id) => id.length > 0)
+);
+function codeArtsSupportsImage(model) {
+  return CODEARTS_VISION_MODELS.has(String(model ?? ""));
+}
+function codeArtsDefaultMaxTokens() {
+  const raw = Number(process.env.GET_IT_FOR_FREE_CODEARTS_MAX_TOKENS ?? "");
+  return Number.isSafeInteger(raw) && raw >= 1024 ? raw : 65536;
+}
 // 上游按客户端 UA 拦截：任何 "deepseek-harness/…" 一律回 403 TM.00000001（已实测）。
 // 这里发华为云 CodeArts 自己的客户端标识，实测该 UA 返回 200。
 var CODEARTS_CLIENT_UA = "HuaweiCloudCodeArts/3.2.1";
@@ -33381,7 +33394,7 @@ function contentToText(content) {
   if (!Array.isArray(content)) return "";
   return content.filter((block) => typeof block === "object" && block !== null && block.type === "text").map((block) => String(block.text)).join("");
 }
-function serializeMessages(messages) {
+function serializeMessages(messages, imageUrls) {
   const normalized = normalizeHarnessMessages(messages);
   const wire = [];
   const { keepCallIds, keepResultIds } = resolveToolPairing(normalized);
@@ -33418,7 +33431,12 @@ function serializeMessages(messages) {
     const content = Array.isArray(message2.content) ? message2.content : [];
     const toolResults = content.filter((block) => typeof block === "object" && block !== null && block.type === "tool-result");
     const text = contentToText(message2.content);
-    if (text.trim().length > 0) wire.push({ role: "user", content: text });
+    // 有图片时按 OpenAI 的 content parts 形状发（text + image_url），
+    // 没有图片仍发纯字符串 —— 与改动前完全一致，不影响纯文本请求。
+    const regular = content.filter((block) => !(typeof block === "object" && block !== null && block.type === "tool-result"));
+    const parts = imageUrls === void 0 ? void 0 : userContentParts(regular, imageUrls);
+    if (parts !== void 0) wire.push({ role: "user", content: parts });
+    else if (text.trim().length > 0) wire.push({ role: "user", content: text });
     for (const result of toolResults) {
       if (!keepResultIds.has(String(result.toolCallId))) continue;
       wire.push({
@@ -33530,10 +33548,23 @@ function isQueueError(status, body) {
 // 502/504 是华为云网关自己回的（HTML 错误页 / APIG.0203 Backend timeout）：
 // 请求已经到了上游，只是后端那台机器当时不可用。早期只认 403/503，
 // 于是这类几秒钟的抖动被当成硬失败直接抛给用户。
+// 华为云网关 200 + SSE 内嵌的路由错误（APIG.0101「接口不存在/未发布」）。
+// 单独立一个类型：外层循环才能先换号、再退避重试。当成 INVALID_REQUEST
+// 会被 DSH 直接判死，用户看到的就是「本轮运行失败」加一句没有上下文的原文。
+class SseGatewayRoutingError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "SseGatewayRoutingError";
+    this.code = code;
+  }
+}
 function isTransientGatewayError(status, body) {
   const text = String(body ?? "");
   if (text.includes("TM.00001041")) return false;
   if (status >= 500 && status <= 599) return true;
+  // 华为云网关在故障窗口或发布状态异常时会回 APIG.0101（接口不存在或未发布）。
+  // 这不是请求写错，也不是密钥问题，按瞬时故障处理：先退避重试，再换号。
+  if (text.includes("APIG.0101") || /does not exist or has not been published/i.test(text)) return true;
   if (status !== 403) return false;
   return /TM\.0000|网络繁忙|请稍后重试|network\s+busy|service\s+busy|try\s+again\s+later/i.test(text);
 }
@@ -33619,6 +33650,9 @@ function describeCodeArtsFailure(status, body) {
   const raw = typeof body === "string" ? body.trim() : "";
   if (isCodeArtsSecurityTokenExpired(status, raw)) {
     return "codearts: 华为云临时令牌已过期（APIG.0602）—— 插件已尝试自动续期并重发；仍失败请点该账号行的「续期」，或重新登录这个账号";
+  }
+  if (raw.includes("APIG.0101") || /does not exist or has not been published/i.test(raw)) {
+    return `codearts: 华为云网关说这个接口不存在或未发布（HTTP ${status}）—— 平台侧发布状态异常（常见于华为云故障窗口），不是密钥或请求的问题；稍后重试或换一个账号`;
   }
   if (HTML_ERROR_PAGE_RE.test(raw)) {
     return `codearts: 上游网关暂时不可用（HTTP ${status}）—— 华为云那一侧的错误页，不是密钥或插件的问题`;
@@ -33896,6 +33930,16 @@ var CodeArtsAdapter = class extends LlmAdapter {
    * 入参异常时回退到 PROVIDER 常量，避免客户端抛
    * `undefined.toUpperCase is not a function`。
    */
+  /** 本模型接受哪些输入模态。见 CODEARTS_VISION_MODELS 的说明。 */
+  inputModalitiesFor(model) {
+    return codeArtsSupportsImage(model) ? ["text", "image"] : ["text"];
+  }
+  /** 把请求里的图片附件投影成 base64 data URL（与其它适配器同一份实现）。 */
+  async projectRequestImage(ref) {
+    return projectRequestImage(ref, {
+      readImageRequest: this.options.readImageRequest
+    });
+  }
   providerInfo(provider) {
     const id = typeof provider === "string" && provider.length > 0 ? provider : PROVIDER;
     return { id, name: "CodeArts Agent" };
@@ -33943,7 +33987,7 @@ var CodeArtsAdapter = class extends LlmAdapter {
     const visible = this.listAllModels();
     const disabled = this.options.accountPool?.disabledModelsFor(PROVIDER);
     const listed = disabled === void 0 || disabled.size === 0 ? visible : visible.filter((m) => !disabled.has(m.id));
-    return listed.map((m) => ({ provider: PROVIDER, id: m.id, name: m.name, inputModalities: ["text"] }));
+    return listed.map((m) => ({ provider: PROVIDER, id: m.id, name: m.name, inputModalities: this.inputModalitiesFor(m.id) }));
   }
   async resolveModel(provider, model, _signal) {
     await this.ensureRemoteModels();
@@ -33963,7 +34007,7 @@ var CodeArtsAdapter = class extends LlmAdapter {
   }
   async prepareCall(provider, model, signal) {
     return {
-      model: { ...await this.resolveModel(provider, model, signal), inputModalities: ["text"] },
+      model: { ...await this.resolveModel(provider, model, signal), inputModalities: this.inputModalitiesFor(model) },
       stream: (options) => this.stream(options)
     };
   }
@@ -33989,7 +34033,48 @@ var CodeArtsAdapter = class extends LlmAdapter {
       if (currentAccountId) reportLedgerAccount(PROVIDER, currentAccountId);
     }
     this.pinSession(credential.access_key_id);
-    const messages = serializeMessages(options.messages);
+    const imageRefs = /* @__PURE__ */ new Map();
+    for (const message2 of options.messages ?? []) {
+      if (Array.isArray(message2?.content)) collectImages(message2.content, imageRefs);
+    }
+    let imageUrls;
+    if (imageRefs.size > 0) {
+      if (!this.inputModalitiesFor(options.model).includes("image")) {
+        throw new LlmError2(
+          `codearts: model "${options.model}" does not accept image input.`,
+          "UNSUPPORTED_CONTENT"
+        );
+      }
+      if (this.options.readImage === void 0) {
+        throw new LlmError2("codearts: image input requires the attachment service.", "UNSUPPORTED_CONTENT");
+      }
+      imageUrls = /* @__PURE__ */ new Map();
+      for (const [id, ref] of imageRefs) {
+        const projected = await this.projectRequestImage(ref);
+        if (projected !== void 0) {
+          imageUrls.set(id, `data:${projected.mediaType};base64,${Buffer.from(projected.data).toString("base64")}`);
+          continue;
+        }
+        let image;
+        try {
+          image = await this.options.readImage(ref);
+        } catch (error) {
+          throw new LlmError2(
+            `codearts: 读取图片附件失败（${id}）：${errorMessage(error)}`,
+            "UNSUPPORTED_CONTENT",
+            { cause: error }
+          );
+        }
+        if (image === void 0) {
+          throw new LlmError2(
+            `codearts: 图片附件读取不到内容（${id}）；附件服务可能未就绪，或该对象已不存在。`,
+            "UNSUPPORTED_CONTENT"
+          );
+        }
+        imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString("base64")}`);
+      }
+    }
+    const messages = serializeMessages(options.messages, imageUrls);
     if (options.system !== void 0 && options.system.length > 0) {
       messages.unshift({ role: "system", content: options.system });
     }
@@ -34036,7 +34121,7 @@ var CodeArtsAdapter = class extends LlmAdapter {
       // 工具校验报 `invalid arguments: "arguments" must be an object`。
       // 参考实现 e2e 实测：65536 可用，131072 反而触发空流被后端拒绝；
       // 显式传入的 options.maxTokens 优先，未设置时默认 65536。
-      max_tokens: options.maxTokens ?? 65536,
+      max_tokens: options.maxTokens ?? codeArtsDefaultMaxTokens(),
       ...wireTools !== void 0 && wireTools.length > 0 ? { tools: wireTools } : {}
     });
     const url = `${CHAT_API_BASE}/chat/completions`;
@@ -34106,6 +34191,33 @@ var CodeArtsAdapter = class extends LlmAdapter {
               }
             }
             throw new LlmError2(message2, QUOTA_EXCEEDED_CODE, { status: 200 });
+          }
+          if (error instanceof SseGatewayRoutingError) {
+            // 网关说「这个接口不存在」时先换号：多半是网关对这侧账号的发布状态
+            // 异常，换一个号常常立刻可用；换不到才按可重试错误抛出。
+            logCodeArtsFailure({
+              status: 200,
+              phase: "sse-routing",
+              body: String(error.message ?? "").slice(0, 300),
+              accountId: currentAccountId ?? null,
+              model: options.model
+            });
+            if (this.options.accountPool) {
+              const nextRoute = await this.options.accountPool.getAvailableAccount("codearts", options.model, rateLimitTried);
+              if (nextRoute && !rateLimitTried.has(nextRoute.entry.id)) {
+                rateLimitTried.add(nextRoute.entry.id);
+                credential = nextRoute.credential;
+                currentAccountId = nextRoute.entry.id;
+                this.pinSession(credential.access_key_id);
+                authRefreshed = false;
+                continue;
+              }
+            }
+            throw new LlmError2(
+              `codearts: 华为云网关暂时找不到这个接口（${error.code}）—— 平台侧发布状态异常（常见于华为云故障窗口），不是密钥或请求的问题`,
+              "RATE_LIMIT",
+              { status: 200 }
+            );
           }
           if (error instanceof SseQueueRetryError) {
           } else if (error instanceof LlmError2 && error.code === BENEFIT_NOT_FOUND_CODE && isBenefitModel && !benefitHeaderDropped) {
@@ -34432,6 +34544,18 @@ var CodeArtsAdapter = class extends LlmAdapter {
             }
             if (errorCode === CODEARTS_BENEFIT_NOT_FOUND_ERROR_CODE || errorCode === "4004") {
               throw new LlmError2(`codearts: ${message2}`, BENEFIT_NOT_FOUND_CODE, { status: 200 });
+            }
+            // 这条分支过去不留任何证据：界面上只有一句上游原文，codearts-error.log
+            // 里查不到，也就拿不到华为云的 request_id。先把原始事件落盘再分类。
+            logCodeArtsFailure({
+              status: 200,
+              phase: "sse-error",
+              body: payload.slice(0, 600),
+              accountId: null,
+              model: options.model
+            });
+            if (errorCode === "APIG.0101" || /does not exist or has not been published/i.test(message2)) {
+              throw new SseGatewayRoutingError(errorCode, message2);
             }
             throw new LlmError2(`codearts: ${message2}`, "INVALID_REQUEST", { status: 200 });
           }
@@ -69809,6 +69933,8 @@ function apply(ctx, config = {}) {
       }
     },
     fetchRemoteModels: () => service.refreshModels(pool),
+    readImage: makeReadImage(ctx),
+    readImageRequest: makeReadImageRequest(ctx),
     accountPool: pool
   });
   const resolveBuddyCredentialByRef = async (refName) => {
