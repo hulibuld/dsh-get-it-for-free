@@ -33347,6 +33347,14 @@ function codeArtsDefaultMaxTokens() {
   const raw = Number(process.env.GET_IT_FOR_FREE_CODEARTS_MAX_TOKENS ?? "");
   return Number.isSafeInteger(raw) && raw >= 1024 ? raw : 65536;
 }
+// 2026-11-10 实测（两个账号 x 两个模型交叉验证）：带 `maas_type: benefit` 的请求会收到
+// SSE 内嵌的 `InferHub.APIG.0101.404 / The API does not exist or has not been published`，
+// 而同一账号、同一模型**不带该头**立刻 200 正常出流。也就是说那条 0101 是我们自己
+// 多带了一个头造成的，不是华为云故障、也不是账号问题。故默认不带；确实需要福利
+// 额度的账号用 GET_IT_FOR_FREE_CODEARTS_BENEFIT_HEADER=1 显式打开。
+function codeArtsBenefitHeaderEnabled() {
+  return process.env.GET_IT_FOR_FREE_CODEARTS_BENEFIT_HEADER === "1";
+}
 // 上游按客户端 UA 拦截：任何 "deepseek-harness/…" 一律回 403 TM.00000001（已实测）。
 // 这里发华为云 CodeArts 自己的客户端标识，实测该 UA 返回 200。
 var CODEARTS_CLIENT_UA = "HuaweiCloudCodeArts/3.2.1";
@@ -34132,7 +34140,7 @@ var CodeArtsAdapter = class extends LlmAdapter {
     let benefitHeaderDropped = false;
     const rateLimitTried = /* @__PURE__ */ new Set();
     if (currentAccountId) rateLimitTried.add(currentAccountId);
-    const isBenefitModel = isCodeArtsBenefitModel(options.model);
+    const isBenefitModel = codeArtsBenefitHeaderEnabled() && isCodeArtsBenefitModel(options.model);
     for (; ; ) {
       concurrencyLimited = false;
       const body = sanitizeHarnessIdentityInBody(buildBody());
@@ -34192,6 +34200,13 @@ var CodeArtsAdapter = class extends LlmAdapter {
             }
             throw new LlmError2(message2, QUOTA_EXCEEDED_CODE, { status: 200 });
           }
+          if (error instanceof SseGatewayRoutingError && isBenefitModel && !benefitHeaderDropped) {
+            // 这条 0101 是 benefit 头引出来的（见 codeArtsBenefitHeaderEnabled 的实测记录）：
+            // 摘头原地重发，别去换号 —— 每个账号都会撞同一堵墙。
+            markCodeArtsBenefitUnavailable(credential, options.model);
+            benefitHeaderDropped = true;
+            continue;
+          }
           if (error instanceof SseGatewayRoutingError) {
             // 网关说「这个接口不存在」时先换号：多半是网关对这侧账号的发布状态
             // 异常，换一个号常常立刻可用；换不到才按可重试错误抛出。
@@ -34250,6 +34265,12 @@ var CodeArtsAdapter = class extends LlmAdapter {
         // 引去重登凭据。重试用尽才换号，换不到才抛出去——抛的是 RATE_LIMIT，不是 AUTH。
         if (isTransientGatewayError(response.status, errorText)) {
           logCodeArtsFailure({ status: response.status, body: errorText, accountId: currentAccountId ?? null, model: options.model });
+          if (isBenefitModel && !benefitHeaderDropped && /APIG\.0101|does not exist|not been published/i.test(errorText)) {
+            markCodeArtsBenefitUnavailable(credential, options.model);
+            benefitHeaderDropped = true;
+            transientAttempts = 0;
+            continue;
+          }
           if (transientAttempts < 3) {
             const waitMs = (response.status >= 500 ? 1500 : 700) * 2 ** transientAttempts;
             transientAttempts += 1;
