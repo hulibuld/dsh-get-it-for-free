@@ -33559,6 +33559,15 @@ function isQueueError(status, body) {
 // 华为云网关 200 + SSE 内嵌的路由错误（APIG.0101「接口不存在/未发布」）。
 // 单独立一个类型：外层循环才能先换号、再退避重试。当成 INVALID_REQUEST
 // 会被 DSH 直接判死，用户看到的就是「本轮运行失败」加一句没有上下文的原文。
+// 「模型未注册」的哨兵：说明这个模型可能需要 maas_type: benefit 头才可见。
+// 抛给外层请求循环，由它决定是否补上该头重试一次（能力靠探测，不靠名单）。
+class SseBenefitProbeRequired extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "SseBenefitProbeRequired";
+    this.code = code;
+  }
+}
 class SseGatewayRoutingError extends Error {
   constructor(code, message) {
     super(message);
@@ -34138,9 +34147,11 @@ var CodeArtsAdapter = class extends LlmAdapter {
     let transientAttempts = 0;
     let authRefreshed = false;
     let benefitHeaderDropped = false;
+    // 反向探测：上游说「模型没注册」时补一次 benefit 头再试（3.0.24）。
+    let benefitHeaderAdded = false;
     const rateLimitTried = /* @__PURE__ */ new Set();
     if (currentAccountId) rateLimitTried.add(currentAccountId);
-    const isBenefitModel = codeArtsBenefitHeaderEnabled() && isCodeArtsBenefitModel(options.model);
+    const isBenefitModel = (codeArtsBenefitHeaderEnabled() || benefitHeaderAdded) && isCodeArtsBenefitModel(options.model);
     for (; ; ) {
       concurrencyLimited = false;
       const body = sanitizeHarnessIdentityInBody(buildBody());
@@ -34200,6 +34211,13 @@ var CodeArtsAdapter = class extends LlmAdapter {
             }
             throw new LlmError2(message2, QUOTA_EXCEEDED_CODE, { status: 200 });
           }
+          if (error instanceof SseBenefitProbeRequired) {
+            if (!isBenefitModel && !benefitHeaderAdded) {
+              benefitHeaderAdded = true;
+              continue;
+            }
+            throw new LlmError2(`codearts: 模型 ${options.model} 未注册（${error.code}）：${error.message}`, "INVALID_REQUEST", { status: 200 });
+          }
           if (error instanceof SseGatewayRoutingError && isBenefitModel && !benefitHeaderDropped) {
             // 这条 0101 是 benefit 头引出来的（见 codeArtsBenefitHeaderEnabled 的实测记录）：
             // 摘头原地重发，别去换号 —— 每个账号都会撞同一堵墙。
@@ -34245,6 +34263,10 @@ var CodeArtsAdapter = class extends LlmAdapter {
         }
       } else {
         const errorText = await response.text().catch(() => "");
+        if (!isBenefitModel && !benefitHeaderAdded && /not registered|002002009/i.test(errorText)) {
+          benefitHeaderAdded = true;
+          continue;
+        }
         concurrencyLimited = isConcurrencyLimitError(response.status, errorText);
         // 并发会话上限是「每个账号 3 个」。卡满时不值得等半小时：换号能立刻空出槽位，
         // 换不到（只有一个号）才退回原来的排队重试逻辑。
@@ -34575,6 +34597,9 @@ var CodeArtsAdapter = class extends LlmAdapter {
               accountId: null,
               model: options.model
             });
+            if (/not registered|002002009|The model is not registered/i.test(errorCode + " " + message2)) {
+              throw new SseBenefitProbeRequired(errorCode, message2);
+            }
             if (errorCode === "APIG.0101" || /does not exist or has not been published/i.test(message2)) {
               throw new SseGatewayRoutingError(errorCode, message2);
             }

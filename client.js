@@ -550,6 +550,8 @@ window.__ModuleLoader__.load({
         'chan.credits.quota': '剩余配额',
         'chan.credits.loaded': '已查询 {count} 个账号',
         'chan.credits.refresh': '刷新余额',
+        'chan.models.refresh': '刷新模型',
+        'chan.models.refreshed': '模型目录已刷新',
         'chan.credits.loading': '余额查询中…',
         'chan.credits.failed': '余额查询失败：{reason}',
         'chan.credits.partial': '{count} 个账号未能查询余额，请展开账号查看原因并重试。',
@@ -1253,6 +1255,8 @@ window.__ModuleLoader__.load({
         'chan.credits.quota': 'Quota left',
         'chan.credits.loaded': '{count} accounts queried',
         'chan.credits.refresh': 'Refresh balance',
+        'chan.models.refresh': 'Refresh models',
+        'chan.models.refreshed': 'Model catalog refreshed',
         'chan.credits.loading': 'Querying balance…',
         'chan.credits.failed': 'Balance query failed: {reason}',
         'chan.credits.partial': 'Could not query {count} accounts. Expand accounts to see the reasons and retry.',
@@ -3311,7 +3315,13 @@ window.__ModuleLoader__.load({
      * does not offer it still renders the free and EAC pages, with this one
      * explaining itself instead of breaking.
      */
-    function sameChannelTransport(left, right) {
+    // 打开设置页时主动探访一次模型目录：距上次自动刷新超过 30 分钟就先让宿主
+// 清一次该渠道的进程内缓存再拉。上游悄悄上新（例如 Qoder 的 qoduck）时，
+// 用户下次打开设置页就能看到，不必等到每天 12:00 那一轮，也不用改代码。
+const AUTO_MODEL_REFRESH_MS = 30 * 60 * 1000
+const AUTO_MODEL_REFRESH = new Map()
+
+function sameChannelTransport(left, right) {
       return left === right || (left !== null && right !== null
         && typeof left === 'object' && typeof right === 'object'
         && left.connection === right.connection && left.call === right.call)
@@ -3535,6 +3545,14 @@ window.__ModuleLoader__.load({
       }, [rpc, channel.id, onError])
       const loadModels = useCallback(async () => {
         try {
+          if (rpc) {
+            const stamp = AUTO_MODEL_REFRESH.get(channel.id) ?? 0
+            if (Date.now() - stamp > AUTO_MODEL_REFRESH_MS) {
+              AUTO_MODEL_REFRESH.set(channel.id, Date.now())
+              // 刷新失败不打断列表：沿用旧目录，等用户手动点「刷新模型」。
+              try { await rpc('model.refresh', { provider: channel.id }, 60_000) } catch { /* keep old catalog */ }
+            }
+          }
           const value = await rpc('model.list', { provider: channel.id })
           setModels(value?.models ?? [])
         } catch (error) { setModels(null); onError(channel, error) }
@@ -3841,6 +3859,19 @@ window.__ModuleLoader__.load({
             type: 'button', className: 'ofm_btn ghost', disabled: balanceLoading || busy !== '' || !rpc,
             'aria-busy': balanceLoading ? 'true' : undefined, onClick: () => void loadBalances(true),
           }, balanceLoading ? t('chan.credits.loading') : t('chan.credits.refresh')) : null,
+          h('button', {
+            type: 'button', className: 'ofm_btn ghost', disabled: busy !== '' || !rpc,
+            'aria-busy': busy === 'refreshModels' ? 'true' : undefined,
+            onClick: async () => {
+              setBusy('refreshModels')
+              try {
+                // 先清宿主的进程内目录缓存，再重拉：只调 model.list 拿到的还是旧缓存。
+                await rpc('model.refresh', { provider: channel.id }, 60_000)
+                await loadModels()
+                setNotice(t('chan.models.refreshed'))
+              } catch (error) { onError(channel, error) } finally { setBusy('') }
+            },
+          }, busy === 'refreshModels' ? '…' : t('chan.models.refresh')),
           creditCapability?.claim ? h('button', {
             type: 'button', className: 'ofm_btn ghost', disabled: busy !== '' || !rpc, 'aria-busy': busy === 'claim' ? 'true' : undefined,
             onClick: claim,
