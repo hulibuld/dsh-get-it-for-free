@@ -529,7 +529,23 @@ window.__ModuleLoader__.load({
         'gw.hide': '隐藏',
         'gw.keyNote': '明文凭据：只用于客户端配置，请勿外发。',
         'gw.keyNone': '尚未生成',
-        'gw.keyNoneHint': '启用一次网关即会自动生成密钥。',
+        'gw.keyNoneHint': '密钥文件还没生成，点「重新生成」立刻造一把（不需要先启动网关）。',
+        'gw.copyConfig': '复制 base_url + Key',
+        'ms.title': '模型同步',
+        'ms.sub': '各渠道目录跟上游保持一致',
+        'ms.last': '上次同步',
+        'ms.never': '还没同步过',
+        'ms.run': '立即同步',
+        'ms.running': '同步中…',
+        'ms.done': '同步完成',
+        'ms.added': '新增',
+        'ms.removed': '下线',
+        'ms.changed': '变更',
+        'ms.models': '模型',
+        'ms.failed': '没取到',
+        'ms.stale': '沿用上次',
+        'ms.empty': '当前没有可同步的渠道',
+        'ms.hint': '只读目录，不动你自己关掉的模型开关',
         'gw.models': '可转发模型',
         'gw.portNote': '端口可用环境变量 DSH_OPENAI_GATEWAY_PORT 调整。',
         'gw.relayTitle': '局域网转发（本插件中继）',
@@ -544,6 +560,21 @@ window.__ModuleLoader__.load({
         'gw.rotate': '轮换',
         'gw.relayNote': '中继只放行模型接口（/v1/*），并要求携带中继密钥；局域网绑定意味着同网段的设备都能访问到这个端口。',
         'gw.freeLaneNote': '免费车道（Get It For Free）自己的转发端口在「免费模型」页的「本地转发」分区。',
+        'gw.channelTitle': '本机 API 网关',
+        'gw.channelSub': '把各渠道模型合成一个 OpenAI 兼容端点，给本机其它工具当 API key 用。',
+        'gw.base': 'Base URL',
+        'gw.copy': '复制',
+        'gw.copied': '已复制',
+        'gw.regenerate': '重新生成密钥',
+        'gw.regenerated': '已生成新密钥，旧密钥立刻失效',
+        'gw.test': '自检',
+        'gw.testing': '自检中…',
+        'gw.testModels': '模型 {count} 个',
+        'gw.testAuthOk': '鉴权正常（错 key 返 401）',
+        'gw.testAuthBad': '鉴权没生效（错 key 竟然 200）',
+        'gw.testDead': '网关没响应：{reason}',
+        'gw.testChat': '最小对话',
+        'gw.keyMasked': '点「显示」查看明文',
         'chan.credits.left': '剩余积分',
         'chan.credits.tokens': '剩余 Token',
         'chan.credits.dollars': '剩余余额（USD）',
@@ -1234,7 +1265,23 @@ window.__ModuleLoader__.load({
         'gw.hide': 'Hide',
         'gw.keyNote': 'A plaintext credential for client configuration — handle with care.',
         'gw.keyNone': 'Not generated yet',
-        'gw.keyNoneHint': 'Enabling the gateway once mints a key automatically.',
+        'gw.keyNoneHint': 'The key file is not created yet — press "Regenerate" to mint one now (the gateway does not need to be running).',
+        'gw.copyConfig': 'Copy base_url + key',
+        'ms.title': 'Model sync',
+        'ms.sub': 'Keep every channel catalog in step with upstream',
+        'ms.last': 'Last sync',
+        'ms.never': 'never synced',
+        'ms.run': 'Sync now',
+        'ms.running': 'Syncing…',
+        'ms.done': 'Sync finished',
+        'ms.added': 'added',
+        'ms.removed': 'removed',
+        'ms.changed': 'changed',
+        'ms.models': 'models',
+        'ms.failed': 'fetch failed',
+        'ms.stale': 'kept last snapshot',
+        'ms.empty': 'no channel to sync right now',
+        'ms.hint': 'read-only: your own model toggles are never touched',
         'gw.models': 'Servable models',
         'gw.portNote': 'The port can be moved with the DSH_OPENAI_GATEWAY_PORT environment variable.',
         'gw.relayTitle': 'LAN relay (this plugin\'s)',
@@ -1249,6 +1296,21 @@ window.__ModuleLoader__.load({
         'gw.rotate': 'Rotate',
         'gw.relayNote': 'The relay forwards only the model routes (/v1/*) and demands the relay key; binding to the LAN means every device on the network can reach that port.',
         'gw.freeLaneNote': 'The free lane (Get It For Free) has its own forward port under "Local forward" on the Free models page.',
+        'gw.channelTitle': 'Local API gateway',
+        'gw.channelSub': 'One OpenAI-compatible endpoint over every channel model, usable as an API key by other local tools.',
+        'gw.base': 'Base URL',
+        'gw.copy': 'Copy',
+        'gw.copied': 'Copied',
+        'gw.regenerate': 'Regenerate key',
+        'gw.regenerated': 'New key minted; the old one stops working immediately',
+        'gw.test': 'Self-test',
+        'gw.testing': 'Testing…',
+        'gw.testModels': '{count} models',
+        'gw.testAuthOk': 'Auth enforced (wrong key returns 401)',
+        'gw.testAuthBad': 'Auth not enforced (a wrong key returned 200)',
+        'gw.testDead': 'Gateway did not answer: {reason}',
+        'gw.testChat': 'Minimal chat',
+        'gw.keyMasked': 'Click "Show" for the plaintext key',
         'chan.credits.left': 'Credits left',
         'chan.credits.tokens': 'Tokens left',
         'chan.credits.dollars': 'Balance left (USD)',
@@ -4038,6 +4100,213 @@ function sameChannelTransport(left, right) {
      * can answer on its own — whether a desktop session was found, how much of
      * the daily allowance is left, and how many models the gateway advertises.
      */
+    /**
+     * 模型同步卡片。
+     *
+     * 面板上原来只有「某个渠道有几个模型」，回答不了用户真正会问的那句：
+     * **这次同步是不是有新模型？** 上游上新是悄悄发生的，用户能感知的只有
+     * 「选择器里多了一条 / 少了一条」。所以这里把 diff 摆出来：上次同步时间、
+     * 每个渠道的模型数，以及新增/下线/变更的条数。
+     *
+     * 只读目录，不动 `disabledModels`：用户手动关掉的模型，同步一次不能又给
+     * 他打开——那是两件事，混在一起用一次就没人敢按这个按钮了。
+     */
+    function ModelSyncCard(props) {
+      const { t } = props
+      const [state, setState] = useState(undefined)
+      const [busy, setBusy] = useState(false)
+      const [failure, setFailure] = useState('')
+      const load = useCallback(async () => {
+        try {
+          const value = await api('/model-sync', { timeout: 8000 })
+          setState(value ?? {})
+        } catch (error) { setFailure(String(error?.message ?? error).slice(0, 160)) }
+      }, [])
+      useEffect(() => { void load() }, [load])
+      const run = useCallback(async () => {
+        setBusy(true)
+        setFailure('')
+        try {
+          // 十几个渠道逐个拉，每个限时 25 秒，所以给足 3 分钟；api 默认 8 秒必超。
+          await post('/model-sync/run', {}, 180_000)
+          await load()
+          showToast({ title: t('ms.done') })
+        } catch (error) {
+          setFailure(String(error?.message ?? error).slice(0, 160))
+        } finally { setBusy(false) }
+      }, [load, t])
+
+      const info = state ?? {}
+      const rows = Array.isArray(info.providers) ? info.providers : []
+      const lastAt = Number(info.lastRunAt ?? 0)
+      const fmt = at => {
+        if (at <= 0) return t('ms.never')
+        try { return new Date(at).toLocaleString(undefined, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) } catch { return '—' }
+      }
+      const lastDiff = info.lastDiff ?? null
+      const totals = lastDiff?.totals ?? { added: 0, removed: 0, changed: 0 }
+      const changed = Array.isArray(lastDiff?.providers)
+        ? []
+        : Object.entries(lastDiff?.providers ?? {}).filter(([, row]) =>
+          (row?.added?.length ?? 0) + (row?.removed?.length ?? 0) + (row?.changed?.length ?? 0) > 0)
+
+      return h('div', { className: 'ofm_chan ofm_glass' },
+        h('div', { className: 'ofm_chanhead' },
+          h('span', { className: 'ofm_chanid' },
+            h('b', null, t('ms.title')),
+            h('span', null, t('ms.sub'))),
+          h('span', { className: 'ofm_chanstate' },
+            h('span', { className: `ofm_dot ${busy || info.running ? 'warn' : lastAt > 0 ? 'ok' : ''}` }),
+            busy || info.running ? t('ms.running') : t('ms.last') + ' ' + fmt(lastAt))),
+        failure === '' ? null : h('p', { className: 'ofm_note' }, failure),
+        h('div', { className: 'ofm_chanmeta' },
+          h('span', null, `${t('ms.models')} `, h('b', null, state === undefined ? '…' : String(info.total ?? 0))),
+          h('span', null, `${t('ms.added')} `, h('b', null, String(totals.added))),
+          h('span', null, `${t('ms.removed')} `, h('b', null, String(totals.removed))),
+          h('span', null, `${t('ms.changed')} `, h('b', null, String(totals.changed)))),
+        rows.length === 0
+          ? h('p', { className: 'ofm_note' }, state === undefined ? '…' : t('ms.empty'))
+          : h('div', { className: 'ofm_chanmeta' },
+            rows.map(row => h('span', { key: row.id },
+              h('b', null, row.id), ` ${String(row.count)}`,
+              row.lastDiff?.added?.length ? ` +${row.lastDiff.added.length}` : '',
+              row.lastDiff?.removed?.length ? ` −${row.lastDiff.removed.length}` : ''))),
+        changed.length === 0 ? null : h('p', { className: 'ofm_note' },
+          changed.slice(0, 6).map(([id, row]) => {
+            const parts = []
+            if (row?.added?.length) parts.push(`+${row.added.slice(0, 3).join(', ')}${row.added.length > 3 ? ' …' : ''}`)
+            if (row?.removed?.length) parts.push(`−${row.removed.slice(0, 3).join(', ')}${row.removed.length > 3 ? ' …' : ''}`)
+            if (row?.changed?.length) parts.push(`~${row.changed.slice(0, 3).map(item => item.id).join(', ')}`)
+            return `${id}: ${parts.join(' | ')}`
+          }).join('　')),
+        h('div', { className: 'ofm_chanacts' },
+          h(Button, { disabled: busy, onClick: () => void run() },
+            busy ? t('ms.running') : t('ms.run'))),
+        h('p', { className: 'ofm_note' }, t('ms.hint')))
+    }
+
+    /**
+     * 本机 API 网关（OpenAI 兼容）的卡片。
+     *
+     * 后端一直有这个网关（`vendor/channel-pack/src/openai-gateway/`）：第一次启用
+     * 就自动生成密钥（`~/.dsh/openai-gateway/api-key`，权限 0600），模型清单来自
+     * 各渠道适配器的目录，`/v1/models`、`/v1/chat/completions`、`/v1/responses`
+     * 三条路由都在。缺的从来只是这一块面板——没有它，开关没人点，8326 从没监听，
+     * 「九个渠道九个账号合成一个 key」这件事在界面上等于不存在。
+     *
+     * 走客户端的 `rpc()`（三级回落：`/rpc` 桥 → 浏览器 connection → 直接打
+     * `/api/channel-pack`），不新增宿主路由：宿主只要多一条直调 pack 内部函数的
+     * 路径，就得导出那个处理器，而它不是模块顶层函数（导出会让整包加载失败）。
+     */
+    function GatewayCard(props) {
+      const { t } = props
+      // 走 pack 自己注册的 `/api/channel-pack`（客户端的 rpc() 三级回落里最后那一级），
+      // 不新增宿主路由：宿主只要多一条调用 pack 内部函数的路径，就得把 pack 的私有
+      // 处理器导出，而它在包里并不是模块顶层函数（导出会让整包加载失败）。
+      const rpc = typeof props.rpc === 'function' ? props.rpc : null
+      const [state, setState] = useState(undefined)
+      const [busy, setBusy] = useState('')
+      const [shown, setShown] = useState(false)
+      const [test, setTest] = useState(undefined)
+      const load = useCallback(async () => {
+        if (rpc === null) { setState({ error: t('chan.rpc.unavailable') }); return }
+        try { setState(await rpc('gateway.getEnabled', {}, 20_000)) }
+        catch (error) { setState({ error: String(error?.message ?? error) }) }
+      }, [rpc, t])
+      useEffect(() => { void load() }, [load])
+      // 一个动作一个 busy 值：开关、换密钥、自检三条互斥，避免连点把状态写乱。
+      const act = useCallback(async (method, payload, timeout) => {
+        if (rpc === null) return undefined
+        setBusy(method)
+        try {
+          const value = await rpc(method, payload, timeout ?? 30_000)
+          setState(current => ({ ...(current ?? {}), ...(value !== null && typeof value === 'object' ? value : {}) }))
+          return value
+        } catch (error) {
+          showToast({ title: t('chan.error').replace('{reason}', String(error?.message ?? error).slice(0, 160)), tone: 'warn' })
+          return undefined
+        } finally { setBusy('') }
+      }, [t])
+      const copy = useCallback(async (text, label) => {
+        try {
+          await navigator.clipboard.writeText(String(text))
+          showToast({ title: t('gw.copied'), body: label })
+        } catch (error) {
+          showToast({ title: String(error?.message ?? error).slice(0, 160), body: label, tone: 'warn' })
+        }
+      }, [t])
+
+      const info = state ?? {}
+      const failure = typeof info.error === 'string' ? info.error : ''
+      const enabled = info.enabled === true
+      const running = info.running === true
+      const blocked = info.blockedByEnv === true
+      const key = info.apiKey !== null && typeof info.apiKey === 'object' ? info.apiKey : null
+      const keyValue = typeof key?.value === 'string' ? key.value : ''
+      const keyFromEnv = key?.fromEnv === true
+      const address = info.address !== null && typeof info.address === 'object' ? info.address : null
+      const base = address !== null && typeof address.port === 'number' ? `http://${address.host}:${address.port}/v1` : ''
+      const models = Array.isArray(info.models) ? info.models : []
+      const tone = blocked ? 'warn' : running ? 'ok' : ''
+      const stateText = blocked ? t('gw.envBlocked') : running ? t('gw.running') : t('gw.stopped')
+
+      return h('div', { className: `ofm_chan ofm_glass${enabled ? '' : ' off'}`, 'data-state': enabled ? 'on' : 'off' },
+        h('div', { className: 'ofm_chanhead' },
+          h('span', { className: 'ofm_chanid' },
+            h('b', null, t('gw.channelTitle')),
+            h('span', null, t('gw.channelSub'))),
+          h('span', { className: 'ofm_chanstate' },
+            h('span', { className: `ofm_dot ${tone}` }),
+            state === undefined ? '…' : stateText)),
+        failure !== '' ? h('p', { className: 'ofm_note' }, failure) : null,
+        h('div', { className: 'ofm_chanmeta' },
+          h('span', null, `${t('gw.base')} `, h('b', null, base === '' ? '—' : base)),
+          base === '' ? null : h('button', { type: 'button', className: 'ofm_btn', onClick: () => void copy(base, t('gw.base')) }, t('gw.copy')),
+          base === '' || keyValue === '' ? null : h('button', {
+            type: 'button',
+            className: 'ofm_btn',
+            onClick: () => void copy(`base_url: ${base}\napi_key: ${keyValue}`, t('gw.copyConfig')),
+          }, t('gw.copyConfig')),
+          h('span', null, `${t('gw.models')} `, h('b', null, state === undefined ? '…' : String(models.length))),
+          keyValue === '' ? null : h('span', null, `${t('gw.key')} `,
+            h('b', null, shown ? keyValue : '•'.repeat(Math.min(keyValue.length, 12))),
+            h('button', { type: 'button', className: 'ofm_btn', onClick: () => setShown(value => !value) },
+              shown ? t('gw.hide') : t('gw.show')),
+            h('button', { type: 'button', className: 'ofm_btn', onClick: () => void copy(keyValue, t('gw.key')) }, t('gw.copy')))),
+        keyValue === '' ? h('p', { className: 'ofm_note' }, t('gw.keyNoneHint')) : null,
+        keyValue === '' ? null : h('p', { className: 'ofm_note' },
+          keyFromEnv ? t('gw.keyNote') : `${t('gw.keyNote')} ${typeof key?.path === 'string' ? key.path : ''}`),
+        h('div', { className: 'ofm_chanacts' },
+          h(Switch, {
+            checked: enabled,
+            label: t('gw.switch'),
+            disabled: busy === 'gateway.setEnabled' || blocked,
+            onChange: () => { void act('gateway.setEnabled', { enabled: !enabled }) },
+          }),
+          h(Button, {
+            disabled: busy !== '' || blocked,
+            onClick: () => { setTest(undefined); void act('gateway.regenerateKey').then(value => { if (value !== undefined) showToast({ title: t('gw.regenerated') }) }) },
+          }, busy === 'gateway.regenerateKey' ? '…' : t('gw.regenerate')),
+          h(Button, {
+            disabled: busy !== '' || !running,
+            onClick: async () => {
+              setTest(undefined)
+              const first = typeof models[0]?.id === 'string' ? models[0].id : ''
+              const value = await act('gateway.selfTest', first === '' ? {} : { model: first }, 180_000)
+              if (value !== undefined) setTest(value)
+            },
+          }, busy === 'gateway.selfTest' ? t('gw.testing') : t('gw.test'))),
+        test === undefined ? null : h('div', { className: 'ofm_chanmeta' },
+          h(Pill, { tone: test?.reachable === true ? 'ok' : 'err' },
+            test?.reachable === true
+              ? t('gw.testModels').replace('{count}', String(test?.models ?? 0))
+              : t('gw.testDead').replace('{reason}', String(test?.reason ?? '—'))),
+          test?.reachable !== true ? null : h(Pill, { tone: test?.authEnforced === true ? 'ok' : 'err' },
+            test?.authEnforced === true ? t('gw.testAuthOk') : t('gw.testAuthBad')),
+          typeof test?.chat?.status === 'number' ? h(Pill, { tone: test.chat.status === 200 ? 'ok' : 'err' },
+            `${t('gw.testChat')} HTTP ${test.chat.status}`) : null))
+    }
+
     function MiMoCard(props) {
       const { t } = props
       const [state, setState] = useState(undefined)
@@ -4364,7 +4633,7 @@ function sameChannelTransport(left, right) {
         !available ? h('div', { className: 'ofm_callout' }, h('div', null, t('chan.rpc.unavailable'))) : null,
         !ready && available ? h('div', { className: 'ofm_chanwrap' },
           [0, 1, 2].map(index => h('div', { className: 'ofm_skel', key: index, style: { minHeight: 168 } }))) : null,
-        ready ? h('div', { className: 'ofm_chanwrap' }, [h(MiMoCard, { key: 'mimo', t }), h(CliLaneCard, { key: 'cli-lane', t }), ...CHANNEL_PROVIDERS.map(channel => h(ChannelCard, {
+        ready ? h('div', { className: 'ofm_chanwrap' }, [h(MiMoCard, { key: 'mimo', t }), h(CliLaneCard, { key: 'cli-lane', t }), h(GatewayCard, { key: 'gateway', t, rpc: available ? rpc : null }), h(ModelSyncCard, { key: 'model-sync', t }), ...CHANNEL_PROVIDERS.map(channel => h(ChannelCard, {
           key: channel.id,
           channel,
           status: statuses?.[channel.id],

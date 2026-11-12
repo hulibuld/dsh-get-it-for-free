@@ -31989,6 +31989,29 @@ function normalizeModelId(id) {
   }
   return id;
 }
+/**
+ * 积分消耗倍率（上游 `credit[].ratio_display`，形如 `"0.18x"`）。
+ *
+ * 为什么拼进**模型显示名**而不是新开字段：宿主模型下拉只渲染文字，名字是它唯一
+ * 能看见的倍率通道（上游 `dsh-codearts` 的 `modelDisplayName()` 就是这么做的，
+ * 见 `docs-merge/codearts.md` B 节）。固定两位小数是为了和 `x0.7` / `x0.79` 这类
+ * 参差对齐。
+ *
+ * 字段读不到就返回 undefined —— 上游不给 `credit` 时名字保持原样，不猜。
+ */
+function codeArtsRatioLabel(m) {
+  const credit = Array.isArray(m?.credit) ? m.credit : undefined;
+  if (credit === void 0) return void 0;
+  for (const entry of credit) {
+    const raw = typeof entry?.ratio_display === "string" ? entry.ratio_display.trim() : "";
+    const match = /^(\d+(?:\.\d+)?)\s*x$/i.exec(raw);
+    if (match !== null) {
+      const value = Number(match[1]);
+      if (Number.isFinite(value)) return `x${value.toFixed(2)}`;
+    }
+  }
+  return void 0;
+}
 function parseModelInfo(m, seen) {
   const rawId = m["model_id"];
   if (typeof rawId !== "string" || rawId.length === 0) return void 0;
@@ -31998,7 +32021,8 @@ function parseModelInfo(m, seen) {
   const name2 = typeof rawName === "string" && rawName.length > 0 ? normalizeModelId(rawName) : id;
   if (seen.has(id)) return void 0;
   seen.add(id);
-  return { id, name: name2 };
+  const ratio = codeArtsRatioLabel(m);
+  return { id, name: ratio === void 0 ? name2 : `${name2} · ${ratio}` };
 }
 function extractJsonArray(text, path2) {
   try {
@@ -40020,6 +40044,9 @@ var QoderAdapter = class extends LlmAdapter4 {
   fetchImpl;
   /** 产品级兜底模型索引（`product.fallbackModels` 的 id → 条目）。 */
   fallbackIndex;
+  /** 本机补充模型缓存（`model-overrides.json`），15 秒过期。 */
+  extraModelsCache;
+  extraModelsAt = 0;
   /**
    * 可中止的休眠；信号中止时立即 resolve（不抛错，由调用方检查 signal）。
    *
@@ -40082,13 +40109,49 @@ var QoderAdapter = class extends LlmAdapter4 {
    * 黑名单过滤掉它们 —— RPC 层只能凭裸 id 补回，展示名与倍率随之丢失
    * （用户报障：「关闭的就没有显示倍率」）。详见 `model.list` 端点的注释。
    */
+  /**
+   * 本机补充的模型（`~/.dsh/get-it-for-free/model-overrides.json`，按渠道 id 分组）。
+   *
+   * 为什么需要：Qoder 的模型目录端点要 WASM 签名，本插件没实现，上游上新模型时
+   * 列表不会自己变。这个文件是唯一不用改代码的补入口。文件不存在 / 解析失败 /
+   * 条目缺 id 都按「没有补充」处理，不影响原表。
+   */
+  extraModels() {
+    const now = Date.now();
+    if (this.extraModelsCache !== void 0 && now - this.extraModelsAt < 15e3) return this.extraModelsCache;
+    this.extraModelsAt = now;
+    let list = [];
+    try {
+      const home = process.env.DSH_HOME?.trim() || join3(process.env.HOME ?? ".", ".dsh");
+      const path2 = join3(home, "get-it-for-free", "model-overrides.json");
+      if (existsSync3(path2)) {
+        const parsed = JSON.parse(readFileSync3(path2, "utf-8"));
+        const raw = parsed?.[this.product.id];
+        if (Array.isArray(raw)) {
+          list = raw.filter((m) => typeof m === "object" && m !== null && typeof m.id === "string" && m.id.length > 0);
+        }
+      }
+    } catch {
+      list = [];
+    }
+    this.extraModelsCache = list;
+    for (const model of list) if (!this.fallbackIndex.has(model.id)) this.fallbackIndex.set(model.id, model);
+    return list;
+  }
+  /** 产品兜底表 + 本机补充（按 id 去重，兜底表优先）。 */
+  allModels() {
+    const extra = this.extraModels();
+    if (extra.length === 0) return this.product.fallbackModels;
+    const seen = new Set(this.product.fallbackModels.map((model) => model.id));
+    return [...this.product.fallbackModels, ...extra.filter((model) => !seen.has(model.id))];
+  }
   listAllModels() {
-    return this.product.fallbackModels.map((model) => ({ id: model.id, name: qoderDisplayName(model) }));
+    return this.allModels().map((model) => ({ id: model.id, name: qoderDisplayName(model) }));
   }
   async listModels(_provider) {
     if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return [];
     const disabled = this.options.accountPool?.disabledModelsFor(this.product.id);
-    const source = this.product.fallbackModels;
+    const source = this.allModels();
     const listed = disabled === void 0 || disabled.size === 0 ? source : source.filter((model) => !disabled.has(model.id));
     return listed.map((model) => ({
       provider: this.product.id,
@@ -40109,6 +40172,7 @@ var QoderAdapter = class extends LlmAdapter4 {
    * 我们应该按照他的设置给出可设置的档位选择」）。
    */
   async resolveModel(provider, model, _signal) {
+    this.extraModels();
     const entry = this.fallbackIndex.get(model);
     const resolved = {
       provider,
@@ -64542,8 +64606,17 @@ async function handleMethod(method, payload, signal) {
           }
         };
         const blockedByEnv = await degrade("env \u5F00\u5173", () => !isGatewayEnabled(process.env), true);
-        const apiKey = await degrade("API Key", () => gatewayApiKey(), null);
-        const address = await degrade("\u76D1\u542C\u5730\u5740", () => blockedByEnv ? null : gatewayAddress() ?? null, null);
+        // 网关还没启动过时 `lastApiKey` 是 null，但设置页必须立刻能「看到并复制」
+        // 这把 key（用户配好客户端才开始用网关，不是反过来）。密钥文件才是事实
+        // 来源，所以这里按需读盘；文件不存在就顺手生成一把（0600，原子写）。
+        const apiKey = await degrade("API Key", () => {
+          const live = gatewayApiKey();
+          if (live !== null) return live;
+          return loadOrCreateApiKey(resolveChannelPackHome(ctx), process.env);
+        }, null);
+        // 没监听时也回显**将要**监听的地址：用户要拿 base_url 去填别的客户端，
+        // 关着的时候给他一个 "null" 没有意义。
+        const address = await degrade("\u76D1\u542C\u5730\u5740", () => blockedByEnv ? null : gatewayAddress() ?? resolveGatewayConfig(process.env), null);
         const llm = llmServiceOf(ctx);
         const listed = llm?.listProviders !== void 0 ? (() => {
           try {
@@ -64612,6 +64685,183 @@ async function handleMethod(method, payload, signal) {
           modelsSource
         };
         return { ok: true, value };
+      }
+      /**
+       * 重新生成网关密钥。
+       *
+       * 为什么不能只写文件：`createOpenAiGateway` 在**创建那一刻**就把密钥读进闭包
+       * （`const key = apiKey.value`），之后每个请求都拿这个闭包值和 `authorized()`
+       * 比对。所以只改磁盘上的文件，正在监听的网关仍然认旧密钥 —— 必须关掉再重新
+       * 起一次（工厂会把 `createOpenAiGateway` 再跑一遍，自然读到新文件）。
+       *
+       * 顺序也固定成「先关 → 再删 → 再开」：先删的话，若关闭过程中有请求进来，
+       * 会撞上一个已经读不出密钥的网关。
+       */
+      case "gateway.regenerateKey": {
+        if (!isGatewayEnabled(process.env)) {
+          return {
+            ok: false,
+            error: {
+              code: "gateway-env-blocked",
+              message: "网关已被环境变量 DSH_OPENAI_GATEWAY_ENABLED 停用，密钥无法在界面里更换"
+            }
+          };
+        }
+        const fromEnv = process.env.DSH_OPENAI_GATEWAY_API_KEY?.trim();
+        if (fromEnv !== void 0 && fromEnv !== "") {
+          return {
+            ok: false,
+            error: {
+              code: "gateway-key-from-env",
+              message: "当前密钥来自环境变量 DSH_OPENAI_GATEWAY_API_KEY，请改环境变量；界面不会覆盖它"
+            }
+          };
+        }
+        const home = resolveChannelPackHome(ctx);
+        const keyPath = join9(home, "openai-gateway", KEY_FILE);
+        try {
+          setGatewayDesiredEnabled(false);
+          await applyGatewayDesiredState();
+          const { unlink } = await import("node:fs/promises");
+          try {
+            await unlink(keyPath);
+          } catch (error) {
+            // 文件不存在是正常情况（第一次启用前没有密钥），其它错误要报出来：
+            // 读不到就等于新密钥写不进去，此时不能假装成功。
+            const code = error?.code;
+            if (code !== "ENOENT") throw error;
+          }
+          const fresh = loadOrCreateApiKey(home);
+          setGatewayDesiredEnabled(pool.gatewayEnabled() !== false);
+          await applyGatewayDesiredState();
+          ctx.logger.info(`[channel-pack] 已重新生成本机网关密钥（${keyPath}）`);
+          return {
+            ok: true,
+            value: {
+              apiKey: { value: fresh.value, fromEnv: false, path: fresh.path },
+              running: isGatewayRunning(),
+              address: gatewayAddress() ?? null
+            }
+          };
+        } catch (error) {
+          // 任何一步失败都要把「想不想开」恢复成持久化的那个值，否则网关会停在
+          // 一个既不是用户设置、也不是代码默认的中间状态。
+          try {
+            setGatewayDesiredEnabled(pool.gatewayEnabled() !== false);
+            await applyGatewayDesiredState();
+          } catch (restoreError) {
+            ctx.logger.warn(`[channel-pack] 重新生成密钥失败后未能恢复网关状态：${String(restoreError)}`);
+          }
+          return {
+            ok: false,
+            error: {
+              code: "gateway-key-failed",
+              message: `重新生成密钥失败：${error instanceof Error ? error.message : String(error)}`
+            }
+          };
+        }
+      }
+      /**
+       * 网关自检：从宿主进程内部打一次自己的回环端点。
+       *
+       * 浏览器打不了 —— 这是跨源请求（页面在宿主端口上，网关在 8326），网关不返
+       * CORS 头，浏览器会先被预检拦掉，看到的「失败」跟网关健康与否无关。所以自检
+       * 必须在宿主进程里做，结果回给面板展示。
+       *
+       * 三件事分开报，因为它们失败的含义完全不同：
+       * 1. 带正确 key 取 `/v1/models` —— 网关活着、鉴权活着、模型目录能读出来；
+       * 2. 带错 key 再取一次 —— 期望 401，**拿到 200 才是故障**（说明鉴权没生效）；
+       * 3. 可选的一次最小 `chat/completions` —— 只有调用方指定了 model 才做，
+       *    因为这一发会真的花掉一个渠道账号的额度。
+       */
+      case "gateway.selfTest": {
+        const req = payload;
+        const key = gatewayApiKey();
+        const address = gatewayAddress();
+        if (key === void 0 || key === null) {
+          return { ok: true, value: { reachable: false, reason: "no-key", steps: [] } };
+        }
+        if (address === void 0 || address === null) {
+          return { ok: true, value: { reachable: false, reason: "not-running", steps: [] } };
+        }
+        const base = `http://${address.host}:${address.port}`;
+        const steps = [];
+        const call = async (label, path, init, timeoutMs) => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
+          const startedAt = Date.now();
+          try {
+            const response = await fetch(`${base}${path}`, { ...init, signal: controller.signal });
+            const text = await response.text();
+            let body;
+            try {
+              body = text === "" ? null : JSON.parse(text);
+            } catch {
+              body = text.slice(0, 400);
+            }
+            const step = { label, status: response.status, ms: Date.now() - startedAt, body };
+            steps.push(step);
+            return step;
+          } catch (error) {
+            const step = {
+              label,
+              status: 0,
+              ms: Date.now() - startedAt,
+              body: null,
+              error: error instanceof Error ? error.message : String(error)
+            };
+            steps.push(step);
+            return step;
+          } finally {
+            clearTimeout(timer);
+          }
+        };
+        const authorized2 = await call(
+          "models",
+          "/v1/models",
+          { headers: { authorization: `Bearer ${key.value}` } },
+          8e3
+        );
+        const unauthorized = await call(
+          "models-bad-key",
+          "/v1/models",
+          { headers: { authorization: "Bearer definitely-not-the-key" } },
+          8e3
+        );
+        let chat;
+        const model = typeof req?.model === "string" ? req.model.trim() : "";
+        if (model !== "") {
+          chat = await call(
+            "chat",
+            "/v1/chat/completions",
+            {
+              method: "POST",
+              headers: { authorization: `Bearer ${key.value}`, "content-type": "application/json" },
+              body: JSON.stringify({
+                model,
+                messages: [{ role: "user", content: "ping" }],
+                max_tokens: 16,
+                stream: false
+              })
+            },
+            12e4
+          );
+        }
+        const models = Array.isArray(authorized2.body?.data) ? authorized2.body.data.length : null;
+        return {
+          ok: true,
+          value: {
+            reachable: authorized2.status === 200,
+            reason: authorized2.status === 200 ? "ok" : authorized2.error !== void 0 ? "unreachable" : "unauthorized",
+            base,
+            models,
+            // 鉴权自检：期望 401。200 意味着任何人拿到地址就能用，比「不通」严重。
+            authEnforced: unauthorized.status === 401,
+            badKeyStatus: unauthorized.status,
+            chat,
+            steps
+          }
+        };
       }
       // ── 内部 captcha 载体（二期）──
       //

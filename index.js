@@ -58,6 +58,7 @@ import { OPTIMIZATIONS } from './src/local-optimize.js'
 import { createModelRuntime, createRuntimeStores } from './src/core/runtime.js'
 import { createMiMo, MIMO_PROVIDER } from './src/mimo/provider.js'
 import { createCliLane, CLI_ROUTE } from './src/cli-lane.js'
+import { createModelSync } from './src/model-sync.js'
 import { uninstallPlugin, spawnDetachedRemoval } from './src/uninstall.js'
 
 export { fromOpenAiMessages } from './src/core/completion.js'
@@ -1200,6 +1201,18 @@ export function apply(ctx, config) {
     logger.warn?.(`get-it-for-free: ${surface} admission rejected status=${status} source=${source} reason=${reason}`)
   }
 
+  // ── 模型目录同步 ────────────────────────────────────────────────────────────
+  // 每日 12:00、开机补刷、面板上的「立即同步」共用这一条路径：先清各渠道的
+  // 进程内目录缓存，再主动拉一遍，跟上一份快照比出新增/下线/变更并落盘。
+  // 不另起一套定时器 —— 「从提供商那边自动更新模型列表」在整份插件里只有
+  // 一个入口、一份时间戳，否则两套调度迟早互相覆盖。
+  const modelSync = createModelSync({
+    listProviders: routes,
+    listModels: provider => ctx.llm?.listModels?.(provider),
+    refresh: reason => refreshChannelModels(reason),
+    logger,
+  })
+
   const api = createApiRoutes({
     settings, stats, availability, catalog: () => modelRuntime.catalog, state,
     refreshCatalog, refreshAvailability, syncForward, syncRelay, syncEgress,
@@ -1211,6 +1224,8 @@ export function apply(ctx, config) {
     mimo: mimoBridge,
     // CLI 通道的状态：是否装了官方 CLI、什么版本、能出哪些模型。
     cliLane,
+    // 模型目录同步：上次同步时间、各渠道模型数、新增/下线 diff 历史。
+    modelSync,
     // ── the aggregate lane's settings surface ────────────────────────────────
     // The registry is static data; the configured half is the settings file with
     // every key masked. Writing one provider rebuilds the catalog and re-emits
@@ -1741,9 +1756,14 @@ export function apply(ctx, config) {
     modelRefreshTimer = setTimeout(() => {
       if (disposed) return
       const reason = delayMs === undefined ? '每日 12:00' : '补刷新'
-      void refreshChannelModels(reason).then(ok => {
-        // 失败 15 分钟后再试（网络抖动不至于要等到明天）；成功则对准下一个 12:00
-        armModelRefresh(ok ? undefined : 15 * 60_000)
+      // 走同步引擎而不是只清缓存：清缓存之后谁会去拉、拉了跟之前差在哪，
+      // 用户一直看不到。引擎内部第一步同样是 refreshChannelModels。
+      void modelSync.run({ reason }).then(entry => {
+        const failed = Object.values(entry?.providers ?? {}).filter(row => typeof row?.error === 'string').length
+        armModelRefresh(failed === 0 ? undefined : 15 * 60_000)
+      }).catch(error => {
+        logger.warn?.(`get-it-for-free: 模型同步失败（${reason}）：${error?.message ?? error}`)
+        armModelRefresh(15 * 60_000)
       })
     }, delay)
     modelRefreshTimer.unref?.()
@@ -1991,6 +2011,19 @@ export function createApiRoutes(deps) {
       }
       if (method === 'GET' && routePath === '/stats') {
         return send(200, buildStats(deps.stats.get(), deps.catalog()))
+      }
+      // ── 模型目录同步（对标 dsh-model-sync 的目录那一半）──────────────────────
+      if (method === 'GET' && routePath === '/model-sync') {
+        return send(200, deps.modelSync.status())
+      }
+      // 手动同步要串行跑完十几个渠道的目录拉取，8 秒兜底必然超时，所以这里本身
+      // 不设上限，交给面板侧给足 timeout；引擎内部按渠道逐个限时 25 秒。
+      if (method === 'POST' && routePath === '/model-sync/run') {
+        try {
+          return send(200, await deps.modelSync.run({ reason: '手动同步' }))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
       }
       // ── CodeBuddy CLI 通道 ───────────────────────────────────────────────────
       if (routePath === '/cli-lane/status') {

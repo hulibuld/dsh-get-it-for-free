@@ -17,3 +17,8 @@ __pycache__/
 交接文档 *.md
 交接文档*.bak
 HANDOFF.local.md
+# 上游插件测绘笔记（3.0.26 起）：本机路径与取证过程，只留本地
+docs-merge/
+# Finder 复制出来的副本（同名带空格），只在本地存在
+client 2.js
+* 2.js
