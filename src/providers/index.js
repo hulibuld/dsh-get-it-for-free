@@ -32,19 +32,6 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-/** The three wire formats the registry can name. */
-export const FORMAT_VALUES = Object.freeze(['openai-chat', 'openai-responses', 'anthropic-messages'])
-
-/** How a provider is made available; `none` covers the keyless and local rows. */
-export const AUTH_KINDS = Object.freeze(['apiKey', 'none', 'oauth', 'adc'])
-
-/**
- * Category values in the order `registry.json` sorts by (alphabetical, so a
- * regenerated file diffs only where the data changed). A picker is free to rank
- * them differently for display.
- */
-export const CATEGORY_VALUES = Object.freeze(['apikey', 'free', 'free-tier', 'local', 'oauth'])
-
 const REGISTRY_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'registry.json')
 
 /** Freeze the shared data so one caller cannot hand another a mutated record. */
@@ -56,9 +43,6 @@ function deepFreeze(value) {
 
 /** The parsed `registry.json` array, sorted by category then id. */
 export const PROVIDERS = deepFreeze(JSON.parse(fs.readFileSync(REGISTRY_FILE, 'utf8')))
-
-/** Every registry id — the set `parseProviderModelId` validates prefixes against. */
-export const PROVIDER_IDS = Object.freeze(new Set(PROVIDERS.map(provider => provider.id)))
 
 const BY_ID = new Map(PROVIDERS.map(provider => [provider.id, provider]))
 

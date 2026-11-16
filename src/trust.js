@@ -124,15 +124,6 @@ export function rejectionFor(req, connection, onRejection) {
   return decision.status
 }
 
-/**
- * The replica fence. Same shape as the kernel's `isTrustedApiRequest`: DNS
- * rebinding defence via the Host header, cross-site fetch refusal, and an
- * Origin/Referer authority match.
- */
-export function structuralRejection(req) {
-  return structuralReason(req) === undefined ? undefined : 403
-}
-
 /** Return a fixed reason without exposing caller-supplied strings. */
 function structuralReason(req) {
   const host = authorityOf(req.headers.host, 'http')

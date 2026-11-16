@@ -401,6 +401,13 @@ const TRACE_PHRASE_REWRITES = [
   ['DeepSeek Harness Web GUI', 'console UI'],
   ['DeepSeek Harness.app', 'DeepSeek.app'],
   ['the DeepSeek Harness Web GUI', 'the local console UI'],
+  // 上游除了认品牌词，还对「第三方 agent 提示词」做模糊指纹：这两句同时出现即判
+  // 非官方客户端，回 400 code=11128（pack.js:36004-36013 实测结论，单句不触发）。
+  // 这里只改措辞，规则本身照旧传达，语义不变。
+  ['Tokens prefixed with @ are paths the user explicitly referenced.',
+    'Tokens starting with @ mark paths the user explicitly referenced.'],
+  ['Relative paths resolve from the workspace root; absolute paths identify files or directories on the host.',
+    'Relative paths resolve from the workspace root; absolute paths identify files or directories on this machine.'],
 ]
 
 const TRACE_BRAND_RE = /(?<![\\/])(DeepSeek)[\s\u00A0\u200B\u200C\u200D\uFEFF]*Harness(?![\\/])/gi

@@ -29,6 +29,7 @@ import { createChannel } from './channel.js'
 import { recoveryPolicy, canRecover, canRecoverSilentStop, recoveryMessages, continuationMessages, checkpointFits, addUsage, createBlockTracker } from './recovery.js'
 import { isEacEntry, isKiloEntry } from './catalog.js'
 import { isComboEntry, comboChain } from './combos.js'
+import { isPoolEntry, poolCandidates, notePoolFailure } from './freepool.js'
 import { applyTokenSavers, saverConfig } from './token-saver/index.js'
 import { classifyFailure, describeVerdict, shouldAdvance } from './route/classify.js'
 import { FALLBACK_IMAGE_PRICING } from './image-pricing.js'
@@ -209,6 +210,21 @@ export class FreeModelAdapter {
   async * runStream(options, pinned, snapshot) {
     const modelId = baseModelId(options.model)
     const entry = pinned ?? snapshot.catalog.find(candidate => candidate.id === modelId) ?? null
+    if (entry !== null && isPoolEntry(entry)) {
+      const pool = (snapshot.settings ?? {}).freePool ?? {}
+      // The order is computed here rather than stored on the row: the row is
+      // cached in the picker, and an order frozen at listing time would keep
+      // dialing the lane whose quota ran out an hour ago until the next reload.
+      const candidates = pool.enabled === false
+        ? []
+        : poolCandidates(snapshot.catalog, {
+          stats: snapshot.stats,
+          exclude: pool.exclude,
+          limit: pool.limit,
+        }).map(row => row.entry)
+      yield * this.runCombo(options, entry, snapshot, candidates)
+      return
+    }
     if (entry !== null && isComboEntry(entry)) {
       yield * this.runCombo(options, entry, snapshot)
       return
@@ -229,8 +245,11 @@ export class FreeModelAdapter {
    * Once an answer delta has been handed over the answer is the caller's, and a
    * later failure ends the turn the normal way — the single-model recovery path
    * inside `runSingle` still gets its continuation attempt first.
+   *
+   * @param {Array<object>} [chain] - candidates for the free pool, whose order is
+   *   recomputed per turn instead of read from the row. Omitted for a combo.
    */
-  async * runCombo(options, entry, snapshot) {
+  async * runCombo(options, entry, snapshot, chain = null) {
     const settings = snapshot.settings ?? {}
     const started = Date.now()
     const rejectedTurn = attempts => {
@@ -241,10 +260,13 @@ export class FreeModelAdapter {
       yield { type: 'finish', reason: { kind: 'error', failure: { message: 'free ride is switched off in its settings page', code: 'CONFIG_DISABLED' } } }
       return
     }
-    const candidates = comboChain(entry, snapshot.catalog)
+    const candidates = chain ?? comboChain(entry, snapshot.catalog)
     if (candidates.length === 0) {
       rejectedTurn(0)
-      yield { type: 'finish', reason: { kind: 'error', failure: { message: `the chain "${entry.name}" has no model available on this egress`, code: CODE.server } } }
+      const message = isPoolEntry(entry)
+        ? `the free pool has no lane left to dial: ${(snapshot.settings ?? {}).freePool?.exclude?.length ? 'every candidate is excluded or benched' : 'no free lane is available on this egress'}`
+        : `the chain "${entry.name}" has no model available on this egress`
+      yield { type: 'finish', reason: { kind: 'error', failure: { message, code: CODE.server } } }
       return
     }
     const tried = []
@@ -284,6 +306,10 @@ export class FreeModelAdapter {
       }
       const reason = result.verdict === null || result.verdict === undefined ? 'failed' : describeVerdict(result.verdict)
       tried.push(`${candidate.id} (${reason})`)
+      // Only a pool benches its mistakes: a hand-written chain is the user's own
+      // order, and reordering it behind their back would be a second opinion
+      // they never asked for. The pool exists precisely to learn this.
+      if (isPoolEntry(entry)) notePoolFailure(candidate.id, result.verdict)
       this.deps.warn?.(`get-it-for-free: chain "${entry.name}" advanced past ${candidate.id} — ${reason}`)
     }
     rejectedTurn(candidates.length)

@@ -167,6 +167,9 @@ export const SETTINGS_INITIAL = {
    *  只做「各公司账号池 → 模型」，不往选择器里塞免费模型。 */
   freeChannelsEnabled: false,
   hideAllModels: true,
+  /** 设置页里被收起来的渠道卡片（右上角「×」）。只影响这一页的排列：账号、
+   *  令牌、模型开关都不动，页面底部的「＋」把它原样加回来。 */
+  hiddenChannels: [],
   /** 上次成功刷新「各渠道可用模型」的时间戳（毫秒）。每日 12:00 的刷新用它
    *  判断今天是否已经刷过：上一次早于今天 12:00 就在启动后立刻补一次。 */
   lastModelRefreshAt: 0,
@@ -226,6 +229,16 @@ export const SETTINGS_INITIAL = {
       enabled: true,
     },
   ],
+  /** The free pool: a virtual row that dials every free lane this plugin serves,
+   *  best-performing first, and benches a lane that just failed. See
+   *  src/freepool.js. On by default because it only ever reorders free lanes —
+   *  it can never reach a lane that bills per token. */
+  freePool: {
+    enabled: true,
+    name: '',
+    exclude: [],
+    limit: 8,
+  },
   /** The five local answers that avoid a provider call entirely: a quota probe,
    *  a shell command prefix, a session title, a suggestion, a filepath list.
    *  They are pure request-shape matches, so a false positive would answer a real

@@ -31866,6 +31866,18 @@ function createDirectFetch(options = {}) {
         ...request2.body ? { duplex: "half" } : {}
       };
     }
+    // 出网口默认走打包进来的 undici：它不经过 globalThis.fetch，宿主侧插件
+    // （billion-context 之类）就看不见模型请求。
+    // 3.0.38 曾改成默认走全局 fetch，想让这类插件看见流量；3.0.42 撤回默认开——实测代价太重：
+    // bili 日志反复打 `[bili-native] third-party globalThis.fetch install detected (#1158)
+    // — re-chaining as downstream (install 8)`，随后就是整轮卡死十几分钟与
+    // `UND_ERR_CONNECT_TIMEOUT`、`upstream 502`。要复现这套实验，显式设
+    // GET_IT_FOR_FREE_HOST_FETCH=1；调用方自带 dispatcher（出口代理）时始终用 undici。
+    const requestedDispatcher = init?.dispatcher;
+    if (process.env.GET_IT_FOR_FREE_HOST_FETCH === "1" && requestedDispatcher === undefined && typeof globalThis.fetch === "function") {
+      const { dispatcher: _dropDispatcher, ...hostInit } = requestInit ?? {};
+      return globalThis.fetch(target, hostInit);
+    }
     return (0, import_undici3.fetch)(target, { ...requestInit, dispatcher });
   };
   const outlet = options.outlet;
@@ -34133,36 +34145,50 @@ var CodeArtsAdapter = class extends LlmAdapter {
       wireTools = void 0;
     }
     let concurrencyLimited = false;
+    // 参数降级阶梯（2026-11-15）：同一组凭据、同一台机器，用探针直接打上游
+    // 无论裸体 / 65536 / 全扩展字段 / 带 120 个工具 / 86KB 历史一律 200，
+    // 但宿主里的真实会话偶尔回 `InferHub.001001005.400 The request param is invalid`。
+    // 那句不说是哪个参数，逐个猜要发四轮；所以按「最可疑 → 最保守」分三级退让，
+    // 每退一级都落盘 `phase: "sse-param-N"`，下次从日志就能看出是哪一档救回来的。
+    //   1：去掉 tool_stream（工具流式是 CodeArts 自家方言）
+    //   2：去掉整套 CodeArts 方言（prompt_cache_key / include / reasoning_summary / thinking）
+    //   3：输出上限压到 8192
+    // 工具本身任何时候都不摘——摘了就没法干活，宁可报错。
+    let degradeStage = 0;
     const buildBody = () => JSON.stringify({
       model: options.model,
       messages,
       stream: true,
-      // prompt_cache_key 让服务端启用前缀缓存并在 usage 中返回 cached_tokens，
-      // 缺少该字段时缓存命中恒为 0（实测 2026-08-24）。
-      prompt_cache_key: this.sessionId,
-      // include/reasoning_summary 对齐 Rust 端 CodeArtsExtraFields，
-      // 让服务端返回加密 reasoning 内容与摘要。
-      include: ["reasoning.encrypted_content"],
-      reasoning_summary: "auto",
-      // 思考开关（实测，2026-09-29）：档位「关闭」翻成本网关真正认的字段。
-      // ⚠️ 是**顶层** `thinking`，不是 raccoon 那种 `extra_body.thinking` 方言
-      // （两者是不同网关的方言，混用会静默无效）。
-      // 实测判据：`disabled` → reasoning_tokens 3/3 全为 0、正文仍正确；
-      // `enabled` 与不传等价（服务端默认就开着），故「开启」档**不发**该字段。
-      ...options.reasoningEffort === "off" ? { thinking: { type: "disabled" } } : {},
-      // 对齐 CodeArts Agent IDE 请求体（deveco-code 内核日志实证）：
-      // tool_stream=true 让后端将超大工具调用参数（如大文件 file_write）
-      // 分段流式传输，避免单次 SSE 事件过大导致连接被掐断
-      // （error decoding response body）。deepseek-v4 的 DSML 路径不受此
-      // 影响，保留该字段与 IDE 对齐。
-      tool_stream: true,
+      ...degradeStage >= 2 ? {} : {
+        // prompt_cache_key 让服务端启用前缀缓存并在 usage 中返回 cached_tokens，
+        // 缺少该字段时缓存命中恒为 0（实测 2026-08-24）。
+        prompt_cache_key: this.sessionId,
+        // include/reasoning_summary 对齐 Rust 端 CodeArtsExtraFields，
+        // 让服务端返回加密 reasoning 内容与摘要。
+        include: ["reasoning.encrypted_content"],
+        reasoning_summary: "auto",
+        // 思考开关（实测，2026-09-29）：档位「关闭」翻成本网关真正认的字段。
+        // ⚠️ 是**顶层** `thinking`，不是 raccoon 那种 `extra_body.thinking` 方言
+        // （两者是不同网关的方言，混用会静默无效）。
+        // 实测判据：`disabled` → reasoning_tokens 3/3 全为 0、正文仍正确；
+        // `enabled` 与不传等价（服务端默认就开着），故「开启」档**不发**该字段。
+        ...options.reasoningEffort === "off" ? { thinking: { type: "disabled" } } : {}
+      },
+      ...degradeStage >= 1 ? {} : {
+        // 对齐 CodeArts Agent IDE 请求体（deveco-code 内核日志实证）：
+        // tool_stream=true 让后端将超大工具调用参数（如大文件 file_write）
+        // 分段流式传输，避免单次 SSE 事件过大导致连接被掐断
+        // （error decoding response body）。deepseek-v4 的 DSML 路径不受此
+        // 影响，保留该字段与 IDE 对齐。
+        tool_stream: true
+      },
       // 输出上限（对齐 deveco-code-rust 参考实现 codearts.rs 的 max_tokens 配置）：
       // 大文件 write 工具参数（如 1000-2000+ 行文档）需要数万 token 的生成空间，
       // 若沿用后端默认输出上限，参数 JSON 会在中途被截断成非法 JSON，harness
       // 工具校验报 `invalid arguments: "arguments" must be an object`。
       // 参考实现 e2e 实测：65536 可用，131072 反而触发空流被后端拒绝；
       // 显式传入的 options.maxTokens 优先，未设置时默认 65536。
-      max_tokens: options.maxTokens ?? codeArtsDefaultMaxTokens(),
+      max_tokens: degradeStage >= 3 ? 8192 : options.maxTokens ?? codeArtsDefaultMaxTokens(),
       ...wireTools !== void 0 && wireTools.length > 0 ? { tools: wireTools } : {}
     });
     const url = `${CHAT_API_BASE}/chat/completions`;
@@ -34175,6 +34201,11 @@ var CodeArtsAdapter = class extends LlmAdapter {
     let benefitHeaderAdded = false;
     const rateLimitTried = /* @__PURE__ */ new Set();
     if (currentAccountId) rateLimitTried.add(currentAccountId);
+    // 福利通道判定（2026-11-15 实测结论，别再翻案）：`maas_type: benefit` 这个头
+    // 在 snap-access 上恰恰是坏事——glm-5.3-flash / deepseek-v4.1-flash 带它就回
+    // APIG.0101「接口未发布」或 001001005「参数非法」，不带就 200 正常出流
+    // （两个账号、裸体/65536/扩展字段/带 tools 全试过）。所以默认**不带**，
+    // 只有 env 显式 =1 才带；反向探测（上游说 not registered）时会临时补一次。
     const isBenefitModel = (codeArtsBenefitHeaderEnabled() || benefitHeaderAdded) && isCodeArtsBenefitModel(options.model);
     for (; ; ) {
       concurrencyLimited = false;
@@ -34281,6 +34312,10 @@ var CodeArtsAdapter = class extends LlmAdapter {
             markCodeArtsBenefitUnavailable(credential, options.model);
             benefitHeaderDropped = true;
             continue;
+          } else if (error instanceof LlmError2 && error.code === "INVALID_REQUEST" && degradeStage < 3 && /param\s+is\s+invalid|001001005/i.test(String(error.message ?? ""))) {
+            degradeStage += 1;
+            logCodeArtsFailure({ status: 200, phase: `sse-param-${degradeStage}`, body: String(error.message ?? "").slice(0, 300), accountId: currentAccountId ?? null, model: options.model });
+            continue;
           } else {
             throw error;
           }
@@ -34306,6 +34341,12 @@ var CodeArtsAdapter = class extends LlmAdapter {
             continue;
           }
           concurrencyLimited = false;
+        }
+        // 参数非法（001001005）走与流内相同的一级退让：先怀疑 CodeArts 自家方言字段。
+        if (degradeStage < 3 && /001001005|param\s+is\s+invalid/i.test(errorText)) {
+          degradeStage += 1;
+          logCodeArtsFailure({ status: response.status, phase: `http-param-${degradeStage}`, body: errorText.slice(0, 300), accountId: currentAccountId ?? null, model: options.model });
+          continue;
         }
         // 网关过载给的 403（TM.00000001「网络繁忙」）：原地等几秒重试最快，也不会把用户
         // 引去重登凭据。重试用尽才换号，换不到才抛出去——抛的是 RATE_LIMIT，不是 AUTH。

@@ -89,7 +89,7 @@ export function injectSystem(payload, wire, text) {
  * @param {'chat'|'messages'|'responses'} wire
  * @returns {{payload: object, stripped: boolean, reason: string}}
  */
-export function stripInjected(payload, wire) {
+function stripInjected(payload, wire) {
   try {
     if (payload === null || typeof payload !== 'object') return { payload, stripped: false, reason: 'shape-not-recognised' }
     if (wire === 'chat') return stripChat(payload)
@@ -111,7 +111,7 @@ export function stripInjected(payload, wire) {
  * @param {'chat'|'messages'|'responses'} wire
  * @returns {boolean}
  */
-export function hasInjected(payload, wire) {
+function hasInjected(payload, wire) {
   try {
     if (payload === null || typeof payload !== 'object') return false
     if (wire === 'chat') {

@@ -4,6 +4,7 @@ import { FreeModelAdapter, ROUTE_MAIN, ROUTE_REGION } from '../adapter.js'
 import { buildCatalog, buildEacCatalog, buildKiloCatalog, isEacEntry, isKiloEntry, parseListing, reviveKiloCatalog } from '../catalog.js'
 import { buildAggregateCatalog, isAggregateEntry } from '../aggregate.js'
 import { buildComboCatalog, isComboEntry, normalizeCombos, pruneRotation } from '../combos.js'
+import { buildPoolEntry, POOL_ID, poolCandidates, poolStatus } from '../freepool.js'
 import { JsonStore, SETTINGS_INITIAL, STATS_INITIAL, STATS_VERSION, migrateStats, pruneDays, recordTurn, recordUsage, isModelHidden } from '../store.js'
 import { STATE, detectEgress, probeCatalog } from '../probe.js'
 import { CODE, UpstreamError, getJson } from '../http.js'
@@ -100,6 +101,17 @@ export function createModelRuntime({
       seen.add(entry.id)
       merged.push(entry)
     }
+    // The free pool sits above the chains and below every real lane: it is a
+    // view over the rows above it, so it cannot exist before them, and a chain
+    // that wants to reference it would be referencing a view of itself.
+    const pool = settings.get().freePool ?? {}
+    if (pool.enabled !== false) {
+      const candidates = poolCandidates(merged, { stats: stats.get(), exclude: pool.exclude, limit: pool.limit })
+      if (candidates.length > 0 && !seen.has(POOL_ID)) {
+        seen.add(POOL_ID)
+        merged.push(buildPoolEntry({ candidates, name: pool.name }))
+      }
+    }
     const combos = normalizeCombos(settings.get().combos)
     comboCatalog = buildComboCatalog(combos, merged)
     pruneRotation(combos)
@@ -120,6 +132,9 @@ export function createModelRuntime({
     membership: computeMembership(catalog, availability.get(), settings.get()),
     settings: settings.get(),
     attributionUserAgent,
+    // The pool ranks lanes by what they did, so the adapter needs the same
+    // numbers the stats page shows. One read per turn, same store, no copy.
+    stats: stats.get(),
   })
   const emitTopology = () => { if (!disposed) onTopology() }
   const adapter = new FreeModelAdapter({
@@ -380,6 +395,13 @@ export function createModelRuntime({
       },
     }),
     publicModelRows: () => publicModelRows(state()),
+    // The pool's ranking, including the benched lanes and why they are benched.
+    // Read straight from the same catalog the adapter dials, so the panel cannot
+    // disagree with what the next turn would actually do.
+    poolStatus() {
+      const pool = settings.get().freePool ?? {}
+      return poolStatus(state().catalog, { stats: stats.get(), exclude: pool.exclude, limit: pool.limit, enabled: pool.enabled !== false })
+    },
     // A settings write that changes the aggregate lane or the chains (a key
     // saved, a provider switched off, a combo edited) rebuilds the merged view
     // without a listing round: the aggregate rows come from settings alone.

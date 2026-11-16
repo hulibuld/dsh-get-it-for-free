@@ -193,25 +193,6 @@ function base62From(bytes) {
   return out
 }
 
-let lastStamp = 0
-let seq = 0
-
-/**
- * Mint a gateway-shaped canonical session id (time-prefixed, monotonic counter).
- *
- * The encoding is the gate's: `~(ts_ms * 0x1000 + counter)`, whose low 12 bits
- * land at `0xfff - counter`. The counter resets every millisecond, so a burst of
- * mints inside one millisecond stays inside the accepted 1–63 window.
- */
-export function mintSessionId(timestamp = Date.now()) {
-  if (timestamp !== lastStamp) { lastStamp = timestamp; seq = 0 }
-  seq += 1
-  const value = ~(BigInt(timestamp) * 0x1000n + BigInt(seq))
-  let hex = ''
-  for (let i = 0; i < 6; i += 1) hex += Number((value >> BigInt(40 - 8 * i)) & 0xffn).toString(16).padStart(2, '0')
-  return `ses_${hex}${base62From(crypto.randomBytes(14))}`
-}
-
 /**
  * Mint a `msg_`-shaped id for local bookkeeping (turn/recovery records).
  *
@@ -264,7 +245,7 @@ function rememberSession(seed, id) {
  * Free-tier quota is accounted per session, so a fresh id per request exhausts
  * it and surfaces as 429 with growing retry-after. The gateway also checks the
  * id's *encoding*, not just its shape: the twelve hex digits must carry the
- * descending timestamp layout `mintSessionId()` produces, with a counter in the
+ * descending timestamp layout {@link canonicalizeSession} produces, with a counter in the
  * accepted 1–63 window (measured 2026-10-17; the reference gateway's
  * `descendingTimePartPattern` documents the same window). A sha256 digest, an
  * ascending `ts << 12` value, or any other random hex is refused with 403
@@ -570,16 +551,6 @@ export function applyFingerprint(body, style) {
 export function restoreToolName(name, map) {
   if (!map || map.size === 0) return name
   return map.get(name) ?? name
-}
-
-/** Session-scoped identity used to pick a decoy out of a real tool call. */
-export function declaredToolNames(body) {
-  const names = new Set()
-  for (const tool of Array.isArray(body.tools) ? body.tools : []) {
-    const n = toolNameOf(tool)
-    if (n) names.add(n)
-  }
-  return names
 }
 
 function truncateSession(value) {

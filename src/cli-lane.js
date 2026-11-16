@@ -58,9 +58,6 @@ import { StringDecoder } from 'node:string_decoder'
 /** The route this lane publishes. Distinct from `buddy` on purpose — see above. */
 export const CLI_ROUTE = 'codebuddy-cli'
 
-/** What the picker calls it. */
-export const CLI_ROUTE_LABEL = 'CodeBuddy CLI · 更稳'
-
 /** Environment the official CLI needs to reach the China-region service. */
 const CLI_ENV = { CODEBUDDY_INTERNET_ENVIRONMENT: 'internal' }
 

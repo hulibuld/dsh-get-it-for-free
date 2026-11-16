@@ -405,6 +405,12 @@ window.__ModuleLoader__.load({
         'chan.meta.accounts': '账号',
         'chan.meta.models': '模型',
         'chan.act.add': '添加账号',
+        'chan.hide': '把这张卡收起来',
+        'chan.hide.hint': '只是从这一页收起来：账号、令牌、模型都留着，随时加回来',
+        'chan.add.title': '添加渠道',
+        'chan.add.sub': '点一个加回页面上',
+        'chan.add.none': '全部渠道都在页面上',
+        'chan.hide.failed': '没保存成功',
         'chan.zcode.bigmodel': 'bigmodel.cn',
         'chan.zcode.zai': 'z.ai 国际版',
         'chan.act.refresh': '续期',
@@ -531,6 +537,25 @@ window.__ModuleLoader__.load({
         'gw.keyNone': '尚未生成',
         'gw.keyNoneHint': '密钥文件还没生成，点「重新生成」立刻造一把（不需要先启动网关）。',
         'gw.copyConfig': '复制 base_url + Key',
+        'rs.title': '签名中转',
+        'rs.sub': 'CodeArts · 给 bili 递重签凭据',
+        'rs.accounts': '个账号可重签',
+        'rs.none': '没有可递的账号',
+        'rs.sync': '同步给 bili',
+        'rs.syncing': '同步中…',
+        'rs.done': '已同步，CodeArts 这条链路恢复压缩',
+        'rs.failed': '同步失败：{reason}',
+        'rs.last': '上次同步',
+        'rs.never': '还没同步过',
+        'rs.hint': '只递 credentialRef，密钥留在宿主凭据库；bili 每次请求都会重扫这个文件，同步完不用重启。',
+        'rs.bili.label': 'bili 对华为云：',
+        'rs.bili.passthrough': '原样放行（不压缩，可用）',
+        'rs.bili.resign': '会重签（实测过不了上游）',
+        'rs.bili.disabled': '已关掉 bili 的签名处理',
+        'rs.bili.unknown': '没找到 bili 配置',
+        'rs.bili.on': '设为原样放行',
+        'rs.bili.off': '交还 bili 重签',
+        'rs.bili.hint': '华为云的签名盖住请求体，bili 只能重签后压缩或拒转发。它的重签路径实测过不了上游（会补尾斜杠、给部分模型加 maas_type 头），所以这条链路建议原样放行：bili 照常记录，只是不压缩。想真压缩就把下面的本机网关打开，再把 127.0.0.1:8326 当成 OpenAI 兼容渠道加进 DSH：那一段是明文，bili 能压；签名留给网关自己做。',
         'ms.title': '模型同步',
         'ms.sub': '各渠道目录跟上游保持一致',
         'ms.last': '上次同步',
@@ -546,6 +571,19 @@ window.__ModuleLoader__.load({
         'ms.stale': '沿用上次',
         'ms.empty': '当前没有可同步的渠道',
         'ms.hint': '只读目录，不动你自己关掉的模型开关',
+        'fpool.title': '免费池',
+        'fpool.sub': '把免费车道合成一行，按实测表现排序',
+        'fpool.on': '已启用',
+        'fpool.off': '已关闭',
+        'fpool.candidates': '候选',
+        'fpool.benched': '冷却中',
+        'fpool.cooling': '冷却',
+        'fpool.empty': '这台机器上还没有可用的免费车道',
+        'fpool.enable': '启用免费池',
+        'fpool.disable': '关闭免费池',
+        'fpool.clear': '全部解除',
+        'fpool.cleared': '冷却已全部解除',
+        'fpool.hint': '只重排本插件自己的免费车道，按量计费的渠道永远不会进池',
         'gw.models': '可转发模型',
         'gw.portNote': '端口可用环境变量 DSH_OPENAI_GATEWAY_PORT 调整。',
         'gw.relayTitle': '局域网转发（本插件中继）',
@@ -1141,6 +1179,12 @@ window.__ModuleLoader__.load({
         'chan.meta.accounts': 'Accounts',
         'chan.meta.models': 'Models',
         'chan.act.add': 'Add account',
+        'chan.hide': 'Put this card away',
+        'chan.hide.hint': 'Only hides the card on this page: accounts, tokens and models stay, and the ✚ brings it back',
+        'chan.add.title': 'Add channel',
+        'chan.add.sub': 'Pick one to bring it back',
+        'chan.add.none': 'Every channel is already on the page',
+        'chan.hide.failed': 'Could not save',
         'chan.zcode.bigmodel': 'bigmodel.cn',
         'chan.zcode.zai': 'z.ai international',
         'chan.act.refresh': 'Refresh',
@@ -1267,6 +1311,25 @@ window.__ModuleLoader__.load({
         'gw.keyNone': 'Not generated yet',
         'gw.keyNoneHint': 'The key file is not created yet — press "Regenerate" to mint one now (the gateway does not need to be running).',
         'gw.copyConfig': 'Copy base_url + key',
+        'rs.title': 'Signature relay',
+        'rs.sub': 'CodeArts · hand bili a re-sign credential',
+        'rs.accounts': 'account(s) re-signable',
+        'rs.none': 'nothing to hand over',
+        'rs.sync': 'Sync to bili',
+        'rs.syncing': 'Syncing…',
+        'rs.done': 'Synced — compression is back on the CodeArts link',
+        'rs.failed': 'Sync failed: {reason}',
+        'rs.last': 'Last sync',
+        'rs.never': 'never synced',
+        'rs.hint': 'Only credentialRef is handed over; keys stay in the host credential store. bili rescans the file on every request, so no restart is needed.',
+        'rs.bili.label': 'bili on Huawei Cloud:',
+        'rs.bili.passthrough': 'byte-untouched passthrough (no compression, works)',
+        'rs.bili.resign': 're-signing (fails upstream in practice)',
+        'rs.bili.disabled': "bili's signature handling is off",
+        'rs.bili.unknown': 'no bili config found',
+        'rs.bili.on': 'Switch to passthrough',
+        'rs.bili.off': 'Hand back to bili re-sign',
+        'rs.bili.hint': "Huawei Cloud signs the request body, so bili can only re-sign-then-compress or refuse. Its re-signer fails upstream in practice (it appends a trailing slash and adds a maas_type header for some models), so passthrough is the stable choice: bili still records the turn, it just does not compress it. For real compression, turn the local gateway below on and add 127.0.0.1:8326 to DSH as an OpenAI-compatible provider: that hop is plain JSON, so bili can compress it, and the signature stays with the gateway.",
         'ms.title': 'Model sync',
         'ms.sub': 'Keep every channel catalog in step with upstream',
         'ms.last': 'Last sync',
@@ -1282,6 +1345,19 @@ window.__ModuleLoader__.load({
         'ms.stale': 'kept last snapshot',
         'ms.empty': 'no channel to sync right now',
         'ms.hint': 'read-only: your own model toggles are never touched',
+        'fpool.title': 'Free pool',
+        'fpool.sub': 'Free lanes folded into one row, ranked by measured behaviour',
+        'fpool.on': 'on',
+        'fpool.off': 'off',
+        'fpool.candidates': 'candidates',
+        'fpool.benched': 'cooling',
+        'fpool.cooling': 'cooling down',
+        'fpool.empty': 'no free lane is available on this machine',
+        'fpool.enable': 'Enable pool',
+        'fpool.disable': 'Disable pool',
+        'fpool.clear': 'Clear cooldowns',
+        'fpool.cleared': 'Cooldowns cleared',
+        'fpool.hint': 'only this plugin’s own free lanes — a lane that bills per token never enters the pool',
         'gw.models': 'Servable models',
         'gw.portNote': 'The port can be moved with the DSH_OPENAI_GATEWAY_PORT environment variable.',
         'gw.relayTitle': 'LAN relay (this plugin\'s)',
@@ -1860,6 +1936,17 @@ window.__ModuleLoader__.load({
 .ofm_chanmeta{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--dsw-alias-label-tertiary)}
 .ofm_chanmeta b{color:var(--dsw-alias-label-secondary);font-weight:650;font-variant-numeric:tabular-nums}
 .ofm_chanacts{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+/* 卡片右上角的「×」：把这张卡收起来。页面底部的「＋」负责加回来，
+   两处都只动这一页的排列，不动账号与模型。 */
+.ofm_chanclose{flex:none;width:24px;height:24px;display:grid;place-items:center;border-radius:8px;border:1px solid transparent;background:transparent;color:var(--dsw-alias-label-tertiary);font-size:15px;line-height:1;cursor:pointer;transition:background .15s ease,color .15s ease,border-color .15s ease}
+.ofm_chanclose:hover{color:var(--dsw-alias-state-error-primary);border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary) 42%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 12%,transparent)}
+.ofm_addzone{display:flex;flex-direction:column;gap:9px;align-items:center;padding:4px 0 2px}
+.ofm_addbtn{border-style:dashed!important}
+.ofm_addlist{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;padding:10px;border-radius:13px;border:1px dashed color-mix(in srgb,var(--dsw-alias-border-l2) 90%,transparent);background:color-mix(in srgb,var(--dsw-alias-bg-layer-1) 55%,transparent)}
+.ofm_addchip{display:inline-flex;flex-direction:column;gap:1px;align-items:flex-start;padding:6px 11px;border-radius:10px;border:1px solid color-mix(in srgb,var(--dsw-alias-border-l2) 90%,transparent);background:color-mix(in srgb,var(--dsw-alias-bg-layer-2) 80%,transparent);cursor:pointer;font-size:12px;color:var(--dsw-alias-label-secondary);transition:border-color .15s ease,transform .15s ease}
+.ofm_addchip:hover{border-color:var(--chan-accent,var(--dsw-alias-state-business-primary));transform:translateY(-1px)}
+.ofm_addchip b{font-size:12.5px;color:var(--dsw-alias-label-primary)}
+.ofm_addchip span{font-size:10.5px;color:var(--dsw-alias-label-tertiary)}
 .ofm_acctlist{display:flex;flex-direction:column;gap:6px}
 .ofm_acct{display:flex;align-items:center;flex-wrap:wrap;gap:9px;padding:7px 10px;border-radius:11px;border:1px solid color-mix(in srgb,var(--dsw-alias-border-l1) 82%,transparent);background:color-mix(in srgb,var(--dsw-alias-bg-layer-1) 62%,transparent);font-size:12px;transition:border-color .16s ease,background .16s ease}
 .ofm_acct:hover{border-color:var(--dsw-alias-border-l2);background:color-mix(in srgb,var(--dsw-alias-bg-layer-1) 88%,transparent)}
@@ -3351,8 +3438,17 @@ window.__ModuleLoader__.load({
       { id: 'gemini', name: 'Gemini', org: 'Google · Antigravity', accent: '#4285F4', login: 'browser' },
     ]
 
+    /** 不在 CHANNEL_PROVIDERS 里、但同样可以收起来的固定卡（MiMo 桌面端额度、
+     *  CodeBuddy CLI 通道）。id 是固定字符串，收起名单与「加回」列表都按它认。 */
+    const FIXED_CARDS = [
+      { id: 'mimo', name: 'MiMo', org: '小米 · 桌面端额度', accent: '#FF6900' },
+      { id: 'cli-lane', name: 'CodeBuddy CLI', org: '腾讯 · 官方客户端通道', accent: '#0A7AFF' },
+      { id: 'doubao', name: '豆包工作', org: '字节 · 网页版额度', accent: '#2C6BFF' },
+    ]
+
     /** 与现有 RPC 的能力对应：余额、每日领取及独立签到状态分别判断。 */
     const CHANNEL_CREDITS = {
+      doubao: { claim: true, status: true },
       codearts: { claim: true, status: true },
       buddy: { claim: true, status: true },
       workbuddy: {},
@@ -3365,6 +3461,17 @@ window.__ModuleLoader__.load({
       minimax: { claim: true, status: true },
       zcode: { claim: true, status: true, unit: 'tokens' },
       gemini: {},
+    }
+
+    /** 豆包不走 pack（协议在我们自己的 src/doubao 里），但界面要跟别的渠道一模
+     *  一样，所以把它喂给同一个 ChannelCard：channel 描述这张卡，rpc 那些方法由
+     *  DOUBAO_TRANSPORT 转到 /doubao/* 的 REST 上。 */
+    const DOUBAO_CHANNEL = {
+      id: 'doubao',
+      name: '豆包工作',
+      org: '字节 · 网页版额度',
+      accent: '#2C6BFF',
+      login: 'cookie',
     }
 
     /**
@@ -3391,6 +3498,161 @@ function sameChannelTransport(left, right) {
 
     function channelTransport(rpc) {
       return typeof rpc?.transport === 'function' ? rpc.transport() : rpc
+    }
+
+    /** 豆包在 pack 之外，方法名却要和包里那套一模一样——所以这里做一张翻译表：
+     *  ChannelCard 发什么方法名，我们就打自己那条 REST。transport() 返回固定对象，
+     *  让 sameChannelTransport 认为「传输没换过」，卡片不会每隔 500ms 重挂。
+     */
+    const DOUBAO_TRANSPORT = { name: 'doubao-rest' }
+
+    function createDoubaoRpc() {
+      const call = async (method, payload, timeoutMs) => {
+        const body = payload !== null && typeof payload === 'object' ? payload : {}
+        const accountId = typeof body.accountId === 'string' ? body.accountId : ''
+        const modelId = typeof body.modelId === 'string' ? body.modelId : ''
+        const readStatus = timeoutMs && timeoutMs > 30_000 ? 60_000 : 30_000
+        switch (method) {
+          case 'account.list': {
+            const data = await api('/doubao/status', { timeout: readStatus })
+            return {
+              accounts: (data?.accounts ?? []).map(row => ({
+                id: row.id,
+                nickname: row.accountName || row.name || row.id,
+                enabled: row.enabled !== false,
+                expiresAt: 0,
+                refreshable: true,
+                online: row.online === true,
+              })),
+            }
+          }
+          case 'model.list': {
+            const data = await api('/doubao/status', { timeout: readStatus })
+            const merged = new Map()
+            for (const account of data?.accounts ?? []) {
+              for (const model of account.modelList ?? []) {
+                const previous = merged.get(model.id)
+                const disabled = model.disabled === true
+                if (previous === undefined) merged.set(model.id, { id: model.id, name: model.name || model.id, disabled, dead: false, isFree: String(model.ratio ?? '') === '0' })
+                else if (!disabled) previous.disabled = false
+              }
+            }
+            return { models: [...merged.values()] }
+          }
+          case 'model.refresh':
+            // 宿主还是老版本时这条路由不存在，404 会把整张卡片弹成「操作失败」。
+            // 刷新失败不影响阅读目录，所以这里吞掉错误、直接回缓存里的清单。
+            try {
+              await post('/doubao/refresh', { part: 'models' }, 180_000)
+            } catch { /* 老宿主没有这条路由，忽略 */ }
+            return { refreshed: ['doubao'] }
+          case 'model.setDisabled':
+            return post('/doubao/models/toggle', { ids: [modelId], disabled: body.disabled !== false }, 30_000)
+          case 'model.setAllDisabled':
+            return post('/doubao/models/toggle', { all: true, disabled: body.disabled !== false }, 60_000)
+          case 'model.clearDead':
+            return { ok: true }
+          case 'credits.status': {
+            const data = await api('/doubao/status', { timeout: readStatus })
+            return {
+              accounts: (data?.accounts ?? []).map(row => {
+                const last = row.lastCheckin ?? null
+                const today = last !== null && typeof last.at === 'number'
+                  && new Date(last.at).toDateString() === new Date().toDateString()
+                return {
+                  accountId: row.id,
+                  status: {
+                    todayCheckedIn: today && ['claimed', 'already'].includes(String(last.status ?? '')),
+                    todayCredit: 0,
+                    lastCheckinAt: last?.at ?? 0,
+                    lastStatus: last?.status ?? '',
+                  },
+                }
+              }),
+            }
+          }
+          case 'credits.balances': {
+            // 余额只从缓存里读；读不到（新装、进程刚重启）才去上游拉一次。
+            // 直接每次点都拉三个上游请求太浪费，而且容易被风控。
+            let data = await api('/doubao/status', { timeout: readStatus })
+            const missing = (data?.accounts ?? []).filter(row => row?.quota === null || row?.quota === undefined)
+            if (missing.length === (data?.accounts ?? []).length) {
+              // 全部没余额：整体刷一次（会连带探活、拉模型）
+              data = await api('/doubao/status?refresh=1', { timeout: 90_000 }).catch(() => data)
+            } else if (missing.length > 0) {
+              // 只有个别账号缺：只补这几个的余额，别顺带把其它账号也拉一遍
+              for (const row of missing) {
+                await post('/doubao/refresh', { id: row.id, part: 'quota' }, 60_000).catch(() => { })
+              }
+              data = await api('/doubao/status', { timeout: readStatus }).catch(() => data)
+            }
+            return {
+              accounts: (data?.accounts ?? []).map(row => ({
+                accountId: row.id,
+                nickname: row.accountName || row.name || row.id,
+                // ChannelCard 读的是 row.balance.total / row.balance.packages，
+                // 不是顶层的 total —— 少包一层整张卡就显示「未返回余额数据」。
+                balance: row.quota ? {
+                  total: Number(row.quota.left ?? 0),
+                  packages: (row.quota?.windows ?? []).map(window => ({ name: window.label ?? window.kind, remaining: window.left })),
+                } : null,
+                error: row.quota ? undefined : String(row.quotaError ?? '余额接口没有返回数据'),
+              })),
+            }
+          }
+          case 'credits.claimAll': {
+            const data = await post('/doubao/checkin', {}, 180_000)
+            const rows = Array.isArray(data?.accounts) ? data.accounts : []
+            return {
+              summary: { claimed: Number(data?.claimed ?? 0), totalCredit: 0 },
+              results: rows
+                .filter(row => row.status === 'error')
+                .map(row => ({ accountId: row.id, outcome: { kind: 'failed', message: String(row.message ?? '失败') } })),
+            }
+          }
+          case 'account.create': {
+            // 我们自己的登录流会开一扇干净的浏览器窗口，不需要宿主再开 popup。
+            await post('/doubao/login', {}, 30_000)
+            return { accountId: 'doubao-login', loginUrl: '' }
+          }
+          case 'login.poll': {
+            const state = await api('/doubao/login', { timeout: 15_000 })
+            const status = String(state?.status ?? '')
+            if (status === 'done') return { done: true, success: true, login: String(state?.account?.accountName ?? state?.account?.name ?? '') }
+            if (status === 'error') return { done: true, success: false, error: String(state?.error ?? '登录失败') }
+            if (status === 'canceled') return { done: true, success: false, error: '已取消' }
+            return { done: false }
+          }
+          case 'account.test': {
+            const result = await post('/doubao/degrade', { id: accountId, modelId: '0' }, 180_000)
+            return {
+              ok: result?.ok === true,
+              ms: Number(result?.totalMs ?? 0),
+              latencyMs: Number(result?.firstMs ?? 0),
+              message: result?.ok === true ? String(result?.text ?? '').slice(0, 80) : String(result?.message ?? '失败'),
+              error: result?.ok === true ? undefined : String(result?.message ?? '失败'),
+            }
+          }
+          case 'account.refresh':
+            await post('/doubao/refresh', { id: accountId, part: 'all' }, 120_000)
+            return { ok: true }
+          case 'account.update':
+            return post('/doubao/accounts/update', {
+              id: accountId,
+              enabled: body.patch?.enabled !== false,
+            }, 20_000)
+          case 'account.delete':
+            return post('/doubao/accounts/remove', { id: accountId }, 20_000)
+          case 'degrade.test':
+            return post('/doubao/degrade', { id: accountId, modelId }, 240_000)
+          default:
+            // 宿主版本比这页新时可能多出几个方法；不认识的当作「这事没有」，
+            // 返回空结果而不是抛错——抛错会让整张卡片变成一条红色「操作失败」。
+            return { ok: true, unsupported: String(method) }
+        }
+      }
+      call.transport = () => DOUBAO_TRANSPORT
+      return call
     }
 
     function useChannelRpc(ctx) {
@@ -3535,7 +3797,7 @@ function sameChannelTransport(left, right) {
     }
 
     function ChannelCard(props) {
-      const { channel, status, rpc, t, onError, onChanged } = props
+      const { channel, status, rpc, t, onError, onChanged, onRemove } = props
       // 账号区默认展开。折叠着的时候，每行账号的「测试 / 刷新 / 停用 / 删除」全被
       // 藏在里面，用起来就像这个渠道根本没有测试按钮——用户就是这么报的。
       const [open, setOpen] = useState('accounts')
@@ -3897,7 +4159,17 @@ function sameChannelTransport(left, right) {
             h('span', null, channel.org)),
           h('span', { className: 'ofm_chanstate' },
             h('span', { className: `ofm_dot ${connected ? 'ok' : closedByAccounts ? 'err' : ''}` }),
-            stateText)),
+            stateText),
+          // 收起来 ≠ 移除账号：点它只是把这张卡从这一页挪走，底部「＋」能加回来。
+          typeof onRemove === 'function'
+            ? h('button', {
+              type: 'button',
+              className: 'ofm_chanclose',
+              title: t('chan.hide'),
+              'aria-label': t('chan.hide'),
+              onClick: () => onRemove(channel),
+            }, '×')
+            : null),
         h('div', { className: 'ofm_chanmeta' },
           h('span', null, `${t('chan.meta.accounts')} `, h('b', null, `${enabledCount}/${accountsCount}`)),
           h('span', null, `${t('chan.meta.models')} `, h('b', null, modelsLabel)),
@@ -4186,6 +4458,110 @@ function sameChannelTransport(left, right) {
     }
 
     /**
+     * 免费池（`free:auto`）的卡片。
+     *
+     * 池子只做一件事：把本插件自己服务的免费车道排成一条队，按实测成功率与
+     * 首字延迟打分，刚失败过的车道进冷却、排到队尾。所以这一屏必须回答三个
+     * 问题——下一轮会先用谁、谁在冷却、为什么。排序不在前端算：后端 `status`
+     * 读的就是适配器下一次真会拨的那个目录，面板和实际行为不许有两套排序。
+     *
+     * 冷却在前端只做倒计时显示，不自己判断过期：过期由后端在下次排序时清掉，
+     * 前端早一秒晚一秒无所谓，自己算反而会出现「面板说好了、实际还在罚站」。
+     */
+    function PoolCard(props) {
+      const { t } = props
+      const [state, setState] = useState(undefined)
+      const [busy, setBusy] = useState(false)
+      const [failure, setFailure] = useState('')
+      const [now, setNow] = useState(() => Date.now())
+      const load = useCallback(async () => {
+        try {
+          const value = await api('/free-pool', { timeout: 8000 })
+          setState(value ?? {})
+          setNow(Date.now())
+        } catch (error) { setFailure(String(error?.message ?? error).slice(0, 160)) }
+      }, [])
+      useEffect(() => { void load() }, [load])
+      // 冷却是有期限的，一屏不刷新的倒计时会永远停在「还有 9 分钟」。
+      useEffect(() => {
+        const timer = setInterval(() => { setNow(Date.now()); void load() }, 15000)
+        return () => { clearInterval(timer) }
+      }, [load])
+      const info = state ?? {}
+      const rows = Array.isArray(info.candidates) ? info.candidates : []
+      const enabled = info.enabled !== false
+      const benchCount = rows.filter(row => Number(row.benchedUntil ?? 0) > now).length
+      const toggle = useCallback(async () => {
+        setBusy(true)
+        setFailure('')
+        try {
+          await post('/free-pool', { enabled: !enabled })
+          await load()
+        } catch (error) {
+          setFailure(String(error?.message ?? error).slice(0, 160))
+        } finally { setBusy(false) }
+      }, [enabled, load])
+      const clear = useCallback(async () => {
+        setBusy(true)
+        setFailure('')
+        try {
+          await post('/free-pool/reset', {})
+          await load()
+          showToast({ title: t('fpool.cleared') })
+        } catch (error) {
+          setFailure(String(error?.message ?? error).slice(0, 160))
+        } finally { setBusy(false) }
+      }, [load, t])
+      const remain = until => {
+        const left = Math.max(0, Math.round((Number(until ?? 0) - now) / 1000))
+        if (left <= 0) return '0:00'
+        const mm = Math.floor(left / 60)
+        const ss = String(left % 60).padStart(2, '0')
+        return `${mm}:${ss}`
+      }
+
+      return h('div', { className: 'ofm_chan ofm_glass' },
+        h('div', { className: 'ofm_chanhead' },
+          h('span', { className: 'ofm_chanid' },
+            h('b', null, t('fpool.title')),
+            h('span', null, t('fpool.sub'))),
+          h('span', { className: 'ofm_chanstate' },
+            h('span', { className: `ofm_dot ${enabled ? (benchCount > 0 ? 'warn' : 'ok') : ''}` }),
+            enabled ? t('fpool.on') : t('fpool.off'))),
+        failure === '' ? null : h('p', { className: 'ofm_note' }, failure),
+        h('div', { className: 'ofm_chanmeta' },
+          h('span', null, `${t('fpool.candidates')} `, h('b', null, state === undefined ? '…' : String(rows.length))),
+          h('span', null, `${t('fpool.benched')} `, h('b', null, String(benchCount)))),
+        rows.length === 0
+          ? h('p', { className: 'ofm_note' }, state === undefined ? '…' : t('fpool.empty'))
+          : h('div', { className: 'ofm_chanmeta' },
+            h('span', { className: 'ofm_note', style: { overflowWrap: 'anywhere' } },
+              rows.slice(0, 8).map(row => {
+                const benched = Number(row.benchedUntil ?? 0) > now
+                const label = `${row.rank ?? '·'} ${row.name ?? row.id ?? ''}`
+                return benched ? `${label}（${t('fpool.cooling')} ${remain(row.benchedUntil)}）` : label
+              }).join('　'))),
+        h('div', { className: 'ofm_chanacts' },
+          h(Button, { disabled: busy, onClick: () => void toggle() },
+            enabled ? t('fpool.disable') : t('fpool.enable')),
+          h(Button, { disabled: busy || benchCount === 0, onClick: () => void clear() },
+            t('fpool.clear'))),
+        h('p', { className: 'ofm_note' }, t('fpool.hint')))
+    }
+
+    /**
+     * 豆包工作（www.doubao.com + 桌面端）的卡片。
+     *
+     * 和其它渠道不一样，这一条不走 pack.js 的账号池：豆包不认「哪个进程」，
+     * 只认 cookie，所以一个账号就是 `~/.dsh/get-it-for-free/doubao.json` 里的
+     * 一条记录，粘几次就有几份额度，请求在它们之间轮着走。
+     *
+     * 签到本身很短（launch → 活动详情 → landing/checkin → 回查），但三种结果
+     * 必须分开显示：真的签上了、今天早就签过、这个账号今天压根没有签到活动。
+     * 把后面两种说成失败，用户会一直重试一件本来就没有的事。
+     */
+    
+    /**
      * 本机 API 网关（OpenAI 兼容）的卡片。
      *
      * 后端一直有这个网关（`vendor/channel-pack/src/openai-gateway/`）：第一次启用
@@ -4198,6 +4574,283 @@ function sameChannelTransport(left, right) {
      * `/api/channel-pack`），不新增宿主路由：宿主只要多一条直调 pack 内部函数的
      * 路径，就得导出那个处理器，而它不是模块顶层函数（导出会让整包加载失败）。
      */
+    // 签名中转：CodeArts 的签名把请求体也盖住了，bili 想压缩上下文就得自己重签，
+    // 重签就得知道是哪一号账号的 AK/SK。这个卡只做一件事 —— 把账号的
+    // credentialRef 递进 bili 扫的那个文件；密钥本体始终留在宿主凭据库里。
+    function ResignCard(props) {
+      const { t } = props
+      const [state, setState] = useState(undefined)
+      const [bili, setBili] = useState(undefined)
+      const [busy, setBusy] = useState(false)
+      const load = useCallback(async () => {
+        try { setState(await api('/resign/status', { timeout: 8000 })) }
+        catch (error) { setState({ error: String(error?.message ?? error) }) }
+        try { setBili(await api('/bili/status', { timeout: 8000 })) }
+        catch (error) { setBili({ error: String(error?.message ?? error) }) }
+      }, [])
+      useEffect(() => { void load() }, [load])
+      const sync = useCallback(async () => {
+        setBusy(true)
+        try {
+          const value = await post('/resign/sync', {}, 20_000)
+          setState(current => ({ ...(current ?? {}), ...(value !== null && typeof value === 'object' ? value : {}) }))
+          showToast({ title: t('rs.done'), body: String(value?.accounts ?? 0) })
+        } catch (error) {
+          showToast({ title: t('rs.failed').replace('{reason}', String(error?.message ?? error).slice(0, 160)), tone: 'warn' })
+        } finally {
+          setBusy(false)
+          await load()
+        }
+      }, [load, t])
+      // 华为云那条链路的签名盖住请求体，bili 只能「重签后压缩」或「拒转发」。
+      // 它的重签实测过不了上游，所以这里给一个开关，把那条链路设成原样放行。
+      const togglePassthrough = useCallback(async () => {
+        const wanted = bili?.passthrough !== true
+        setBusy(true)
+        try {
+          await post('/bili/passthrough', { enabled: wanted }, 20_000)
+        } catch (error) {
+          showToast({ title: t('chan.error').replace('{reason}', String(error?.message ?? error).slice(0, 160)), tone: 'warn' })
+        } finally {
+          setBusy(false)
+          await load()
+        }
+      }, [bili, load, t])
+
+      const info = state ?? {}
+      const failure = typeof info.error === 'string' ? info.error : ''
+      const candidates = Array.isArray(info.candidates) ? info.candidates : []
+      const last = info.last !== null && typeof info.last === 'object' ? info.last : null
+      const ready = candidates.length > 0
+      const biliInfo = bili !== null && typeof bili === 'object' ? bili : {}
+      const biliMode = typeof biliInfo.mode === 'string' ? biliInfo.mode : 'unknown'
+      const biliText = t(`rs.bili.${biliMode}`) === `rs.bili.${biliMode}` ? String(biliMode) : t(`rs.bili.${biliMode}`)
+
+      return h('div', { className: 'ofm_chan ofm_glass', 'data-state': ready ? 'on' : 'off' },
+        h('div', { className: 'ofm_chanhead' },
+          h('span', { className: 'ofm_chanid' },
+            h('b', null, t('rs.title')),
+            h('span', null, t('rs.sub'))),
+          h('span', { className: 'ofm_chanstate' },
+            h('span', { className: `ofm_dot ${ready ? 'ok' : ''}` }),
+            state === undefined ? '…' : (ready ? `${candidates.length} ${t('rs.accounts')}` : t('rs.none')))),
+        failure !== '' ? h('p', { className: 'ofm_note' }, failure) : null,
+        h('div', { className: 'ofm_chanmeta' },
+          h('span', null, last !== null && typeof last.at === 'number' ? `${t('rs.last')} ${new Date(last.at).toLocaleTimeString()}` : t('rs.never')),
+          h('button', { type: 'button', className: 'ofm_btn', disabled: busy, onClick: () => void sync() }, busy ? t('rs.syncing') : t('rs.sync'))),
+        h('p', { className: 'ofm_note' }, t('rs.hint')),
+        h('div', { className: 'ofm_chanmeta' },
+          h('span', null, `${t('rs.bili.label')} ${bili === undefined ? '…' : biliText}`),
+          h('button', {
+            type: 'button',
+            className: 'ofm_btn ghost',
+            disabled: busy || biliInfo.present === false,
+            onClick: () => void togglePassthrough(),
+          }, biliInfo.passthrough === true ? t('rs.bili.off') : t('rs.bili.on'))),
+        h('p', { className: 'ofm_note' }, t('rs.bili.hint')))
+    }
+
+    // WorkBuddy / CodeBuddy：桌面端每天往 auth 目录写一份登录态，这里只是把它
+    // 读出来写进渠道包账号池。没有登录流程，所以卡上只有一个按钮。
+    function BuddyCard() {
+      const [state, setState] = useState(undefined)
+      const [busy, setBusy] = useState(false)
+      const load = useCallback(async () => {
+        try { setState(await api('/buddy/status', { timeout: 10_000 })) }
+        catch (error) { setState({ error: String(error?.message ?? error) }) }
+      }, [])
+      useEffect(() => { void load() }, [load])
+      const doImport = useCallback(async () => {
+        setBusy(true)
+        try {
+          const value = await post('/buddy/import', {}, 60_000)
+          const imported = Array.isArray(value?.imported) ? value.imported.length : 0
+          const failed = Array.isArray(value?.failed) ? value.failed.length : 0
+          showToast({ title: `已导入 ${imported} 个账号${failed > 0 ? `，失败 ${failed}` : ''}` })
+        } catch (error) {
+          showToast({ title: `导入失败：${String(error?.message ?? error).slice(0, 160)}`, tone: 'warn' })
+        } finally {
+          setBusy(false)
+          await load()
+        }
+      }, [load])
+      const info = state ?? {}
+      const found = Array.isArray(info.discovered) ? info.discovered : []
+      const packAccounts = Number(info.pack?.accounts ?? 0)
+      const ready = found.length > 0
+      return h('div', { className: 'ofm_chan ofm_glass', 'data-state': ready ? 'on' : 'off' },
+        h('div', { className: 'ofm_chanhead' },
+          h('span', { className: 'ofm_chanid' },
+            h('b', null, 'WorkBuddy 本机登录'),
+            h('span', null, '读桌面端写好的登录态，不登录、不弹窗')),
+          h('span', { className: 'ofm_chanstate' },
+            h('span', { className: `ofm_dot ${ready ? 'ok' : ''}` }),
+            state === undefined ? '…' : (ready ? `${found.length} 个账号` : '未发现'))),
+        typeof info.error === 'string' && info.error !== '' ? h('p', { className: 'ofm_note' }, info.error) : null,
+        h('div', { className: 'ofm_chanmeta' },
+          h('span', null, `渠道包内 ${packAccounts} 个`),
+          h('button', {
+            type: 'button',
+            className: 'ofm_btn',
+            disabled: busy || !ready,
+            onClick: () => void doImport(),
+          }, busy ? '导入中…' : '导入模型选择器')),
+        h('p', { className: 'ofm_note' }, found.length === 0
+          ? '没找到 auth 文件：先在这台机器上登录一次 WorkBuddy / CodeBuddy 桌面端。'
+          : found.slice(0, 3).map(row => row.nickname || row.id).join(' · ')))
+    }
+
+    // Qoder：桌面端凭据在钥匙串里，扫不出来，只能粘 PAT。加之前先验一遍上游。
+    function QoderCard() {
+      const [state, setState] = useState(undefined)
+      const [pat, setPat] = useState('')
+      const [region, setRegion] = useState('global')
+      const [busy, setBusy] = useState('')
+      const load = useCallback(async () => {
+        try { setState(await api('/qoder/status', { timeout: 10_000 })) }
+        catch (error) { setState({ error: String(error?.message ?? error) }) }
+      }, [])
+      useEffect(() => { void load() }, [load])
+      const add = useCallback(async () => {
+        const token = pat.trim()
+        if (token === '') return
+        setBusy('add')
+        try {
+          const value = await post('/qoder/accounts', { pat: token, region }, 120_000)
+          setPat('')
+          showToast({ title: `已加入 Qoder ${region === 'cn' ? '中国版' : '国际版'}（${value?.account?.id ?? 'ok'}）` })
+        } catch (error) {
+          showToast({ title: `验证没通过：${String(error?.message ?? error).slice(0, 160)}`, tone: 'warn' })
+        } finally {
+          setBusy('')
+          await load()
+        }
+      }, [pat, region, load])
+      const remove = useCallback(async id => {
+        setBusy(id)
+        try { await post('/qoder/accounts/remove', { id, region }, 30_000) }
+        catch (error) { showToast({ title: String(error?.message ?? error).slice(0, 160), tone: 'warn' }) }
+        finally { setBusy(''); await load() }
+      }, [region, load])
+      const info = state ?? {}
+      const rows = Array.isArray(info.accounts) ? info.accounts : []
+      const ready = rows.length > 0
+      return h('div', { className: 'ofm_chan ofm_glass', 'data-state': ready ? 'on' : 'off' },
+        h('div', { className: 'ofm_chanhead' },
+          h('span', { className: 'ofm_chanid' },
+            h('b', null, 'Qoder'),
+            h('span', null, '粘 PAT，加完直接进模型选择器')),
+          h('span', { className: 'ofm_chanstate' },
+            h('span', { className: `ofm_dot ${ready ? 'ok' : ''}` }),
+            state === undefined ? '…' : (ready ? `${rows.length} 个账号` : '未接入'))),
+        typeof info.error === 'string' && info.error !== '' ? h('p', { className: 'ofm_note' }, info.error) : null,
+        h('div', { className: 'ofm_chanmeta' },
+          h('select', {
+            className: 'ofm_input',
+            value: region,
+            disabled: busy !== '',
+            onChange: event => setRegion(event.target.value),
+          }, h('option', { value: 'global' }, '国际版'), h('option', { value: 'cn' }, '中国版')),
+          h('input', {
+            className: 'ofm_input',
+            type: 'password',
+            placeholder: 'pt-…',
+            value: pat,
+            disabled: busy !== '',
+            onChange: event => setPat(event.target.value),
+          }),
+          h('button', { type: 'button', className: 'ofm_btn', disabled: busy !== '' || pat.trim() === '', onClick: () => void add() },
+            busy === 'add' ? '验证中…' : '添加')),
+        rows.length === 0 ? null : h('div', { className: 'ofm_chanmeta' },
+          rows.slice(0, 6).map(row => h('span', { key: row.id, className: 'ofm_note' },
+            `${row.label || row.id}（${row.region === 'cn' ? '中国版' : '国际版'}）`,
+            h('button', { type: 'button', className: 'ofm_btn ghost', disabled: busy !== '', onClick: () => void remove(row.id) }, '删')))),
+        h('p', { className: 'ofm_note' }, 'PAT 存在插件自己的 vault 里（0600）；上游说无效的令牌不会落盘。'))
+    }
+
+    // 华为云 CodeArts：内置 OAuth2（PKCE + DPoP），点一下开浏览器，回来自己落库。
+    function CodeArtsCard() {
+      const [state, setState] = useState(undefined)
+      const [busy, setBusy] = useState('')
+      const load = useCallback(async () => {
+        try { setState(await api('/codearts/status', { timeout: 10_000 })) }
+        catch (error) { setState({ error: String(error?.message ?? error) }) }
+      }, [])
+      useEffect(() => { void load() }, [load])
+      // 登录是「点开浏览器 → 用户授权 → 环回回调落库」，所以这里轮询状态直到 done。
+      const login = useCallback(async () => {
+        setBusy('login')
+        try {
+          const started = await post('/codearts/login', {}, 20_000)
+          if (typeof started?.loginUrl === 'string' && started.loginUrl !== '') {
+            try { window.open(started.loginUrl, '_blank', 'noopener') } catch { /* 面板里也给地址 */ }
+          }
+          for (let i = 0; i < 60; i++) {
+            await new Promise(resolve => setTimeout(resolve, 2_000))
+            const now = await api('/codearts/status', { timeout: 10_000 }).catch(() => undefined)
+            if (now !== undefined) setState(now)
+            if (now?.state === 'done') {
+              const synced = await post('/codearts/sync', {}, 120_000).catch(error => ({ error: String(error?.message ?? error) }))
+              const count = Array.isArray(synced?.imported) ? synced.imported.length : 0
+              showToast({ title: `登录完成，已同步 ${count} 个账号` })
+              break
+            }
+            if (now?.state === 'error') {
+              showToast({ title: `登录失败：${String(now.error ?? '未知原因').slice(0, 160)}`, tone: 'warn' })
+              break
+            }
+          }
+        } catch (error) {
+          showToast({ title: `登录没起来：${String(error?.message ?? error).slice(0, 160)}`, tone: 'warn' })
+        } finally {
+          setBusy('')
+          await load()
+        }
+      }, [load])
+      const remove = useCallback(async id => {
+        setBusy(id)
+        try { await post('/codearts/accounts/remove', { id }, 30_000) }
+        catch (error) { showToast({ title: String(error?.message ?? error).slice(0, 160), tone: 'warn' }) }
+        finally { setBusy(''); await load() }
+      }, [load])
+      const info = state ?? {}
+      const rows = Array.isArray(info.accounts) ? info.accounts : []
+      const ready = rows.length > 0
+      const phase = String(info.state ?? '')
+      return h('div', { className: 'ofm_chan ofm_glass', 'data-state': ready ? 'on' : 'off' },
+        h('div', { className: 'ofm_chanhead' },
+          h('span', { className: 'ofm_chanid' },
+            h('b', null, '华为云 CodeArts'),
+            h('span', null, 'OAuth2 + DPoP，登录后令牌自动回写')),
+          h('span', { className: 'ofm_chanstate' },
+            h('span', { className: `ofm_dot ${ready ? 'ok' : ''}` }),
+            state === undefined ? '…' : (ready ? `${rows.length} 个账号` : (phase === 'waiting' ? '等待授权' : '未登录')))),
+        typeof info.error === 'string' && info.error !== '' ? h('p', { className: 'ofm_note' }, info.error) : null,
+        h('div', { className: 'ofm_chanmeta' },
+          h('button', { type: 'button', className: 'ofm_btn', disabled: busy !== '', onClick: () => void login() },
+            busy === 'login' ? '等待授权…' : '登录华为云'),
+          phase === 'waiting' && typeof info.loginUrl === 'string' && info.loginUrl !== ''
+            ? h('button', {
+              type: 'button',
+              className: 'ofm_btn ghost',
+              onClick: () => { try { window.open(info.loginUrl, '_blank', 'noopener') } catch { /* ignore */ } },
+            }, '再开一次授权页')
+            : null,
+          phase === 'waiting'
+            ? h('button', {
+              type: 'button',
+              className: 'ofm_btn ghost',
+              disabled: busy !== '',
+              onClick: async () => { await post('/codearts/login/cancel', {}, 10_000).catch(() => {}); await load() },
+            }, '取消')
+            : null),
+        rows.length === 0 ? null : h('div', { className: 'ofm_chanmeta' },
+          rows.slice(0, 6).map(row => h('span', { key: row.id, className: 'ofm_note' },
+            `${row.label || row.userName || row.id}${row.stale === true ? '（需重新登录）' : ''}`,
+            h('button', { type: 'button', className: 'ofm_btn ghost', disabled: busy !== '', onClick: () => void remove(row.id) }, '删')))),
+        h('p', { className: 'ofm_note' }, '令牌一小时一换，插件每 15 分钟回写一次；渠道包只拿 ak/sk/security_token 签名。'))
+    }
+
     function GatewayCard(props) {
       const { t } = props
       // 走 pack 自己注册的 `/api/channel-pack`（客户端的 rpc() 三级回落里最后那一级），
@@ -4286,7 +4939,7 @@ function sameChannelTransport(left, right) {
           h(Button, {
             disabled: busy !== '' || blocked,
             onClick: () => { setTest(undefined); void act('gateway.regenerateKey').then(value => { if (value !== undefined) showToast({ title: t('gw.regenerated') }) }) },
-          }, busy === 'gateway.regenerateKey' ? '…' : t('gw.regenerate')),
+          }, busy === 'gateway.regenerateKey' ? '…' : (keyValue === '' ? '生成 API Key' : t('gw.regenerate'))),
           h(Button, {
             disabled: busy !== '' || !running,
             onClick: async () => {
@@ -4308,7 +4961,7 @@ function sameChannelTransport(left, right) {
     }
 
     function MiMoCard(props) {
-      const { t } = props
+      const { t, onRemove } = props
       const [state, setState] = useState(undefined)
       const [busy, setBusy] = useState(false)
       const load = useCallback(async force => {
@@ -4335,7 +4988,16 @@ function sameChannelTransport(left, right) {
             h('span', null, '小米 · 桌面端额度')),
           h('span', { className: 'ofm_chanstate' },
             h('span', { className: `ofm_dot ${signedIn ? 'ok' : ''}` }),
-            state === undefined ? '…' : signedIn ? t('chan.state.on') : t('chan.state.off'))),
+            state === undefined ? '…' : signedIn ? t('chan.state.on') : t('chan.state.off')),
+          typeof onRemove === 'function'
+            ? h('button', {
+              type: 'button',
+              className: 'ofm_chanclose',
+              title: t('chan.hide'),
+              'aria-label': t('chan.hide'),
+              onClick: () => onRemove({ id: 'mimo', name: 'MiMo' }),
+            }, '×')
+            : null),
         h('div', { className: 'ofm_chanmeta' },
           h('span', null, '额度 ', h('b', null, state === undefined ? '…' : percent === null ? '—' : `${percent}%`)),
           reset === '' ? null : h('span', null, '重置 ', h('b', null, reset)),
@@ -4363,7 +5025,7 @@ function sameChannelTransport(left, right) {
      * and the route never appears in the model picker.
      */
     function CliLaneCard(props) {
-      const { t } = props
+      const { t, onRemove } = props
       const [state, setState] = useState(undefined)
       const [busy, setBusy] = useState(false)
       const [check, setCheck] = useState(undefined)
@@ -4417,7 +5079,16 @@ function sameChannelTransport(left, right) {
             h('span', null, '腾讯 · 官方客户端通道')),
           h('span', { className: 'ofm_chanstate' },
             h('span', { className: `ofm_dot ${installed ? 'ok' : ''}` }),
-            state === undefined ? '…' : installed ? '已找到 CLI' : '未安装')),
+            state === undefined ? '…' : installed ? '已找到 CLI' : '未安装'),
+          typeof onRemove === 'function'
+            ? h('button', {
+              type: 'button',
+              className: 'ofm_chanclose',
+              title: t('chan.hide'),
+              'aria-label': t('chan.hide'),
+              onClick: () => onRemove({ id: 'cli-lane', name: 'CodeBuddy CLI' }),
+            }, '×')
+            : null),
         h('div', { className: 'ofm_chanmeta' },
           h('span', null, `版本 `, h('b', null, state === undefined ? '…' : version === '' ? '—' : version)),
           h('span', null, `账号 `, h('b', null, state === undefined ? '…' : String(nicknames.length === 0 ? 1 : nicknames.length))),
@@ -4501,6 +5172,14 @@ function sameChannelTransport(left, right) {
             }, '无视风险继续使用。'))))
     }
 
+    /** 被收起的渠道卡片名单：只认小写渠道 id，去重、限量。读到坏数据当「都没收起」，
+     *  免得一条脏数据把整页卡片全藏起来。 */
+    function normalizeHiddenChannels(value) {
+      if (!Array.isArray(value)) return []
+      const ids = value.filter(id => typeof id === 'string' && /^[a-z][a-z0-9_-]{1,39}$/.test(id))
+      return [...new Set(ids)].slice(0, 64)
+    }
+
     function ChannelsPage(props) {
       const { t, ctx, summary } = props
       const { available, rpc } = useChannelRpc(ctx)
@@ -4516,7 +5195,61 @@ function sameChannelTransport(left, right) {
         try { const value = await rpc('usage.autoCheckin', { enabled: auto?.enabled !== true }, 60_000); setAuto(value?.autoCheckin ?? null) } catch { /* the status refresh tells */ }
       }
       const [statuses, setStatuses] = useState(undefined)
+      // 豆包不经过 pack，所以它那一格的计数由自己这条 REST 单独喂给 ChannelCard。
+      const doubaoRpc = useMemo(() => createDoubaoRpc(), [])
+      const [doubaoStatus, setDoubaoStatus] = useState(undefined)
+      const loadDoubao = useCallback(async () => {
+        try {
+          const data = await api('/doubao/status', { timeout: 30_000 })
+          const accounts = Array.isArray(data?.accounts) ? data.accounts : []
+          const models = new Map()
+          let disabled = 0
+          for (const account of accounts) {
+            for (const model of account.modelList ?? []) {
+              models.set(model.id, true)
+              if (model.disabled === true) disabled += 1
+            }
+          }
+          setDoubaoStatus({
+            accounts: { total: accounts.length, enabled: accounts.filter(row => row.enabled !== false).length },
+            models: { total: models.size, disabled },
+          })
+        } catch {
+          setDoubaoStatus({ accounts: { total: 0, enabled: 0 }, models: { total: 0, disabled: 0 } })
+        }
+      }, [])
+      useEffect(() => { void loadDoubao() }, [loadDoubao])
       const [error, setError] = useState('')
+      // 卡片右上角的「×」把这张卡从这一页收起来，底部的「＋」加回来。
+      // 名单存在插件设置里（换台机器、重开 App 都是同样的排列）；账号、令牌、
+      // 模型开关一个都不动 —— 收起一张卡不等于退出登录。
+      const [hiddenChannels, setHiddenChannels] = useState(undefined)
+      const [adding, setAdding] = useState(false)
+      useEffect(() => {
+        let alive = true
+        api('/summary')
+          .then(data => { if (alive) setHiddenChannels(normalizeHiddenChannels(data?.settings?.hiddenChannels)) })
+          .catch(() => { if (alive) setHiddenChannels([]) })
+        return () => { alive = false }
+      }, [])
+      const hidden = hiddenChannels ?? []
+      const visibleProviders = CHANNEL_PROVIDERS.filter(row => !hidden.includes(row.id))
+      // 「＋ 添加渠道」列的是所有可收起的卡：两张固定卡 + 每个渠道。
+      const hideableCards = [...FIXED_CARDS, ...CHANNEL_PROVIDERS]
+      const hiddenProviders = hideableCards.filter(row => hidden.includes(row.id))
+      const saveHidden = useCallback(async (next) => {
+        const list = normalizeHiddenChannels(next)
+        const before = hiddenChannels ?? []
+        setHiddenChannels(list)
+        try {
+          // 整张名单一起发：两个窗口同时改，后到的那个不会把别人的卡加回来。
+          await post('/settings', { hiddenChannels: list }, 8_000)
+        } catch (err) {
+          setHiddenChannels(before)
+          showToast({ title: t('chan.hide.failed'), body: String(err?.message ?? err).slice(0, 120), tone: 'warn' })
+        }
+      }, [hiddenChannels, t])
+      const onRemove = useCallback(channel => { void saveHidden([...(hiddenChannels ?? []), channel.id]) }, [saveHidden, hiddenChannels])
       const pack = summary?.channels ?? { state: 'pending', error: '' }
       // The pack is what answers this page's RPC, so *the RPC answering* is the
       // readiness signal — the summary's `channels` bit can be a step behind:
@@ -4586,15 +5319,18 @@ function sameChannelTransport(left, right) {
 
       const onChanged = useCallback(() => {
         void loadStatus()
+        void loadDoubao()
         try { window.dispatchEvent(new CustomEvent('ofm:channels')) } catch { /* no window */ }
-      }, [loadStatus])
+      }, [loadStatus, loadDoubao])
 
       const onError = useCallback((channel, err) => {
         const reason = String(err?.message ?? err)
         showToast({ title: t('chan.error').replace('{reason}', reason).slice(0, 120), body: channel.name, tone: 'warn' })
       }, [t])
 
-      const connected = statuses === undefined ? 0 : CHANNEL_PROVIDERS.filter(row => (statuses[row.id]?.accounts?.enabled ?? 0) > 0).length
+      // 计数只数页面上还在的卡：收起的那几张不参与分母，否则会出现「4/11」这种
+      // 永远补不齐的数字。两张固定卡（MiMo、CodeBuddy CLI）也只在没被收起时算。
+      const connected = statuses === undefined ? 0 : visibleProviders.filter(row => (statuses[row.id]?.accounts?.enabled ?? 0) > 0).length
       const failed = !ready && pack.state === 'failed'
 
       // 风险告知：没接受过就先把整页挡住。接受后写进设置，之后不再打扰。
@@ -4621,8 +5357,8 @@ function sameChannelTransport(left, right) {
               h('p', { className: 'ofm_pagesub' }, t('chan.sub'))),
             h('div', { className: 'ofm_pills' },
               h(Pill, { strong: true, tone: ready ? 'ok' : failed ? 'err' : 'warn' },
-                ready ? `${connected}/${CHANNEL_PROVIDERS.length} ${t('chan.state.on')}` : t('chan.state.off')),
-              h(Pill, null, `${t('chan.meta.accounts')} ${statuses === undefined ? '—' : CHANNEL_PROVIDERS.reduce((sum, row) => sum + (statuses[row.id]?.accounts?.enabled ?? 0), 0)}`))),
+                ready ? `${connected}/${visibleProviders.length} ${t('chan.state.on')}` : t('chan.state.off')),
+              h(Pill, null, `${t('chan.meta.accounts')} ${statuses === undefined ? '—' : visibleProviders.reduce((sum, row) => sum + (statuses[row.id]?.accounts?.enabled ?? 0), 0)}`))),
           auto == null ? null : h('div', { className: 'ofm_row' },
             h(Switch, { checked: auto.enabled === true, label: t('chan.auto.title'), onChange: () => void toggleAuto() }),
             h(Pill, { tone: auto.running === true ? 'warn' : auto.ranToday === true ? 'ok' : '' },
@@ -4633,7 +5369,7 @@ function sameChannelTransport(left, right) {
         !available ? h('div', { className: 'ofm_callout' }, h('div', null, t('chan.rpc.unavailable'))) : null,
         !ready && available ? h('div', { className: 'ofm_chanwrap' },
           [0, 1, 2].map(index => h('div', { className: 'ofm_skel', key: index, style: { minHeight: 168 } }))) : null,
-        ready ? h('div', { className: 'ofm_chanwrap' }, [h(MiMoCard, { key: 'mimo', t }), h(CliLaneCard, { key: 'cli-lane', t }), h(GatewayCard, { key: 'gateway', t, rpc: available ? rpc : null }), h(ModelSyncCard, { key: 'model-sync', t }), ...CHANNEL_PROVIDERS.map(channel => h(ChannelCard, {
+        ready ? h('div', { className: 'ofm_chanwrap' }, [hidden.includes('mimo') ? null : h(MiMoCard, { key: 'mimo', t, onRemove }), hidden.includes('cli-lane') ? null : h(CliLaneCard, { key: 'cli-lane', t, onRemove }), h(GatewayCard, { key: 'gateway', t, rpc: available ? rpc : null }), h(ResignCard, { key: 'resign', t }), h(BuddyCard, { key: 'buddy' }), h(QoderCard, { key: 'qoder' }), h(CodeArtsCard, { key: 'codearts' }), h(ModelSyncCard, { key: 'model-sync', t }), h(PoolCard, { key: 'free-pool', t }), hidden.includes('doubao') ? null : h(ChannelCard, { key: 'doubao', channel: DOUBAO_CHANNEL, status: doubaoStatus, rpc: doubaoRpc, t, onError, onChanged, onRemove }), ...visibleProviders.map(channel => h(ChannelCard, {
           key: channel.id,
           channel,
           status: statuses?.[channel.id],
@@ -4641,7 +5377,32 @@ function sameChannelTransport(left, right) {
           t,
           onError,
           onChanged,
+          onRemove,
         }))]) : null,
+        // 页面最底下的「＋」：把收起来的卡加回来。名单就在这一行，一眼看到自己
+        // 藏了什么，不用去设置里翻。
+        ready ? h('div', { className: 'ofm_addzone' },
+          h('button', {
+            type: 'button',
+            className: 'ofm_btn ofm_addbtn',
+            'aria-expanded': adding ? 'true' : 'false',
+            disabled: hiddenProviders.length === 0,
+            title: hiddenProviders.length === 0 ? t('chan.add.none') : t('chan.add.sub'),
+            onClick: () => setAdding(value => !value),
+          }, hiddenProviders.length === 0 ? t('chan.add.none') : `＋ ${t('chan.add.title')}${hiddenProviders.length > 0 ? ` (${hiddenProviders.length})` : ''}`),
+          adding && hiddenProviders.length > 0 ? h('div', { className: 'ofm_addlist' },
+            hiddenProviders.map(channel => h('button', {
+              key: channel.id,
+              type: 'button',
+              className: 'ofm_addchip',
+              style: { '--chan-accent': channel.accent },
+              title: channel.name,
+              onClick: () => {
+                const rest = (hiddenChannels ?? []).filter(id => id !== channel.id)
+                void saveHidden(rest)
+                if (hiddenProviders.length === 1) setAdding(false)
+              },
+            }, h('b', null, channel.name), h('span', null, channel.org)))) : null) : null,
         error !== '' && !failed ? h('p', { className: 'ofm_note' }, `${t('chan.error').replace('{reason}', error)}`) : null)
     }
 

@@ -42,10 +42,6 @@ function blocksOf(content) {
   return []
 }
 
-function hasBlocks(blocks, type) {
-  return Array.isArray(blocks) && blocks.some(block => block?.type === type)
-}
-
 /** A user image block's data URL, or undefined when it cannot travel. */
 function imageDataUrl(block, resolveImage) {
   if (block?.offloaded === true) return undefined
@@ -419,11 +415,6 @@ export function toToolDefs(tools, style) {
     else list.push({ type: 'function', function: { name: name.slice(0, MAX_TOOL_NAME_LEN), description, parameters } })
   }
   return list
-}
-
-/** Does this content list need an image-capable model? */
-export function needsVision(messages) {
-  return (messages ?? []).some(message => hasBlocks(message.content, 'image') && message.content.some(block => block?.type === 'image' && block.offloaded !== true))
 }
 
 export { baseModelId, restoreToolName }

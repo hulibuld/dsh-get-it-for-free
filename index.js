@@ -51,6 +51,7 @@ import { rejectionFor, isLoopbackHost, connectionAdmissionView } from './src/tru
 import { resolveAttributionUserAgent } from './adapter/kernel.js'
 import { fetchProviderModels, isAggregateEntry, testProvider } from './src/aggregate.js'
 import { buildComboCatalog, isComboEntry, normalizeCombos } from './src/combos.js'
+import { clearBench, POOL_ID, POOL_NAME } from './src/freepool.js'
 import { getProvider, listProviders } from './src/providers/index.js'
 import { saverConfig } from './src/token-saver/index.js'
 import { CAVEMAN_LEVELS, PONYTAIL_LEVELS } from './src/token-saver/prompts.js'
@@ -59,6 +60,10 @@ import { createModelRuntime, createRuntimeStores } from './src/core/runtime.js'
 import { createMiMo, MIMO_PROVIDER } from './src/mimo/provider.js'
 import { createCliLane, CLI_ROUTE } from './src/cli-lane.js'
 import { createModelSync } from './src/model-sync.js'
+import { createDoubao } from './src/doubao/index.js'
+import { DOUBAO_PROVIDER, createDoubaoAdapter } from './src/doubao/adapter.js'
+import { createResignBridge } from './src/resign-bridge.js'
+import { readBiliCompat, setBiliPassthrough } from './src/bili-config.js'
 import { uninstallPlugin, spawnDetachedRemoval } from './src/uninstall.js'
 
 export { fromOpenAiMessages } from './src/core/completion.js'
@@ -589,6 +594,213 @@ export function apply(ctx, config) {
       fs.appendFileSync(path.join(dir, 'cli-probe.log'), `${new Date().toISOString()} | lane mount failed: ${error?.message ?? error}\n`)
     } catch { /* diagnostics only */ }
     logger.warn?.(`get-it-for-free: CodeBuddy CLI 通道未挂载（${error?.message ?? error}）`)
+  }
+
+  // ── 往渠道包里写账号 ────────────────────────────────────────────────────────
+  // 三个新吸收的能力（CodeArts OAuth、WorkBuddy 本机登录、Qoder PAT）拿到的都是
+  // 「一份凭据」，而凭据单独存在凭据库里对用户没有意义 —— 渠道包的可见性判据是
+  // 「凭据可解析 + 账号池里有指向它的条目」，两件都要写，缺一条那一组模型就不会
+  // 出现在选择器里。账号池是 pack 挂载时才 provide 的，所以每次现取。
+  async function packInjectDeps() {
+    if (credentialsService === undefined) return null
+    const pool = typeof ctx?.get === 'function' ? ctx.get('accountPool') : undefined
+    if (pool === undefined || pool === null) return null
+    if (credentialRefOf === undefined) {
+      try {
+        credentialRefOf = (await import('@deepseek-ai/dsh-credentials')).credentialRef
+      } catch {
+        credentialRefOf = null
+      }
+    }
+    if (typeof credentialRefOf !== 'function') return null
+    return { credentials: credentialsService, credentialRef: credentialRefOf, pool }
+  }
+
+  // ── WorkBuddy / CodeBuddy 桌面端登录态 ──────────────────────────────────────
+  // 凭据不经过任何登录流程：桌面端自己往 CodeBuddyExtension 的 auth 目录每天写
+  // 一份 JSON，我们只读。读到的写进渠道包账号池才算真正可用（见 pack-inject）。
+  async function buddyModule() {
+    // 动态 import：这一块坏掉只丢「扫本机登录」，不能让整份插件加载失败。
+    return import('./src/workbuddy/discover.js')
+  }
+
+  /** 一份凭据该落到哪个产品：看它自己写的 domain，看不出来就按 WorkBuddy 国际版。 */
+  function buddyProviderFor(domain) {
+    const text = String(domain ?? '').toLowerCase()
+    if (text.includes('workbuddy')) return 'workbuddy'
+    if (text.includes('tencent') || text.includes('copilot')) return 'buddy'
+    return 'workbuddy'
+  }
+
+  async function buddyPoolStatus() {
+    const deps2 = await packInjectDeps()
+    if (deps2 === null) return { ready: false, accounts: 0 }
+    try {
+      const rows = await deps2.pool.listAllAccounts()
+      const mine = (Array.isArray(rows) ? rows : []).filter(row => row?.provider === 'buddy' || row?.provider === 'workbuddy')
+      return { ready: true, accounts: mine.length }
+    } catch {
+      return { ready: false, accounts: 0 }
+    }
+  }
+
+  async function buddyImport({ provider = '', only = '' } = {}) {
+    const { discoverCredentialDetails } = await buddyModule()
+    const { injectCredential } = await import('./src/pack-inject.js')
+    const deps2 = await packInjectDeps()
+    if (deps2 === null) {
+      throw Object.assign(new Error('渠道包还没就绪（或宿主的凭据服务不可用），等它挂上再点一次'), { code: 'NO_POOL' })
+    }
+    const details = await discoverCredentialDetails({ logger })
+    const targets = details.filter(row => only === '' || row.id === only)
+    const done = []
+    const failed = []
+    for (const row of targets) {
+      const target = provider !== '' ? provider : buddyProviderFor(row.domain)
+      const refreshToken = typeof row.refreshToken === 'string' ? row.refreshToken : ''
+      // domain 空着就整条不写：渠道包按 domain 与产品配置比对，空值它跳过；
+      // 写错一个域反而会让这条账号被当成「旧版凭据」清掉。
+      const credential = {
+        access_token: row.accessToken,
+        refresh_token: refreshToken,
+        ...(row.domain === '' || row.domain === undefined ? {} : { domain: row.domain }),
+        user_id: row.uin ?? '',
+        nickname: row.nickname,
+        token_type: 'Bearer',
+      }
+      try {
+        const result = await injectCredential({
+          ...deps2,
+          provider: target,
+          seed: row.id,
+          nickname: row.nickname,
+          credential,
+          refreshable: refreshToken !== '',
+        })
+        done.push({ ...result, provider: target, nickname: row.nickname })
+      } catch (error) {
+        failed.push({ id: row.id, error: String(error?.message ?? error).slice(0, 200) })
+      }
+    }
+    if (done.length > 0) await refreshChannelModels('本机登录导入')
+    return { imported: done, failed, discovered: targets.length }
+  }
+
+  // ── Qoder PAT ───────────────────────────────────────────────────────────────
+  // Qoder 桌面端把凭据加密存在钥匙串里，本机扫不出来，所以这一路只有两个来源：
+  // 面板粘的 PAT 和环境变量（QODER_PERSONAL_ACCESS_TOKEN / QODERCN_…）。PAT 本身
+  // 就是 security_oauth_token，渠道包会用它去换 jobToken 并做 cosy 签名。
+  async function qoderService() {
+    const { createQoder } = await import('./src/qoder/index.js')
+    return createQoder({ logger, env: typeof process !== 'undefined' ? process.env : {} })
+  }
+
+  async function qoderSync() {
+    const { resolveAccounts } = await import('./src/qoder/index.js')
+    const { injectCredential } = await import('./src/pack-inject.js')
+    const deps2 = await packInjectDeps()
+    if (deps2 === null) return { imported: [], failed: [], skipped: 'NO_POOL' }
+    const imported = []
+    const failed = []
+    for (const region of ['global', 'cn']) {
+      let rows = []
+      try {
+        rows = await resolveAccounts({ env: typeof process !== 'undefined' ? process.env : {}, region })
+      } catch (error) {
+        failed.push({ region, error: String(error?.message ?? error).slice(0, 200) })
+        continue
+      }
+      for (const row of rows) {
+        if (typeof row?.pat !== 'string' || row.pat === '') continue
+        // machine_id 登录后不该变：由 token 派生，重启后仍是同一条设备记录。
+        const digest = crypto.createHash('sha256').update(row.pat).digest('hex')
+        const uuid = `${digest.slice(0, 8)}-${digest.slice(8, 12)}-5${digest.slice(13, 16)}-a${digest.slice(17, 20)}-${digest.slice(20, 32)}`
+        try {
+          const result = await injectCredential({
+            ...deps2,
+            provider: region === 'cn' ? 'qodercn' : 'qoder',
+            // 种子用 vault 里的账号 id（它本身由 PAT 派生）：删账号时手上只有 id，
+            // 用它当种子才能把同一个 slot 算回来。
+            seed: row.id,
+            nickname: row.label || row.id,
+            credential: {
+              security_oauth_token: row.pat,
+              access_token: row.pat,
+              machine_id: uuid,
+              ...(row.label ? { nickname: row.label } : {}),
+            },
+            refreshable: false,
+          })
+          imported.push({ ...result, region })
+        } catch (error) {
+          failed.push({ region, id: row.id, error: String(error?.message ?? error).slice(0, 200) })
+        }
+      }
+    }
+    if (imported.length > 0) await refreshChannelModels('Qoder PAT 同步')
+    return { imported, failed }
+  }
+
+  // ── 华为云 CodeArts ─────────────────────────────────────────────────────────
+  // 走内置 OAuth2（PKCE + DPoP），环回回调 127.0.0.1，令牌落在插件自己的
+  // .codearts-accounts.json。渠道包只要 ak/sk/security_token 三件就能签名发请求，
+  // 续期由这一侧负责 —— 渠道包自己续期需要 code_verifier，而那份只在登录那一刻存在。
+  let codeartsInstance
+  async function codeartsService() {
+    if (codeartsInstance !== undefined) return codeartsInstance
+    const { createCodeArtsOAuth } = await import('./src/codearts/oauth.js')
+    codeartsInstance = createCodeArtsOAuth({ logger, env: typeof process !== 'undefined' ? process.env : {} })
+    return codeartsInstance
+  }
+
+  /** 过期时间可能是 ISO 字符串或秒/毫秒时间戳，统一成毫秒。 */
+  function expiryMsOf(value) {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value > 1e12 ? value : value * 1000
+    if (typeof value === 'string' && value !== '') {
+      const parsed = Date.parse(value)
+      if (Number.isFinite(parsed)) return parsed
+      const numeric = Number(value)
+      if (Number.isFinite(numeric) && numeric > 0) return numeric > 1e12 ? numeric : numeric * 1000
+    }
+    return undefined
+  }
+
+  async function codeartsSync() {
+    const oauth = await codeartsService()
+    const deps2 = await packInjectDeps()
+    if (deps2 === null) return { imported: [], failed: [], skipped: 'NO_POOL' }
+    const { injectCredential } = await import('./src/pack-inject.js')
+    const imported = []
+    const failed = []
+    for (const row of await oauth.list()) {
+      try {
+        // getToken 会顺手把快过期的续掉：写进渠道包的必须是能签名的当前令牌。
+        const token = await oauth.getToken(row.id)
+        const expiresAt = expiryMsOf(token.expiration)
+        await injectCredential({
+          ...deps2,
+          provider: 'codearts',
+          seed: row.id,
+          nickname: row.label || row.userName || row.id,
+          credential: {
+            access_key_id: token.accessKeyId,
+            secret_access_key: token.secretAccessKey,
+            security_token: token.securityToken,
+            ...(typeof token.expiration === 'string' && token.expiration !== '' ? { expires_at: token.expiration } : {}),
+            ...(row.userName ? { user_name: row.userName } : {}),
+            ...(row.userId ? { user_id: row.userId } : {}),
+            ...(row.domainId ? { domain_id: row.domainId } : {}),
+          },
+          expiresAt,
+          refreshable: false,
+        })
+        imported.push({ id: row.id, label: row.label })
+      } catch (error) {
+        failed.push({ id: row.id, error: String(error?.message ?? error).slice(0, 200) })
+      }
+    }
+    if (imported.length > 0) await refreshChannelModels('CodeArts 登录同步')
+    return { imported, failed }
   }
 
   /**
@@ -1213,6 +1425,75 @@ export function apply(ctx, config) {
     logger,
   })
 
+  // ── 豆包工作 ────────────────────────────────────────────────────────────────
+  // 账号存在 ~/.dsh/get-it-for-free/doubao.json，一个账号一条 cookie；额度、
+  // 模型目录、每日签到都走同一个客户端身份。放在我们自己这一层而不是 pack.js
+  // 里，是因为这份协议还在频繁试错，改坏不该拖累整个渠道层。
+  const doubao = createDoubao({ logger, onChange: () => emitTopology() })
+
+  // 把豆包那 12 个模型真正挂给宿主的 LLM 层 —— 面板上的卡只管「看」，这里才让
+  // 它们出现在右下角的模型选择器里。和 MiMo 一样是可选通道：挂不上就只让它自己
+  // 缺席，绝不把整份插件带下水。
+  try {
+    ctx.llm.registerAdapter([DOUBAO_PROVIDER], createDoubaoAdapter({ doubao, logger }))
+  } catch (error) {
+    logger.warn?.(`get-it-for-free: 豆包模型未注册（${error?.message ?? error}）`)
+  }
+
+  // ── 签名中转（给 billion-context 递凭据）────────────────────────────────────
+  // CodeArts 的签名盖住了请求体，bili 要压缩就得自己重签，重签就得知道是哪一号
+  // 账号的 AK/SK。它扫 <DSH_HOME>/jet-hub/state.json 找 provider==='codearts'
+  // 的条目，再按 credentialRef 去宿主凭据库取。我们只负责把账号镜像过去 ——
+  // 密钥本体不出这个进程之外的凭据库，这里落盘的是 ref 名。
+  const resign = createResignBridge({ logger })
+  // 默认不再自动镜像（3.0.42）。实测：凭据一旦递过去，bili 就对每个 CodeArts 请求
+  // 走自己的重签（日志：`[resign] re-sign arm active (sdk-hmac-sha256)`），而重签出来的
+  // 请求被华为云回了 502 —— 比原来的「原样放行」更糟。所以默认关，只在用户手动点
+  // 「同步」时写一次；要恢复自动，建一个空文件 ~/.dsh/get-it-for-free/resign-auto。
+  const resignAuto = (() => {
+    try { return fs.existsSync(path.join(os.homedir(), '.dsh', 'get-it-for-free', 'resign-auto')) } catch { return false }
+  })()
+  if (resignAuto) void resign.sync()
+
+  // ── 与 bili 的默认校正 ──────────────────────────────────────────────────────
+  // 这条链路和 billion-context 唯一稳定的组合是「原样放行」。bili 的默认判断是
+  // 「有凭据就自己重签」，而它重签出来的请求华为云必拒 —— 用户装了 bili 之后
+  // 华为云渠道整条不可用，报错还指向上游，看不出是 bili 动的手。所以启动时做
+  // 一次幂等校正：只在「bili 现在打算重签」这一种状态下改它，改前自动备份，
+  // 已经有别的状态就不去覆盖用户的选择。
+  try {
+    const compat = readBiliCompat()
+    // 只有 bili 的配置里确实写了这条签名方案（说明它真想管这个 scheme）才动它。
+    // 没写就等于 bili 压根不管这类请求，我们不去替它新建一段配置。
+    if (compat.present === true && compat.mode === 'resign' && compat.scheme !== null) {
+      const after = setBiliPassthrough({ enabled: true })
+      logger.info?.(`get-it-for-free: bili 原本会对华为云请求重签（上游不接受），已改成原样放行${after.backup === '' ? '' : `（备份 ${after.backup}）`}`)
+    }
+  } catch (error) {
+    logger.warn?.(`get-it-for-free: 校正 bili 配置失败（${error?.message ?? error}）`)
+  }
+
+  // ── Qoder PAT 的启动补写 ────────────────────────────────────────────────────
+  // vault 里的 PAT 每次启动都要补一遍：凭据库可能被清、渠道包可能被重装，而
+  // 「凭据 + 条目」缺一条，Qoder 那组模型就整组不出现在选择器里。延迟启动是因为
+  // 渠道包是异步 import 挂载的，太早取不到 accountPool。
+  const qoderPrime = setTimeout(() => {
+    void qoderSync().catch(error => logger.warn?.(`get-it-for-free: Qoder PAT 同步失败（${error?.message ?? error}）`))
+  }, 9_000)
+  qoderPrime.unref?.()
+
+  // ── CodeArts 令牌回写 ───────────────────────────────────────────────────────
+  // 这里的令牌一小时一换，而渠道包里那份是「拷贝」：不主动回写，过了有效期
+  // 华为云那组模型就会开始 401。15 分钟一轮，只在真有过期风险时 getToken 才会续。
+  const codeartsPrime = setTimeout(() => {
+    void codeartsSync().catch(error => logger.warn?.(`get-it-for-free: CodeArts 同步失败（${error?.message ?? error}）`))
+  }, 12_000)
+  codeartsPrime.unref?.()
+  const codeartsTick = setInterval(() => {
+    void codeartsSync().catch(() => {})
+  }, 15 * 60_000)
+  codeartsTick.unref?.()
+
   const api = createApiRoutes({
     settings, stats, availability, catalog: () => modelRuntime.catalog, state,
     refreshCatalog, refreshAvailability, syncForward, syncRelay, syncEgress,
@@ -1226,6 +1507,10 @@ export function apply(ctx, config) {
     cliLane,
     // 模型目录同步：上次同步时间、各渠道模型数、新增/下线 diff 历史。
     modelSync,
+    // 豆包工作：多账号凭据、额度、模型目录、每日签到。
+    doubao,
+    // 签名中转：把 CodeArts 账号的 credentialRef 镜像给 bili，让它能重签。
+    resign,
     // ── the aggregate lane's settings surface ────────────────────────────────
     // The registry is static data; the configured half is the settings file with
     // every key masked. Writing one provider rebuilds the catalog and re-emits
@@ -1336,6 +1621,56 @@ export function apply(ctx, config) {
         return { combos: rows, usable: catalog.filter(isComboEntry).map(publicCombo) }
       },
     },
+    // ── the free pool ───────────────────────────────────────────────────────
+    // Named `freePool`, not `pool`: `deps.pool` is already the channel pack's
+    // account-pool snapshot (see `fetchPoolSnapshot`), and two different pools
+    // under one key would silently swap which one the panel is reading.
+    freePool: {
+      // The order is read from the runtime, not recomputed here: the panel has to
+      // show exactly the list the next turn would dial, or the first thing a user
+      // does after a bad turn is doubt the panel.
+      status: () => {
+        const current = settings.get().freePool ?? {}
+        return {
+          ...modelRuntime.poolStatus(),
+          name: String(current.name ?? ''),
+          exclude: Array.isArray(current.exclude) ? current.exclude : [],
+          limit: Number(current.limit) || 8,
+        }
+      },
+      save: async patch => {
+        if (patch === null || typeof patch !== 'object') throw httpError(400, 'the request body must be a JSON object')
+        const current = settings.get().freePool ?? {}
+        const next = { ...current }
+        if (patch.enabled !== undefined) next.enabled = patch.enabled !== false
+        if (patch.name !== undefined) {
+          if (typeof patch.name !== 'string' || patch.name.length > 60) throw httpError(400, 'name must be a string of at most 60 characters')
+          next.name = patch.name.trim()
+        }
+        if (patch.exclude !== undefined) {
+          if (!Array.isArray(patch.exclude) || patch.exclude.length > 500
+            || patch.exclude.some(id => typeof id !== 'string' || id.length > 300)) {
+            throw httpError(400, 'exclude must be an array of model ids')
+          }
+          next.exclude = [...new Set(patch.exclude.map(id => id.trim()).filter(id => id !== ''))]
+        }
+        if (patch.limit !== undefined) {
+          const limit = Number(patch.limit)
+          if (!Number.isFinite(limit) || limit < 1 || limit > 32) throw httpError(400, 'limit must be between 1 and 32')
+          next.limit = Math.trunc(limit)
+        }
+        settings.update({ freePool: next })
+        settings.flush()
+        // The row's capabilities are the intersection of its candidates, so the
+        // merged view has to be rebuilt before the picker is told it changed.
+        syncAggregateCatalog()
+        return { freePool: next }
+      },
+      reset: () => {
+        clearBench()
+        return { ok: true }
+      },
+    },
     // ── token savers ────────────────────────────────────────────────────────
     tokenSaver: {
       get: () => ({ ...publicTokenSaver(settings.get().tokenSaver), savings: buildStats(stats.get(), state().catalog).savings }),
@@ -1390,6 +1725,17 @@ export function apply(ctx, config) {
     // The absorbed channel pack's liveness, for the 免费接入 page: the page
     // renders its channel grid from this bit plus the pack's own RPC.
     channels: () => channelPack,
+    // 本机登录态发现（WorkBuddy / CodeBuddy 桌面端）。
+    buddy: () => buddyModule(),
+    buddyPoolStatus,
+    buddyImport,
+    packInjectDeps,
+    // Qoder PAT：vault 在插件自己这儿，注入到渠道包才算能用。
+    qoderService,
+    qoderSync,
+    // 华为云 CodeArts：OAuth2 登录 + 令牌同步进渠道包。
+    codeartsService,
+    codeartsSync,
     chanRelay: {
       status: chanRelayStatus,
       apply: async patch => {
@@ -1979,7 +2325,7 @@ export function createApiRoutes(deps) {
           try {
             spawnDetachedRemoval({ packageDir: PKG_DIR }).catch(() => {})
           } catch (error) {
-            logger.warn?.(`get-it-for-free: 卸载收尾失败 (${error?.message ?? error})`)
+            deps.logger?.warn?.(`get-it-for-free: 卸载收尾失败 (${error?.message ?? error})`)
           }
         }, 900)
         return send(200, { ok: true, removed: result.removed, dataKept: result.dataKept })
@@ -2021,6 +2367,293 @@ export function createApiRoutes(deps) {
       if (method === 'POST' && routePath === '/model-sync/run') {
         try {
           return send(200, await deps.modelSync.run({ reason: '手动同步' }))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // ── 豆包工作（多账号 / 额度 / 模型目录 / 每日签到）──────────────────────
+      if (method === 'GET' && routePath === '/doubao/status') {
+        const force = url.searchParams.get('refresh') === '1'
+        try {
+          return send(200, await deps.doubao.status({ force }))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // 粘 cookie 就行：一个账号一条记录，几条记录就是几个账号并行用。
+      if (method === 'POST' && routePath === '/doubao/accounts') {
+        try {
+          const body = await readJson(req)
+          return send(200, await deps.doubao.addAccount({ cookie: body?.cookie, name: body?.name }))
+        } catch (error) {
+          return send(400, { error: String(error?.message ?? error).slice(0, 300), code: String(error?.code ?? '') })
+        }
+      }
+      if (method === 'POST' && routePath === '/doubao/accounts/remove') {
+        try {
+          const body = await readJson(req)
+          if (typeof body?.id !== 'string' || body.id === '') return send(400, { error: 'id required' })
+          return send(200, await deps.doubao.removeAccount(body.id))
+        } catch (error) {
+          return send(400, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // 签到：不带 id 就是全部账号跑一遍；dryRun 只读活动详情，不提交领取。
+      if (method === 'POST' && routePath === '/doubao/checkin') {
+        try {
+          const body = await readJson(req)
+          const dryRun = body?.dryRun === true
+          if (typeof body?.id === 'string' && body.id !== '') {
+            return send(200, { at: Date.now(), dryRun, accounts: [{ id: body.id, ...(await deps.doubao.checkin(body.id, { dryRun })) }] })
+          }
+          return send(200, await deps.doubao.checkinAll({ dryRun }))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // 面板上的续期 / 刷新余额 / 刷新模型各打一块，不互相捎带。
+      if (method === 'POST' && routePath === '/doubao/refresh') {
+        try {
+          const body = await readJson(req)
+          const part = ['probe', 'quota', 'models'].includes(body?.part) ? body.part : 'all'
+          return send(200, await deps.doubao.refresh({ id: typeof body?.id === 'string' ? body.id : '', part }))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // 模型开关：豆包一次请求只带一个 model_item_key，所以这里的「关掉」
+      // 只是不在面板上列它，不会影响别的账号。
+      if (method === 'POST' && routePath === '/doubao/models/toggle') {
+        try {
+          const body = await readJson(req)
+          const disabled = body?.disabled !== false
+          let ids = Array.isArray(body?.ids) ? body.ids.filter(id => typeof id === 'string') : []
+          if (body?.all === true) {
+            const rows = await deps.doubao.status()
+            const set = new Set()
+            for (const account of rows.accounts) for (const model of account.modelList ?? []) set.add(model.id)
+            ids = [...set]
+          }
+          return send(200, await deps.doubao.setModelsDisabled({ ids, disabled }))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/doubao/accounts/update') {
+        try {
+          const body = await readJson(req)
+          if (typeof body?.id !== 'string' || body.id === '') return send(400, { error: 'id is required' })
+          const patch = typeof body?.enabled === 'boolean' ? { enabled: body.enabled } : {}
+          return send(200, await deps.doubao.updateAccount(body.id, patch))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // 智商检测：真发一条消息，回 {ok, firstMs, totalMs, nickname, text}
+      if (method === 'POST' && routePath === '/doubao/degrade') {
+        try {
+          const body = await readJson(req)
+          const id = typeof body?.id === 'string' ? body.id : ''
+          const modelId = typeof body?.modelId === 'string' && body.modelId !== '' ? body.modelId : '0'
+          return send(200, await deps.doubao.degrade({ id, modelId }))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/doubao/chat') {
+        try {
+          const body = await readJson(req)
+          if (typeof body?.prompt !== 'string' || body.prompt === '') return send(400, { error: 'prompt is required' })
+          const id = typeof body?.id === 'string' ? body.id : ''
+          return send(200, await deps.doubao.talk(id, {
+            prompt: body.prompt,
+            modelId: typeof body?.modelId === 'string' && body.modelId !== '' ? body.modelId : '0',
+            reasoningLevel: Number(body?.reasoningLevel) || 0,
+            taskMode: body?.taskMode === true,
+            conversationId: typeof body?.conversationId === 'string' ? body.conversationId : '',
+          }))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // 登录：POST 开浏览器并开始等，GET 轮询进度，cancel 收窗。
+      if (method === 'POST' && routePath === '/doubao/login') {
+        try {
+          return send(200, await deps.doubao.login.start())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'GET' && routePath === '/doubao/login') {
+        return send(200, deps.doubao.login.status())
+      }
+      if (method === 'POST' && routePath === '/doubao/login/cancel') {
+        return send(200, deps.doubao.login.cancel())
+      }
+      // ── WorkBuddy / CodeBuddy 本机登录态 ─────────────────────────────────────
+      // 只读桌面端自己写的 auth 文件：不登录、不弹窗、不碰钥匙串。
+      if (method === 'GET' && routePath === '/buddy/status') {
+        try {
+          const { status } = await deps.buddy()
+          return send(200, { ...(await status({ logger: deps.logger })), pack: await deps.buddyPoolStatus() })
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // 扫到的凭据写进渠道包账号池 —— 凭据和条目一起写，缺一条那组模型不会出现。
+      if (method === 'POST' && routePath === '/buddy/import') {
+        try {
+          const body = await readJson(req)
+          return send(200, await deps.buddyImport({
+            provider: typeof body?.provider === 'string' ? body.provider : '',
+            only: typeof body?.id === 'string' ? body.id : '',
+          }))
+        } catch (error) {
+          return send(400, { error: String(error?.message ?? error).slice(0, 300), code: String(error?.code ?? '') })
+        }
+      }
+      // ── Qoder PAT ────────────────────────────────────────────────────────────
+      if (method === 'GET' && routePath === '/qoder/status') {
+        try {
+          return send(200, await (await deps.qoderService()).status())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'GET' && routePath === '/qoder/accounts') {
+        try {
+          const region = url.searchParams.get('region')
+          return send(200, await (await deps.qoderService()).list(region === 'cn' || region === 'global' ? { region } : {}))
+        } catch (error) {
+          return send(400, { error: String(error?.message ?? error).slice(0, 300), code: String(error?.code ?? '') })
+        }
+      }
+      // 加一条 PAT：先验一遍上游，通过了才落盘，然后立刻写进渠道包。
+      if (method === 'POST' && routePath === '/qoder/accounts') {
+        try {
+          const body = await readJson(req)
+          const added = await (await deps.qoderService()).add({ pat: body?.pat, region: body?.region, label: body?.label })
+          let sync = null
+          try {
+            sync = await deps.qoderSync()
+          } catch (error) {
+            sync = { error: String(error?.message ?? error).slice(0, 200) }
+          }
+          return send(200, { ...added, sync })
+        } catch (error) {
+          return send(400, { error: String(error?.message ?? error).slice(0, 300), code: String(error?.code ?? '') })
+        }
+      }
+      if (method === 'POST' && routePath === '/qoder/accounts/remove') {
+        try {
+          const body = await readJson(req)
+          const region = body?.region === 'cn' || body?.region === 'global' ? body.region : undefined
+          const removed = await (await deps.qoderService()).remove(body?.id, region)
+          const { evictAccount, slotFor } = await import('./src/pack-inject.js')
+          const packDeps = await deps.packInjectDeps()
+          if (packDeps !== null && typeof body?.id === 'string' && body.id !== '') {
+            // 注入时的 slot 由 vault 账号 id 派生，删的时候用同一个种子把 id 算回来。
+            for (const provider of (region === undefined ? ['qoder', 'qodercn'] : [region === 'cn' ? 'qodercn' : 'qoder'])) {
+              const { id: accountId } = slotFor(provider, body.id)
+              await evictAccount({ ...packDeps, accountId }).catch(() => {})
+            }
+            // 条目没了，目录缓存还是旧的：不刷新的话那一组模型会继续挂在选择器里。
+            try { await deps.refresh('Qoder 删除账号') } catch { /* 刷新失败不影响删除结果 */ }
+          }
+          return send(200, removed)
+        } catch (error) {
+          return send(400, { error: String(error?.message ?? error).slice(0, 300), code: String(error?.code ?? '') })
+        }
+      }
+      if (method === 'POST' && routePath === '/qoder/verify') {
+        try {
+          const body = await readJson(req)
+          return send(200, await (await deps.qoderService()).verify({ pat: body?.pat, region: body?.region }))
+        } catch (error) {
+          return send(400, { error: String(error?.message ?? error).slice(0, 300), code: String(error?.code ?? '') })
+        }
+      }
+      // ── 华为云 CodeArts OAuth2 ──────────────────────────────────────────────
+      if (method === 'GET' && routePath === '/codearts/status') {
+        try {
+          const oauth = await deps.codeartsService()
+          return send(200, { ...oauth.status(), accounts: await oauth.list() })
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // start() 先 listen 拿真端口再拼 URL，所以这里必然返回一个可点的地址。
+      if (method === 'POST' && routePath === '/codearts/login') {
+        try {
+          const oauth = await deps.codeartsService()
+          return send(200, await oauth.start())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300), code: String(error?.code ?? '') })
+        }
+      }
+      if (method === 'POST' && routePath === '/codearts/login/cancel') {
+        try {
+          return send(200, (await deps.codeartsService()).cancel())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // 登录完成后再同步一次：把新令牌写进渠道包账号池（凭据 + 条目成对写）。
+      if (method === 'POST' && routePath === '/codearts/sync') {
+        try {
+          return send(200, await deps.codeartsSync())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/codearts/accounts/remove') {
+        try {
+          const body = await readJson(req)
+          const removed = await (await deps.codeartsService()).remove(body?.id)
+          if (removed === true && typeof body?.id === 'string' && body.id !== '') {
+            const { evictAccount, slotFor } = await import('./src/pack-inject.js')
+            const packDeps = await deps.packInjectDeps()
+            if (packDeps !== null) {
+              await evictAccount({ ...packDeps, accountId: slotFor('codearts', body.id).id }).catch(() => {})
+              await deps.refresh('CodeArts 删除账号')
+            }
+          }
+          return send(200, { removed })
+        } catch (error) {
+          return send(400, { error: String(error?.message ?? error).slice(0, 300), code: String(error?.code ?? '') })
+        }
+      }
+      // ── 签名中转（billion-context 重签凭据）──────────────────────────────────
+      // 只看「有没有把 ref 递过去」，不看密钥本身：凭据永远是宿主凭据库解出来的。
+      if (method === 'GET' && routePath === '/resign/status') {
+        try {
+          return send(200, await deps.resign.status())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/resign/sync') {
+        try {
+          return send(200, await deps.resign.sync())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // ── 与 bili 共存（华为云链路不压缩）──────────────────────────────────────
+      // CodeArts 的签名盖住请求体，bili 只能「重签后压缩」或「拒转发」；它的重签
+      // 实测过不了上游（补尾斜杠 + 给部分模型加 maas_type: benefit），所以唯一
+      // 稳的组合是原样放行 —— 这是 bili 自己的开关，我们只做受控写入。
+      if (method === 'GET' && routePath === '/bili/status') {
+        try {
+          return send(200, readBiliCompat())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/bili/passthrough') {
+        try {
+          const body = await readJson(req)
+          return send(200, setBiliPassthrough({ enabled: body?.enabled !== false }))
         } catch (error) {
           return send(500, { error: String(error?.message ?? error).slice(0, 300) })
         }
@@ -2148,6 +2781,18 @@ export function createApiRoutes(deps) {
           return send(404, { error: `pool unavailable (${reason})` })
         }
       }
+      // The free pool is this plugin's own lane ranking, distinct from the
+      // account pool above: `/pool` answers "which accounts does the pack hold",
+      // `/free-pool` answers "which free model will the next turn dial, and why".
+      if (method === 'GET' && routePath === '/free-pool') {
+        return send(200, deps.freePool.status())
+      }
+      if (method === 'POST' && routePath === '/free-pool') {
+        return send(200, { ok: true, ...await deps.freePool.save(await readJson(req)) })
+      }
+      if (method === 'POST' && routePath === '/free-pool/reset') {
+        return send(200, deps.freePool.reset())
+      }
       if (method === 'GET' && routePath === '/announcement') {
         // A managed install also stands down the owner's onboarding copy: the
         // pack, not the plugin, speaks for what is new.
@@ -2222,6 +2867,13 @@ export function createApiRoutes(deps) {
         const visibility = validateModelVisibility(patch)
         const current = deps.settings.get()
         const next = sanitizeSettings({ ...current, ...pick(patch, ['enabled', 'exposeRegionModels', 'probeIntervalMinutes', 'defaultMaxTokens', 'announcementAck', 'feedUrl', 'feedPollMinutes', 'notifyOs', 'updateCheckHours', 'autoReloadWatch', 'riskAccepted']), ...visibility }, current)
+        // 渠道卡片上的「×」：整张名单一起来，服务端不猜增量。只影响设置页里
+        // 显示哪些卡，不动账号、令牌、模型开关——所以这里不需要任何清理动作。
+        if (patch.hiddenChannels !== undefined) {
+          if (!Array.isArray(patch.hiddenChannels)) return send(400, { error: 'hiddenChannels must be an array of channel ids' })
+          const ids = patch.hiddenChannels.filter(id => typeof id === 'string' && /^[a-z][a-z0-9_-]{1,39}$/.test(id))
+          next.hiddenChannels = [...new Set(ids)].slice(0, 64)
+        }
         if (patch.forward !== undefined) {
           const forward = { ...(current.forward ?? {}), ...pick(patch.forward, ['enabled', 'host', 'port']) }
           // The listener spends this machine's lane, and a routable bind address
@@ -2605,6 +3257,10 @@ function publicSettings(settings, forwardInfo, egressInfo) {
     defaultMaxTokens: settings.defaultMaxTokens ?? 32768,
     announcementAck: settings.announcementAck ?? '',
     riskAccepted: settings.riskAccepted === true,
+    /** 设置页里被收起（点了卡片右上角「×」）的渠道卡片 id。 */
+    hiddenChannels: Array.isArray(settings.hiddenChannels)
+      ? settings.hiddenChannels.filter(id => typeof id === 'string').slice(0, 64)
+      : [],
     feedUrl: typeof settings.feedUrl === 'string' ? settings.feedUrl : '',
     feedPollMinutes: settings.feedPollMinutes ?? 30,
     notifyOs: settings.notifyOs === true,
