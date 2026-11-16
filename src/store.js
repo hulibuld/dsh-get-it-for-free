@@ -151,6 +151,19 @@ export function dayKey(at = Date.now()) {
   return `${y}-${m}-${d}`
 }
 
+/** 3.3.0 拆掉免登录车道（匿名清单 / Kilo / 免费池）后，这四个键不再有任何
+ *  读者。留在文件里只会让人以为它们还有用，所以在读取时清掉一次。 */
+export const RETIRED_SETTINGS = ['freePool', 'freeChannelsEnabled', 'hideAllModels', 'hideFreeModels']
+
+/** 删掉已退役的键；返回同一个对象（就地改），供 JsonStore.edit 使用。 */
+export function migrateSettings(settings) {
+  if (settings === null || typeof settings !== 'object' || Array.isArray(settings)) return settings
+  for (const key of RETIRED_SETTINGS) {
+    if (Object.hasOwn(settings, key)) delete settings[key]
+  }
+  return settings
+}
+
 export const SETTINGS_INITIAL = {
   version: 1,
   /** Master switch: when off the routes stay registered but serve nothing. */
@@ -159,14 +172,7 @@ export const SETTINGS_INITIAL = {
   exposeRegionModels: true,
   /** Advertisement only: retain catalog entries and historical model resolution. */
   hiddenModelIds: [],
-  hideFreeModels: false,
   hideEacModels: false,
-  /** 一键把所有模型都藏起来：membership 变空后本插件的两个路由不再向选择器
-   *  投放任何模型（路由仍注册，只是空列表，选择器会按「0 模型」过滤掉分组）。 */
-  /** 免费模型聚合通道（Get It For Free / 地区受限）的总开关。默认关闭：本插件
-   *  只做「各公司账号池 → 模型」，不往选择器里塞免费模型。 */
-  freeChannelsEnabled: false,
-  hideAllModels: true,
   /** 设置页里被收起来的渠道卡片（右上角「×」）。只影响这一页的排列：账号、
    *  令牌、模型开关都不动，页面底部的「＋」把它原样加回来。 */
   hiddenChannels: [],
@@ -216,29 +222,10 @@ export const SETTINGS_INITIAL = {
     providers: {},
   },
   /** Named fallback chains. A combo is a virtual model whose answer comes from
-   *  the first link that produces output; see src/combos.js.
-   *  Ships one sensible default so a fresh install shows a single "推荐免费组"
-   *  entry instead of a dozen free models; users can edit/disable it in settings. */
-  combos: [
-    {
-      id: 'combo:recommended-free',
-      name: '推荐免费组',
-      models: ['deepseek-v4.1-flash-free', 'glm-5.3-flash-free', 'space-bunny-free'],
-      strategy: 'fallback',
-      stickyLimit: 1,
-      enabled: true,
-    },
-  ],
-  /** The free pool: a virtual row that dials every free lane this plugin serves,
-   *  best-performing first, and benches a lane that just failed. See
-   *  src/freepool.js. On by default because it only ever reorders free lanes —
-   *  it can never reach a lane that bills per token. */
-  freePool: {
-    enabled: true,
-    name: '',
-    exclude: [],
-    limit: 8,
-  },
+   *  the first link that produces output; see src/combos.js. Ships empty: a
+   *  default would have to name models, and the only models that always exist
+   *  are the account lanes this machine happens to be logged into. */
+  combos: [],
   /** The five local answers that avoid a provider call entirely: a quota probe,
    *  a shell command prefix, a session title, a suggestion, a filepath list.
    *  They are pure request-shape matches, so a false positive would answer a real
@@ -287,7 +274,6 @@ export function publicModelVisibility(settings) {
   return {
     hiddenModelIds: [...new Set((Array.isArray(settings?.hiddenModelIds) ? settings.hiddenModelIds : [])
       .filter(validHiddenModelId))].slice(0, 1000),
-    hideFreeModels: settings?.hideFreeModels === true,
     hideEacModels: settings?.hideEacModels === true,
   }
 }
@@ -298,7 +284,7 @@ export function validateModelVisibility(patch) {
     throw Object.assign(new TypeError('settings must be a JSON object'), { statusCode: 400 })
   }
   const result = {}
-  for (const key of ['hideFreeModels', 'hideEacModels', 'hiddenModelIds']) {
+  for (const key of ['hideEacModels', 'hiddenModelIds']) {
     if (!Object.hasOwn(patch, key)) continue
     const value = patch[key]
     if (key === 'hiddenModelIds'
@@ -312,10 +298,7 @@ export function validateModelVisibility(patch) {
 }
 
 export function isModelHidden(entry, settings) {
-  if (settings?.hideAllModels === true) return true
   return (Array.isArray(settings?.hiddenModelIds) && settings.hiddenModelIds.includes(entry.id))
-    || (settings?.hideFreeModels === true && (!entry.channel || entry.channel === 'anonymous' || entry.channel === 'kilo'
-      || (entry.channel === 'combo' && Array.isArray(entry.lanes) && entry.lanes.length > 0 && entry.lanes.every(lane => lane === 'free'))))
     || (settings?.hideEacModels === true && entry.channel === 'eac')
 }
 

@@ -2,8 +2,8 @@
  * Outbound wire for the aggregate lane: the user's own keys at third-party
  * providers.
  *
- * The other three lanes are fixed outlets — a pooled anonymous credential, a
- * co-paid relay, a keyless gateway — and each owns its own module. This lane is
+ * The other lanes are fixed outlets — the account channels the plugin wires in,
+ * a co-paid relay — and each owns its own module. This lane is
  * the orthogonal one: the 76 providers of `src/providers/registry.json`, each
  * reachable only with material the user pastes into the settings page. The
  * module therefore does three things and no more:
@@ -55,7 +55,7 @@ import { egressFetch } from './egress.js'
 import { chatEndpoint, defaultHeaders, getProvider, modelsEndpoint, providerModelId } from './providers/index.js'
 import { displayModelName } from './catalog.js'
 
-/** The channel tag every aggregate row carries, the way EAC and Kilo rows do. */
+/** The channel tag every aggregate row carries, the way EAC rows do. */
 export const AGGREGATE_CHANNEL = 'aggregate'
 
 /** Registry `format` -> the plugin's wire vocabulary (src/stream.js). */
@@ -371,7 +371,7 @@ function retryAfterMs(response) {
  *
  * An authoritative empty listing returns `[]`, not null: the caller can then
  * clear a persisted roster, while a failed round keeps it — the same discipline
- * the Kilo channel's roster already follows.
+ * the sealed lane's roster already follows.
  */
 export async function fetchProviderModels(config, providerId, { signal, timeoutMs = LISTING_TIMEOUT_MS } = {}) {
   let resolved

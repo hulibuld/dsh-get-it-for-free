@@ -1,10 +1,11 @@
 /**
  * Provider registry for the aggregate lane.
  *
- * The plugin already owns three model lanes whose ids it mints itself: the
- * anonymous free lane, the EAC co-paid lane and the Kilo channel. This module
- * adds a fourth, orthogonal namespace — upstream providers a user reaches with
- * their own key, or, for the keyless and local ones, with no account at all.
+ * The plugin already owns lanes whose ids it mints itself: the account channels
+ * it wires into the pack, the EAC co-paid lane, and the models each channel
+ * names. This module adds an orthogonal namespace — upstream providers a user
+ * reaches with their own key, or, for the keyless and local ones, with no
+ * account at all.
  * The data lives in `registry.json` so a provider can be added, corrected or
  * dropped in one diffable file; nothing in this module reaches the network, and
  * a record's `source` field names which of the two vetted catalogs it came from.

@@ -38,8 +38,8 @@ window.__ModuleLoader__.load({
     const DICT = {
       zh: {
         'meta.title': 'Get It For Free',
-        'meta.description': '在 DeepSeek Harness 内直连免密免费模型：清单随上游更新、地区可用性自动探测、思考强度真实生效，并附 Token 看板与 OpenAI 兼容转发端口。',
-        'ann.pitch': '你只需在 dsh 里装上这个插件，无需登录、注册、填 API Key 或任何其它操作，就能用上包括 Muse Spark 1.3、MiMo V2.6 在内的前沿模型——完全免费，不限量。',
+        'meta.description': '把你自己的免费/签到型大模型账号接进 DeepSeek Harness：登录一次，模型以普通 provider 出现在选择器里，并附 Token 看板与 OpenAI 兼容转发端口。',
+        'ann.pitch': '把你已有的免费账号接进 dsh：华为云 CodeArts、CodeBuddy / WorkBuddy、Qoder、MiMo、豆包工作这些都支持，登录一次之后它们的模型就以普通 provider 出现在选择器里。插件本身不提供免登录的中转。',
         nav: 'Get It For Free',
         title: 'Get It For Free',
         refresh: '刷新清单',
@@ -85,7 +85,6 @@ window.__ModuleLoader__.load({
         'tag.hotTitle': '当前最热门的免费模型之一。',
         'tag.fast': '高速',
         'tag.fastTitle': '响应快、吞吐高，适合长对话与连续调用。',
-        'tag.kiloChannel': 'Kilo 渠道 · 免费池（prompt 可能被上游记录用于改进服务，勿发送敏感内容）',
         'roster.noLane': 'EAC 协付模型在当前运行环境不可用：宿主未提供可识别的桌面 / Web 配置，因此不加载该渠道。',
         'section.models': '模型清单',
         'section.modelsHint': '名称与能力来自上游清单与公开能力表，可用性由本机出口实测得出。',
@@ -232,9 +231,7 @@ window.__ModuleLoader__.load({
         'forward.lanUrl': '局域网地址',
         'forward.lanNoAddress': '没有检测到局域网 IPv4 地址',
         'forward.lanAlso': '其它地址：{list}',
-        'pref.enabled': '启用免费模型',
         'pref.exposeRegion': '展示地区受限模型',
-        'pref.hideFreeModels': '隐藏匿名与 Kilo 免费模型',
         'pref.hideEacModels': '隐藏 EAC 模型',
         'visibility.showModel': '在模型选择器中显示',
         'visibility.hidden': '已隐藏',
@@ -260,7 +257,7 @@ window.__ModuleLoader__.load({
         'ann.later': '稍后再说',
         'ann.page': '第 {n} / {total} 页',
         'ann.openSettings': '打开设置页',
-        'ann.p1': '免密：安装即可用，不需要注册、不需要填任何 API Key。',
+        'ann.p1': '要有账号：模型来自你自己的登录/凭据，插件不做免登录中转。',
         'ann.p2': '清单跟随上游：模型集合、上下文长度与能力每次刷新都重新拉取。',
         'ann.p3': '诚实的能力声明：探测不出来的能力不会显示，思考强度档位是真实生效的输出上限。',
         'ann.n1': '两个新模型已通过 EAC 渠道上线，由 OpenCode 免费车道转发：DeepSeek V4.1 Flash Free 与 GLM 5.3 Flash Free。',
@@ -571,19 +568,6 @@ window.__ModuleLoader__.load({
         'ms.stale': '沿用上次',
         'ms.empty': '当前没有可同步的渠道',
         'ms.hint': '只读目录，不动你自己关掉的模型开关',
-        'fpool.title': '免费池',
-        'fpool.sub': '把免费车道合成一行，按实测表现排序',
-        'fpool.on': '已启用',
-        'fpool.off': '已关闭',
-        'fpool.candidates': '候选',
-        'fpool.benched': '冷却中',
-        'fpool.cooling': '冷却',
-        'fpool.empty': '这台机器上还没有可用的免费车道',
-        'fpool.enable': '启用免费池',
-        'fpool.disable': '关闭免费池',
-        'fpool.clear': '全部解除',
-        'fpool.cleared': '冷却已全部解除',
-        'fpool.hint': '只重排本插件自己的免费车道，按量计费的渠道永远不会进池',
         'gw.models': '可转发模型',
         'gw.portNote': '端口可用环境变量 DSH_OPENAI_GATEWAY_PORT 调整。',
         'gw.relayTitle': '局域网转发（本插件中继）',
@@ -801,7 +785,6 @@ window.__ModuleLoader__.load({
         'routing.enabled': '启用',
         'routing.channel.free': '免费车道',
         'routing.channel.eac': 'EAC 协付',
-        'routing.channel.kilo': 'Kilo',
         'routing.channel.aggregate': '聚合',
         'routing.channel.combo': '链路',
         'gw.clientsTitle': '接入客户端',
@@ -812,8 +795,8 @@ window.__ModuleLoader__.load({
       },
       en: {
         'meta.title': 'Get It For Free',
-        'meta.description': 'Free no-key models inside DeepSeek Harness: a roster that follows upstream, live regional availability, genuinely enforced thinking levels, a token dashboard and an OpenAI-compatible local forward port.',
-        'ann.pitch': 'All you do is install this plugin in dsh — no login, no sign-up, no API key, no other step of any kind. The frontier models are simply there, Muse Spark 1.3 and MiMo V2.6 among them. Completely free, with no usage cap.',
+        'meta.description': 'Your own free and check-in model accounts inside DeepSeek Harness: log in once, and their models show up as ordinary providers, with a token dashboard and an OpenAI-compatible local forward port.',
+        'ann.pitch': 'Connect the free accounts you already have: Huawei Cloud CodeArts, CodeBuddy / WorkBuddy, Qoder, MiMo, Doubao and more. Log in once and their models appear in the picker as ordinary providers. The plugin itself is not a no-login relay.',
         nav: 'Get It For Free',
         title: 'Get It For Free',
         refresh: 'Refresh roster',
@@ -859,7 +842,6 @@ window.__ModuleLoader__.load({
         'tag.hotTitle': 'One of the most requested free models right now.',
         'tag.fast': 'Fast',
         'tag.fastTitle': 'Quick first token and high throughput — good for long or back-to-back turns.',
-        'tag.kiloChannel': 'Kilo channel · free pool (prompts may be logged by the upstream provider — never send sensitive content)',
         'roster.noLane': 'The co-paid EAC models are unavailable in this composition: the host did not present a recognized desktop or web profile, so the lane is not loaded.',
         'section.models': 'Model roster',
         'section.modelsHint': 'Names and capacities come from the upstream roster and published capability tables; availability is measured from this machine.',
@@ -1006,9 +988,7 @@ window.__ModuleLoader__.load({
         'forward.lanUrl': 'Network URL',
         'forward.lanNoAddress': 'No network IPv4 address was detected',
         'forward.lanAlso': 'Also reachable at {list}',
-        'pref.enabled': 'Enable free models',
         'pref.exposeRegion': 'Show region-limited models',
-        'pref.hideFreeModels': 'Hide anonymous and Kilo free models',
         'pref.hideEacModels': 'Hide EAC models',
         'visibility.showModel': 'Show in model picker',
         'visibility.hidden': 'Hidden',
@@ -1034,7 +1014,7 @@ window.__ModuleLoader__.load({
         'ann.later': 'Later',
         'ann.page': 'Page {n} of {total}',
         'ann.openSettings': 'Open settings',
-        'ann.p1': 'No credentials: install and use it — no sign-up, no API key to paste.',
+        'ann.p1': 'Accounts required: models come from credentials you supply; this plugin is not a no-login relay.',
         'ann.p2': 'The roster follows upstream: models, context lengths and capabilities are re-fetched on every refresh.',
         'ann.p3': 'Honest capability claims: anything a probe cannot confirm stays hidden, and each effort level is a real output budget.',
         'ann.n1': 'Two new models are live on the EAC lane, relayed from OpenCode’s free tier: DeepSeek V4.1 Flash Free and GLM 5.3 Flash Free.',
@@ -1345,19 +1325,6 @@ window.__ModuleLoader__.load({
         'ms.stale': 'kept last snapshot',
         'ms.empty': 'no channel to sync right now',
         'ms.hint': 'read-only: your own model toggles are never touched',
-        'fpool.title': 'Free pool',
-        'fpool.sub': 'Free lanes folded into one row, ranked by measured behaviour',
-        'fpool.on': 'on',
-        'fpool.off': 'off',
-        'fpool.candidates': 'candidates',
-        'fpool.benched': 'cooling',
-        'fpool.cooling': 'cooling down',
-        'fpool.empty': 'no free lane is available on this machine',
-        'fpool.enable': 'Enable pool',
-        'fpool.disable': 'Disable pool',
-        'fpool.clear': 'Clear cooldowns',
-        'fpool.cleared': 'Cooldowns cleared',
-        'fpool.hint': 'only this plugin’s own free lanes — a lane that bills per token never enters the pool',
         'gw.models': 'Servable models',
         'gw.portNote': 'The port can be moved with the DSH_OPENAI_GATEWAY_PORT environment variable.',
         'gw.relayTitle': 'LAN relay (this plugin\'s)',
@@ -1575,7 +1542,6 @@ window.__ModuleLoader__.load({
         'routing.enabled': 'Enabled',
         'routing.channel.free': 'Free lane',
         'routing.channel.eac': 'EAC co-paid',
-        'routing.channel.kilo': 'Kilo',
         'routing.channel.aggregate': 'Aggregate',
         'routing.channel.combo': 'Chain',
         'gw.clientsTitle': 'Connect a client',
@@ -4457,97 +4423,6 @@ function sameChannelTransport(left, right) {
         h('p', { className: 'ofm_note' }, t('ms.hint')))
     }
 
-    /**
-     * 免费池（`free:auto`）的卡片。
-     *
-     * 池子只做一件事：把本插件自己服务的免费车道排成一条队，按实测成功率与
-     * 首字延迟打分，刚失败过的车道进冷却、排到队尾。所以这一屏必须回答三个
-     * 问题——下一轮会先用谁、谁在冷却、为什么。排序不在前端算：后端 `status`
-     * 读的就是适配器下一次真会拨的那个目录，面板和实际行为不许有两套排序。
-     *
-     * 冷却在前端只做倒计时显示，不自己判断过期：过期由后端在下次排序时清掉，
-     * 前端早一秒晚一秒无所谓，自己算反而会出现「面板说好了、实际还在罚站」。
-     */
-    function PoolCard(props) {
-      const { t } = props
-      const [state, setState] = useState(undefined)
-      const [busy, setBusy] = useState(false)
-      const [failure, setFailure] = useState('')
-      const [now, setNow] = useState(() => Date.now())
-      const load = useCallback(async () => {
-        try {
-          const value = await api('/free-pool', { timeout: 8000 })
-          setState(value ?? {})
-          setNow(Date.now())
-        } catch (error) { setFailure(String(error?.message ?? error).slice(0, 160)) }
-      }, [])
-      useEffect(() => { void load() }, [load])
-      // 冷却是有期限的，一屏不刷新的倒计时会永远停在「还有 9 分钟」。
-      useEffect(() => {
-        const timer = setInterval(() => { setNow(Date.now()); void load() }, 15000)
-        return () => { clearInterval(timer) }
-      }, [load])
-      const info = state ?? {}
-      const rows = Array.isArray(info.candidates) ? info.candidates : []
-      const enabled = info.enabled !== false
-      const benchCount = rows.filter(row => Number(row.benchedUntil ?? 0) > now).length
-      const toggle = useCallback(async () => {
-        setBusy(true)
-        setFailure('')
-        try {
-          await post('/free-pool', { enabled: !enabled })
-          await load()
-        } catch (error) {
-          setFailure(String(error?.message ?? error).slice(0, 160))
-        } finally { setBusy(false) }
-      }, [enabled, load])
-      const clear = useCallback(async () => {
-        setBusy(true)
-        setFailure('')
-        try {
-          await post('/free-pool/reset', {})
-          await load()
-          showToast({ title: t('fpool.cleared') })
-        } catch (error) {
-          setFailure(String(error?.message ?? error).slice(0, 160))
-        } finally { setBusy(false) }
-      }, [load, t])
-      const remain = until => {
-        const left = Math.max(0, Math.round((Number(until ?? 0) - now) / 1000))
-        if (left <= 0) return '0:00'
-        const mm = Math.floor(left / 60)
-        const ss = String(left % 60).padStart(2, '0')
-        return `${mm}:${ss}`
-      }
-
-      return h('div', { className: 'ofm_chan ofm_glass' },
-        h('div', { className: 'ofm_chanhead' },
-          h('span', { className: 'ofm_chanid' },
-            h('b', null, t('fpool.title')),
-            h('span', null, t('fpool.sub'))),
-          h('span', { className: 'ofm_chanstate' },
-            h('span', { className: `ofm_dot ${enabled ? (benchCount > 0 ? 'warn' : 'ok') : ''}` }),
-            enabled ? t('fpool.on') : t('fpool.off'))),
-        failure === '' ? null : h('p', { className: 'ofm_note' }, failure),
-        h('div', { className: 'ofm_chanmeta' },
-          h('span', null, `${t('fpool.candidates')} `, h('b', null, state === undefined ? '…' : String(rows.length))),
-          h('span', null, `${t('fpool.benched')} `, h('b', null, String(benchCount)))),
-        rows.length === 0
-          ? h('p', { className: 'ofm_note' }, state === undefined ? '…' : t('fpool.empty'))
-          : h('div', { className: 'ofm_chanmeta' },
-            h('span', { className: 'ofm_note', style: { overflowWrap: 'anywhere' } },
-              rows.slice(0, 8).map(row => {
-                const benched = Number(row.benchedUntil ?? 0) > now
-                const label = `${row.rank ?? '·'} ${row.name ?? row.id ?? ''}`
-                return benched ? `${label}（${t('fpool.cooling')} ${remain(row.benchedUntil)}）` : label
-              }).join('　'))),
-        h('div', { className: 'ofm_chanacts' },
-          h(Button, { disabled: busy, onClick: () => void toggle() },
-            enabled ? t('fpool.disable') : t('fpool.enable')),
-          h(Button, { disabled: busy || benchCount === 0, onClick: () => void clear() },
-            t('fpool.clear'))),
-        h('p', { className: 'ofm_note' }, t('fpool.hint')))
-    }
 
     /**
      * 豆包工作（www.doubao.com + 桌面端）的卡片。
@@ -5369,7 +5244,7 @@ function sameChannelTransport(left, right) {
         !available ? h('div', { className: 'ofm_callout' }, h('div', null, t('chan.rpc.unavailable'))) : null,
         !ready && available ? h('div', { className: 'ofm_chanwrap' },
           [0, 1, 2].map(index => h('div', { className: 'ofm_skel', key: index, style: { minHeight: 168 } }))) : null,
-        ready ? h('div', { className: 'ofm_chanwrap' }, [hidden.includes('mimo') ? null : h(MiMoCard, { key: 'mimo', t, onRemove }), hidden.includes('cli-lane') ? null : h(CliLaneCard, { key: 'cli-lane', t, onRemove }), h(GatewayCard, { key: 'gateway', t, rpc: available ? rpc : null }), h(ResignCard, { key: 'resign', t }), h(BuddyCard, { key: 'buddy' }), h(QoderCard, { key: 'qoder' }), h(CodeArtsCard, { key: 'codearts' }), h(ModelSyncCard, { key: 'model-sync', t }), h(PoolCard, { key: 'free-pool', t }), hidden.includes('doubao') ? null : h(ChannelCard, { key: 'doubao', channel: DOUBAO_CHANNEL, status: doubaoStatus, rpc: doubaoRpc, t, onError, onChanged, onRemove }), ...visibleProviders.map(channel => h(ChannelCard, {
+        ready ? h('div', { className: 'ofm_chanwrap' }, [hidden.includes('mimo') ? null : h(MiMoCard, { key: 'mimo', t, onRemove }), hidden.includes('cli-lane') ? null : h(CliLaneCard, { key: 'cli-lane', t, onRemove }), h(GatewayCard, { key: 'gateway', t, rpc: available ? rpc : null }), h(ResignCard, { key: 'resign', t }), h(BuddyCard, { key: 'buddy' }), h(QoderCard, { key: 'qoder' }), h(CodeArtsCard, { key: 'codearts' }), h(ModelSyncCard, { key: 'model-sync', t }), hidden.includes('doubao') ? null : h(ChannelCard, { key: 'doubao', channel: DOUBAO_CHANNEL, status: doubaoStatus, rpc: doubaoRpc, t, onError, onChanged, onRemove }), ...visibleProviders.map(channel => h(ChannelCard, {
           key: channel.id,
           channel,
           status: statuses?.[channel.id],

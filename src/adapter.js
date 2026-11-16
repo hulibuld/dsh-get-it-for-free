@@ -21,15 +21,13 @@ import { applyFingerprint, baseModelId, endpointFor, mintRequestId, sessionForCo
 import { toChatMessages, toClaudeMessages, toResponseInput, toToolDefs, repairToolPairing } from './messages.js'
 import { CODE, UpstreamError, postStreamed } from './http.js'
 import { postSealedStreamed } from './eac.js'
-import { postKiloStreamed } from './kilo.js'
 import { postAggregateStreamed, isAggregateEntry } from './aggregate.js'
-import { finishReason, readStream, sanitizeUsage, windowTokens } from './stream.js'
+import { finishReason, readStream, windowTokens } from './stream.js'
 import { DEFAULT_LEVEL, MIN_BUDGET, budgetFor, defaultEffortFor, effortPatchFor, effortsFor, hasDeclaredEffortMenu, resolveLevel } from './effort.js'
 import { createChannel } from './channel.js'
 import { recoveryPolicy, canRecover, canRecoverSilentStop, recoveryMessages, continuationMessages, checkpointFits, addUsage, createBlockTracker } from './recovery.js'
-import { isEacEntry, isKiloEntry } from './catalog.js'
+import { isEacEntry } from './catalog.js'
 import { isComboEntry, comboChain } from './combos.js'
-import { isPoolEntry, poolCandidates, notePoolFailure } from './freepool.js'
 import { applyTokenSavers, saverConfig } from './token-saver/index.js'
 import { classifyFailure, describeVerdict, shouldAdvance } from './route/classify.js'
 import { FALLBACK_IMAGE_PRICING } from './image-pricing.js'
@@ -210,21 +208,6 @@ export class FreeModelAdapter {
   async * runStream(options, pinned, snapshot) {
     const modelId = baseModelId(options.model)
     const entry = pinned ?? snapshot.catalog.find(candidate => candidate.id === modelId) ?? null
-    if (entry !== null && isPoolEntry(entry)) {
-      const pool = (snapshot.settings ?? {}).freePool ?? {}
-      // The order is computed here rather than stored on the row: the row is
-      // cached in the picker, and an order frozen at listing time would keep
-      // dialing the lane whose quota ran out an hour ago until the next reload.
-      const candidates = pool.enabled === false
-        ? []
-        : poolCandidates(snapshot.catalog, {
-          stats: snapshot.stats,
-          exclude: pool.exclude,
-          limit: pool.limit,
-        }).map(row => row.entry)
-      yield * this.runCombo(options, entry, snapshot, candidates)
-      return
-    }
     if (entry !== null && isComboEntry(entry)) {
       yield * this.runCombo(options, entry, snapshot)
       return
@@ -245,11 +228,8 @@ export class FreeModelAdapter {
    * Once an answer delta has been handed over the answer is the caller's, and a
    * later failure ends the turn the normal way — the single-model recovery path
    * inside `runSingle` still gets its continuation attempt first.
-   *
-   * @param {Array<object>} [chain] - candidates for the free pool, whose order is
-   *   recomputed per turn instead of read from the row. Omitted for a combo.
    */
-  async * runCombo(options, entry, snapshot, chain = null) {
+  async * runCombo(options, entry, snapshot) {
     const settings = snapshot.settings ?? {}
     const started = Date.now()
     const rejectedTurn = attempts => {
@@ -260,12 +240,10 @@ export class FreeModelAdapter {
       yield { type: 'finish', reason: { kind: 'error', failure: { message: 'free ride is switched off in its settings page', code: 'CONFIG_DISABLED' } } }
       return
     }
-    const candidates = chain ?? comboChain(entry, snapshot.catalog)
+    const candidates = comboChain(entry, snapshot.catalog)
     if (candidates.length === 0) {
       rejectedTurn(0)
-      const message = isPoolEntry(entry)
-        ? `the free pool has no lane left to dial: ${(snapshot.settings ?? {}).freePool?.exclude?.length ? 'every candidate is excluded or benched' : 'no free lane is available on this egress'}`
-        : `the chain "${entry.name}" has no model available on this egress`
+const message = `the chain "${entry.name}" has no model available on this egress`
       yield { type: 'finish', reason: { kind: 'error', failure: { message, code: CODE.server } } }
       return
     }
@@ -306,10 +284,6 @@ export class FreeModelAdapter {
       }
       const reason = result.verdict === null || result.verdict === undefined ? 'failed' : describeVerdict(result.verdict)
       tried.push(`${candidate.id} (${reason})`)
-      // Only a pool benches its mistakes: a hand-written chain is the user's own
-      // order, and reordering it behind their back would be a second opinion
-      // they never asked for. The pool exists precisely to learn this.
-      if (isPoolEntry(entry)) notePoolFailure(candidate.id, result.verdict)
       this.deps.warn?.(`get-it-for-free: chain "${entry.name}" advanced past ${candidate.id} — ${reason}`)
     }
     rejectedTurn(candidates.length)
@@ -358,7 +332,6 @@ export class FreeModelAdapter {
     }
 
     const sealed = isEacEntry(entry)
-    const kilo = isKiloEntry(entry)
     const aggregate = isAggregateEntry(entry)
     // The absorbed channels speak the Chat wire regardless of what their ids
     // resemble; only the free lane splits endpoints per model, and an aggregate
@@ -377,32 +350,9 @@ export class FreeModelAdapter {
     let attemptBudget = budget
     let nextIndex = 0
     let totalUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
-    let rejectedInputUsage = false
-    const trustedOutcome = outcome => {
-      // Only this Kilo router has a confirmed inflated multimodal stamp.
-      // Other lanes may advertise a conservative/fallback window, so exceeding
-      // that metadata alone must not erase their otherwise valid accounting.
-      if (!kilo || entry.id !== 'kilo-auto/free' || outcome?.sawUsage !== true) return outcome
-      const usage = sanitizeUsage(outcome.usage, entry.contextWindow)
-      if (usage === outcome.usage) return outcome
-      rejectedInputUsage = true
-      return usage === undefined
-        ? { ...outcome, sawUsage: false, usage: { inputTokens: 0, outputTokens: 0 } }
-        : { ...outcome, usage }
-    }
     const collectUsage = outcome => {
-      const trusted = trustedOutcome(outcome)
+      const trusted = outcome
       totalUsage = addUsage(totalUsage, trusted?.usage, trusted?.sawUsage)
-      // Once one attempt's input is unknown, no sum of the other attempts can
-      // restore an exact prompt/total. Keep decode counts but let the host use
-      // its local input estimate, including after an honest continuation.
-      if (rejectedInputUsage) {
-        totalUsage = {
-          inputTokens: 0,
-          outputTokens: totalUsage.outputTokens,
-          ...totalUsage.reasoningTokens === undefined ? {} : { reasoningTokens: totalUsage.reasoningTokens },
-        }
-      }
       return trusted
     }
     const blocks = createBlockTracker()
@@ -443,7 +393,7 @@ export class FreeModelAdapter {
       // now declare menus too (see `src/catalog.js`), so the gate is the entry
       // rather than the lane — an entry without a menu still keeps the free
       // lane's token-budget behaviour, untouched.
-      if (sealed || kilo || hasDeclaredEffortMenu(entry)) {
+      if (sealed || hasDeclaredEffortMenu(entry)) {
         const patch = effortPatchFor(options.reasoningEffort, entry)
         if (patch !== null) Object.assign(payload, patch)
       }
@@ -473,7 +423,7 @@ export class FreeModelAdapter {
       // caller's tools exactly as declared, so the fingerprint pass is free-lane
       // only. The aggregate lane is somebody else's gateway entirely — renaming
       // its tools to this lane's gate placeholders would break the caller's calls.
-      const renameMap = sealed || kilo || aggregate ? new Map() : applyFingerprint(payload, wire === 'messages' ? 'claude' : style === 'flat')
+      const renameMap = sealed || aggregate ? new Map() : applyFingerprint(payload, wire === 'messages' ? 'claude' : style === 'flat')
       const controller = new AbortController()
       const onAbort = () => controller.abort(options.signal?.reason)
       options.signal?.addEventListener('abort', onAbort, { once: true })
@@ -488,9 +438,7 @@ export class FreeModelAdapter {
       const channel = createChannel()
       const request = (sealed
         ? postSealedTurn(this.deps, payload, controller.signal, value => channel.push(value))
-        : kilo
-          ? postKiloStreamed({ body: payload, signal: controller.signal, onData: value => channel.push(value) })
-          : aggregate
+        : aggregate
             ? postAggregateStreamed({
               config: settings.aggregate ?? {},
               providerId: entry.providerId,
@@ -701,7 +649,7 @@ export class FreeModelAdapter {
         options.signal?.removeEventListener('abort', onAbort)
         controller.abort()
         await request
-        if (!recorded) record(false, trustedOutcome(partialOutcome), { aborted: true })
+        if (!recorded) record(false, partialOutcome, { aborted: true })
         if (!continuationScheduled && !turnRecorded) finishTurn(false, false, attempt + 1)
       }
     }
@@ -811,7 +759,7 @@ function toFailure(error) {
  */
 function wireOf(entry) {
   if (isAggregateEntry(entry)) return entry.wire ?? 'chat'
-  if (isEacEntry(entry) || isKiloEntry(entry)) return 'chat'
+  if (isEacEntry(entry)) return 'chat'
   return wireFor(entry.id)
 }
 

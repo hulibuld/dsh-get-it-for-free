@@ -31,7 +31,7 @@ import { fileURLToPath } from 'node:url'
 import { externalUrl, openExternal } from './src/open-external.js'
 import { ROUTE_LABELS, ROUTE_MAIN, ROUTE_REGION } from './src/adapter.js'
 import { DATA_DIR_NAME, LEGACY_DATA_DIR_NAME, resolveDshHome, publicModelVisibility, validateModelVisibility, isModelHidden } from './src/store.js'
-import { isEacEntry, isKiloEntry } from './src/catalog.js'
+import { isEacEntry } from './src/catalog.js'
 import { generateKey, rankLanAddresses, startForwardServer, startLanRelay } from './src/forward.js'
 import { chanGatewayCredential, chanGatewayEnabled, chanGatewayPort, startChanRelay } from './src/chan-relay.js'
 import { CODE, UpstreamError } from './src/http.js'
@@ -51,7 +51,6 @@ import { rejectionFor, isLoopbackHost, connectionAdmissionView } from './src/tru
 import { resolveAttributionUserAgent } from './adapter/kernel.js'
 import { fetchProviderModels, isAggregateEntry, testProvider } from './src/aggregate.js'
 import { buildComboCatalog, isComboEntry, normalizeCombos } from './src/combos.js'
-import { clearBench, POOL_ID, POOL_NAME } from './src/freepool.js'
 import { getProvider, listProviders } from './src/providers/index.js'
 import { saverConfig } from './src/token-saver/index.js'
 import { CAVEMAN_LEVELS, PONYTAIL_LEVELS } from './src/token-saver/prompts.js'
@@ -471,7 +470,7 @@ export function apply(ctx, config) {
     onSealedUnavailable: () => logger.warn?.('get-it-for-free: the sealed lane is not available in this composition (no recognized host profile); its models stay hidden'),
     onTopology: () => emitTopology(),
   })
-  const { state, adapter, refreshCatalog, refreshAvailability, watchEgress, fetchListing, publicModelRows, syncAggregateCatalog } = modelRuntime
+  const { state, adapter, refreshCatalog, refreshAvailability, watchEgress, publicModelRows, syncAggregateCatalog } = modelRuntime
   const runForwarded = modelRuntime.complete
 
   // ── registration ────────────────────────────────────────────────────────────
@@ -1127,27 +1126,6 @@ export function apply(ctx, config) {
   }
 
   // ── egress outlet ───────────────────────────────────────────────────────────
-  /** One gateway round trip at a time; the panel polls, the throttle decides. */
-  let latencyMeasureInFlight = null
-  /**
-   * The settings page asks "how long does opencode take to answer right now", and
-   * the honest answer is a real round trip through the outlet — not the age of the
-   * last catalog refresh. Re-reading the listing is the cheapest call that proves
-   * the whole path (it is the same request the catalog uses, and free), so it is
-   * reused here, throttled so a panel left open cannot turn into a loop.
-   */
-  async function measureGatewayLatency() {
-    if (modelRuntime.gatewayLatency.at !== 0 && Date.now() - modelRuntime.gatewayLatency.at < 60_000) return
-    if (latencyMeasureInFlight !== null) return await latencyMeasureInFlight.catch(() => {})
-    const run = fetchListing()
-      .then(() => {})
-      .catch(error => {
-        logger.debug?.(`get-it-for-free: gateway latency reading failed (${error?.message ?? error})`)
-      })
-    latencyMeasureInFlight = run
-    try { await run } finally { if (latencyMeasureInFlight === run) latencyMeasureInFlight = null }
-  }
-
   /**
    * Which node the outlet is carrying traffic on, and what it costs to reach the
    * gateway through it. Purely informational: every failure is a missing reading,
@@ -1160,7 +1138,6 @@ export function apply(ctx, config) {
       outletNode = { node: '', delayMs: 0, at: 0 }
       return { node: '', nodeDelayMs: 0, nodeAt: 0, latencyMs: 0, latencyAt: 0 }
     }
-    await measureGatewayLatency().catch(() => {})
     const selection = await readOutletSelection(relay).catch(() => null)
     // A settled read is cached for `/summary`, which cannot await a round trip.
     if (outletRelay === relay) {
@@ -1621,56 +1598,6 @@ export function apply(ctx, config) {
         return { combos: rows, usable: catalog.filter(isComboEntry).map(publicCombo) }
       },
     },
-    // ── the free pool ───────────────────────────────────────────────────────
-    // Named `freePool`, not `pool`: `deps.pool` is already the channel pack's
-    // account-pool snapshot (see `fetchPoolSnapshot`), and two different pools
-    // under one key would silently swap which one the panel is reading.
-    freePool: {
-      // The order is read from the runtime, not recomputed here: the panel has to
-      // show exactly the list the next turn would dial, or the first thing a user
-      // does after a bad turn is doubt the panel.
-      status: () => {
-        const current = settings.get().freePool ?? {}
-        return {
-          ...modelRuntime.poolStatus(),
-          name: String(current.name ?? ''),
-          exclude: Array.isArray(current.exclude) ? current.exclude : [],
-          limit: Number(current.limit) || 8,
-        }
-      },
-      save: async patch => {
-        if (patch === null || typeof patch !== 'object') throw httpError(400, 'the request body must be a JSON object')
-        const current = settings.get().freePool ?? {}
-        const next = { ...current }
-        if (patch.enabled !== undefined) next.enabled = patch.enabled !== false
-        if (patch.name !== undefined) {
-          if (typeof patch.name !== 'string' || patch.name.length > 60) throw httpError(400, 'name must be a string of at most 60 characters')
-          next.name = patch.name.trim()
-        }
-        if (patch.exclude !== undefined) {
-          if (!Array.isArray(patch.exclude) || patch.exclude.length > 500
-            || patch.exclude.some(id => typeof id !== 'string' || id.length > 300)) {
-            throw httpError(400, 'exclude must be an array of model ids')
-          }
-          next.exclude = [...new Set(patch.exclude.map(id => id.trim()).filter(id => id !== ''))]
-        }
-        if (patch.limit !== undefined) {
-          const limit = Number(patch.limit)
-          if (!Number.isFinite(limit) || limit < 1 || limit > 32) throw httpError(400, 'limit must be between 1 and 32')
-          next.limit = Math.trunc(limit)
-        }
-        settings.update({ freePool: next })
-        settings.flush()
-        // The row's capabilities are the intersection of its candidates, so the
-        // merged view has to be rebuilt before the picker is told it changed.
-        syncAggregateCatalog()
-        return { freePool: next }
-      },
-      reset: () => {
-        clearBench()
-        return { ok: true }
-      },
-    },
     // ── token savers ────────────────────────────────────────────────────────
     tokenSaver: {
       get: () => ({ ...publicTokenSaver(settings.get().tokenSaver), savings: buildStats(stats.get(), state().catalog).savings }),
@@ -2023,9 +1950,6 @@ export function apply(ctx, config) {
   // which floored every interval below an hour *including the shipped default of
   // 15*, so the number on the settings page was silently ignored.
   every(() => {
-    // 免费模型整体关掉（hideAllModels）时，目录探测已经没有意义：模型不会进
-    // 任何 provider，只会白跑网络。这里直接跳过，省掉每 15 分钟一轮的请求。
-    if (settings.get().hideAllModels === true || settings.get().freeChannelsEnabled !== true) return
     void (async () => {
       await watchEgress()
       await refreshCatalog({ probe: true })
@@ -2781,18 +2705,6 @@ export function createApiRoutes(deps) {
           return send(404, { error: `pool unavailable (${reason})` })
         }
       }
-      // The free pool is this plugin's own lane ranking, distinct from the
-      // account pool above: `/pool` answers "which accounts does the pack hold",
-      // `/free-pool` answers "which free model will the next turn dial, and why".
-      if (method === 'GET' && routePath === '/free-pool') {
-        return send(200, deps.freePool.status())
-      }
-      if (method === 'POST' && routePath === '/free-pool') {
-        return send(200, { ok: true, ...await deps.freePool.save(await readJson(req)) })
-      }
-      if (method === 'POST' && routePath === '/free-pool/reset') {
-        return send(200, deps.freePool.reset())
-      }
       if (method === 'GET' && routePath === '/announcement') {
         // A managed install also stands down the owner's onboarding copy: the
         // pack, not the plugin, speaks for what is new.
@@ -3378,7 +3290,7 @@ function buildSummary(deps) {
   // and the aggregate lane are named by a listing round that already succeeded,
   // and a combo is a view over rows that were themselves named — none of them is
   // pinged. A listing is not an inference verdict; explicit tests add their own samples.
-  const unprobed = entry => isEacEntry(entry) || isKiloEntry(entry) || isAggregateEntry(entry) || isComboEntry(entry)
+  const unprobed = entry => isEacEntry(entry) || isAggregateEntry(entry) || isComboEntry(entry)
   return {
     catalog: state.catalog.map(entry => ({
       ...entry,

@@ -1,25 +1,22 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { FreeModelAdapter, ROUTE_MAIN, ROUTE_REGION } from '../adapter.js'
-import { buildCatalog, buildEacCatalog, buildKiloCatalog, isEacEntry, isKiloEntry, parseListing, reviveKiloCatalog } from '../catalog.js'
+import { buildEacCatalog, isEacEntry, parseListing } from '../catalog.js'
 import { buildAggregateCatalog, isAggregateEntry } from '../aggregate.js'
 import { buildComboCatalog, isComboEntry, normalizeCombos, pruneRotation } from '../combos.js'
-import { buildPoolEntry, POOL_ID, poolCandidates, poolStatus } from '../freepool.js'
-import { JsonStore, SETTINGS_INITIAL, STATS_INITIAL, STATS_VERSION, migrateStats, pruneDays, recordTurn, recordUsage, isModelHidden } from '../store.js'
+import { JsonStore, RETIRED_SETTINGS, SETTINGS_INITIAL, STATS_INITIAL, STATS_VERSION, migrateSettings, migrateStats, pruneDays, recordTurn, recordUsage, isModelHidden } from '../store.js'
 import { STATE, detectEgress, probeCatalog } from '../probe.js'
-import { CODE, UpstreamError, getJson } from '../http.js'
+import { CODE, UpstreamError } from '../http.js'
 import { runModelTest, modelAvailability } from '../model-test.js'
 import { DEFAULT_LEVEL } from '../effort.js'
 import { fetchSealedListing } from '../eac.js'
-import { fetchKiloListing } from '../kilo.js'
-import { sessionForConversation } from '../upstream.js'
 import { createForwardCompletion, publicModelRows } from './completion.js'
 
-const FALLBACK_CATALOG = buildCatalog([
-  'mimo-v2.6-flash-free', 'mimo-v2.5-free', 'ling-3.0-flash-fin-free',
-  'nemotron-3-ultra-free', 'nemotron-3.5-lightning-free', 'space-bunny-free',
-  'muse-spark-1.3-contributor-free', 'muse-spark-1.2-contributor-free',
-])
+// 这个插件只做「登录账号之后的渠道」。没有凭据就能调的匿名清单与 Kilo 车道
+// 已经整条拆除：它们的模型不需要任何账号，与这里其余的每一条车道都不是同类，
+// 混在一个选择器里既说不清来源，也没法回答「这个模型能用，凭的是哪个账号」。
+// 于是 MODEL_ROWS 恒为空，catalog 只由下面三条有凭据的车道组成：
+// sealed（EAC，GitHub 授权后解锁）、aggregate（用户自己的 key）、combo（链）。
 
 /** 路径由产品入口决定；核心不解析 DSH_HOME，也不发现宿主服务。 */
 export function createRuntimeStores({ dataDir, logger = console }) {
@@ -40,9 +37,11 @@ export function createRuntimeStores({ dataDir, logger = console }) {
   const settings = new JsonStore(settingsPath, settingsInitial, {
     log: message => logger.warn?.(message),
   })
+  // 3.3.0 拆掉免登录车道后，旧文件里的四个键已经没有读者；清一次，之后不会再出现。
+  if (RETIRED_SETTINGS.some(key => Object.hasOwn(settings.get(), key))) settings.edit(migrateSettings)
   const stats = open('stats.json', STATS_INITIAL)
   const availability = open('availability.json', { version: 1, at: 0, egress: null, results: {} })
-  const catalogStore = open('catalog.json', { version: 1, at: 0, entries: FALLBACK_CATALOG.map(entry => entry.id) })
+  const catalogStore = open('catalog.json', { version: 1, at: 0, entries: [] })
   if (stats.get().version !== STATS_VERSION) stats.edit(migrateStats)
   return {
     settings, stats, availability, catalogStore,
@@ -65,16 +64,13 @@ export function createModelRuntime({
   onSealedUnavailable = () => {},
   onTopology = () => {},
 }) {
-  let catalog = materializeCatalog(catalogStore.get().entries ?? [])
+  let catalog = []
   let sealedCatalog = sealedCredential() === null ? [] : buildEacCatalog(catalogStore.get().sealIds ?? [])
-  let kiloCatalog = reviveKiloCatalog(catalogStore.get().kiloRows)
   /** The aggregate lane: one row per enabled provider/model the user configured.
    *  Derived from settings, not from a listing, so it is rebuilt on every merge. */
   let aggregateCatalog = []
   /** The virtual rows a combo contributes; rebuilt last, after every real lane. */
   let comboCatalog = []
-  /** The free lane's own roster: the base every other lane is merged onto. */
-  let freeCatalog = catalog
   let egress = availability.get().egress ?? null
   let gatewayLatency = { ms: 0, at: 0 }
   let disposed = false
@@ -96,21 +92,10 @@ export function createModelRuntime({
   const rebuildCatalog = () => {
     const seen = new Set()
     const merged = []
-    for (const entry of [...freeCatalog, ...sealedCatalog, ...kiloCatalog, ...aggregateCatalog]) {
+    for (const entry of [...sealedCatalog, ...aggregateCatalog]) {
       if (entry === null || entry === undefined || seen.has(entry.id)) continue
       seen.add(entry.id)
       merged.push(entry)
-    }
-    // The free pool sits above the chains and below every real lane: it is a
-    // view over the rows above it, so it cannot exist before them, and a chain
-    // that wants to reference it would be referencing a view of itself.
-    const pool = settings.get().freePool ?? {}
-    if (pool.enabled !== false) {
-      const candidates = poolCandidates(merged, { stats: stats.get(), exclude: pool.exclude, limit: pool.limit })
-      if (candidates.length > 0 && !seen.has(POOL_ID)) {
-        seen.add(POOL_ID)
-        merged.push(buildPoolEntry({ candidates, name: pool.name }))
-      }
     }
     const combos = normalizeCombos(settings.get().combos)
     comboCatalog = buildComboCatalog(combos, merged)
@@ -132,8 +117,7 @@ export function createModelRuntime({
     membership: computeMembership(catalog, availability.get(), settings.get()),
     settings: settings.get(),
     attributionUserAgent,
-    // The pool ranks lanes by what they did, so the adapter needs the same
-    // numbers the stats page shows. One read per turn, same store, no copy.
+    // 面板与请求共用同一份计数：一次读取，同一个 store，不做副本。
     stats: stats.get(),
   })
   const emitTopology = () => { if (!disposed) onTopology() }
@@ -185,25 +169,10 @@ export function createModelRuntime({
     }
   }
 
+  // 一次刷新只做一件事：问有凭据的那条车道要清单，再合并。没有匿名清单可拉，
+  // 所以这里不再有一次「免费模型目录」的网络往返。
   async function refreshCatalogOnce({ probe, force }) {
-    let ids = []
-    try {
-      ids = parseListing(await fetchListing())
-    } catch (error) {
-      if (!disposed) logger.warn?.(`get-it-for-free: model listing refresh failed (${error?.message ?? error}); keeping the cached catalog`)
-    }
-    if (disposed) return catalog
-    if (ids.length > 0) {
-      freeCatalog = buildCatalog(ids)
-      catalogStore.update({ at: Date.now(), entries: freeCatalog.map(entry => entry.id) })
-      catalogStore.flush()
-      settings.update({ catalogSyncedAt: Date.now() })
-    } else {
-      freeCatalog = materializeCatalog(catalogStore.get().entries ?? [])
-    }
     await refreshSealedRoster()
-    if (disposed) return catalog
-    await refreshKiloRoster()
     if (disposed) return catalog
     mergeCatalogs()
     if (probe) await refreshAvailability(force)
@@ -249,30 +218,6 @@ export function createModelRuntime({
     emitTopology()
   }
 
-  async function refreshKiloRoster() {
-    try {
-      const payload = await fetchKiloListing({ signal: lifetime.signal })
-      if (disposed) return
-      if (payload?.error || !Array.isArray(payload?.data)) throw new Error('invalid Kilo model listing')
-      kiloCatalog = buildKiloCatalog(payload.data)
-      catalogStore.update({ kiloRows: kiloCatalog })
-    } catch (error) {
-      if (!disposed) logger.warn?.(`get-it-for-free: Kilo channel listing failed (${error?.code ?? error?.message ?? 'unknown'}); keeping its cached roster`)
-    }
-  }
-
-  async function fetchListing() {
-    if (disposed) return { data: [] }
-    const started = Date.now()
-    const listing = await getJson('/inference/v1/models', {
-      session: sessionForConversation('catalog:get-it-for-free'),
-      attributionUserAgent,
-      signal: lifetime.signal,
-    })
-    if (!disposed) gatewayLatency = { ms: Date.now() - started, at: Date.now() }
-    return listing
-  }
-
   let probeRound = null
   let probeThrottleStreak = 0
   let probeBackoffUntil = 0
@@ -284,9 +229,13 @@ export function createModelRuntime({
     // for a sharper reason — a probe there is a *real request to a provider the
     // user pays for*, spent to learn something the settings page already knows
     // (whether a key is configured). A combo is excluded because it has no
-    // endpoint of its own: probing one would send the chain's own id to the free
-    // lane as a model name, spending quota to collect a verdict about nothing.
-    const probeable = catalog.filter(entry => !isEacEntry(entry) && !isKiloEntry(entry) && !isAggregateEntry(entry) && !isComboEntry(entry))
+    // endpoint of its own: probing one would send the chain's own id to a lane as
+    // a model name, spending quota to collect a verdict about nothing.
+    //
+    // 拆掉匿名车道之后这个集合就是空的：剩下每条车道都有凭据，健康度由它自己的
+    // 账号与上游决定，用一个匿名探针去替它下判断没有意义。探针框架留着，是为了
+    // 入口那边的「重新探测」按钮还有个确定的行为（一轮空探测，不改任何结论）。
+    const probeable = catalog.filter(entry => !isEacEntry(entry) && !isAggregateEntry(entry) && !isComboEntry(entry))
     const results = await probeCatalog(probeable, { attributionUserAgent, signal: lifetime.signal }, (id, result) => {
       if (disposed) return
       availability.edit(value => ({
@@ -383,25 +332,18 @@ export function createModelRuntime({
   }
 
   return {
-    testModel, state, adapter, refreshCatalog, refreshSealedLane, refreshAvailability, watchEgress, fetchListing,
+    testModel, state, adapter, refreshCatalog, refreshSealedLane, refreshAvailability, watchEgress,
     complete: createForwardCompletion({
       adapter, signal: lifetime.signal,
       state: () => {
         const snapshot = state()
         // Hiding advertisements must not invalidate requests using a saved id.
         return { ...snapshot, membership: computeMembership(snapshot.catalog, availability.get(), {
-          ...snapshot.settings, hiddenModelIds: [], hideFreeModels: false, hideEacModels: false,
+          ...snapshot.settings, hiddenModelIds: [], hideEacModels: false,
         }) }
       },
     }),
     publicModelRows: () => publicModelRows(state()),
-    // The pool's ranking, including the benched lanes and why they are benched.
-    // Read straight from the same catalog the adapter dials, so the panel cannot
-    // disagree with what the next turn would actually do.
-    poolStatus() {
-      const pool = settings.get().freePool ?? {}
-      return poolStatus(state().catalog, { stats: stats.get(), exclude: pool.exclude, limit: pool.limit, enabled: pool.enabled !== false })
-    },
     // A settings write that changes the aggregate lane or the chains (a key
     // saved, a provider switched off, a combo edited) rebuilds the merged view
     // without a listing round: the aggregate rows come from settings alone.
@@ -424,16 +366,9 @@ export function createModelRuntime({
   }
 }
 
-function materializeCatalog(ids) {
-  const rebuilt = buildCatalog(ids)
-  return rebuilt.length > 0 ? rebuilt : FALLBACK_CATALOG
-}
-
 export function computeMembership(catalog, availabilitySnapshot, settings) {
-  // 免费模型组默认关闭：只有当用户显式把 freeChannelsEnabled 设成 true 时，
-  // 这两个聚合 provider 才会往模型选择器里投放模型。默认返回空集合，选择器
-  // 按「0 模型」把分组隐藏，所以全新安装不会再出现一长列免费模型。
-  if (settings?.freeChannelsEnabled !== true) return {}
+  // 进到这里的每一条车道都已经过了凭据判定（账号池、聚合 key、链），所以不再有
+  // 「整组隐藏」的开关：有凭据就投放，没凭据的车道根本不在 catalog 里。
   const expose = settings?.exposeRegionModels !== false
   const verdictOf = entry => modelAvailability(entry.id, availabilitySnapshot, Boolean(entry.channel)).availability
   const probeable = catalog.filter(entry => !entry.channel)
