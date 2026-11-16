@@ -404,6 +404,8 @@ window.__ModuleLoader__.load({
         'chan.act.add': '添加账号',
         'chan.hide': '把这张卡收起来',
         'chan.hide.hint': '只是从这一页收起来：账号、令牌、模型都留着，随时加回来',
+        'chan.empty.title': '未接入渠道',
+        'chan.empty.sub': '还没登录账号的渠道，点开可以接进来',
         'chan.add.title': '添加渠道',
         'chan.add.sub': '点一个加回页面上',
         'chan.add.none': '全部渠道都在页面上',
@@ -1161,6 +1163,8 @@ window.__ModuleLoader__.load({
         'chan.act.add': 'Add account',
         'chan.hide': 'Put this card away',
         'chan.hide.hint': 'Only hides the card on this page: accounts, tokens and models stay, and the ✚ brings it back',
+        'chan.empty.title': 'Not connected yet',
+        'chan.empty.sub': 'Channels with no account signed in — expand to connect one',
         'chan.add.title': 'Add channel',
         'chan.add.sub': 'Pick one to bring it back',
         'chan.add.none': 'Every channel is already on the page',
@@ -4910,10 +4914,17 @@ function sameChannelTransport(left, right) {
       // 有账号的渠道排前面：十几个空渠道卡压在顶上，每次都得往下扒拉才找得到
       // 自己在用的那几张。statuses 还没回来时保持原顺序，免得卡片先乱跳一遍；
       // Array.prototype.sort 是稳定的，同组内仍是固定顺序。
-      const hasAccount = row => (statuses?.[row.id]?.accounts?.enabled ?? 0) > 0 ? 0 : 1
+      const hasAccount = row => (statuses?.[row.id]?.accounts?.enabled ?? 0) > 0
       const visibleProviders = CHANNEL_PROVIDERS
         .filter(row => !hidden.includes(row.id))
-        .sort((a, b) => hasAccount(a) - hasAccount(b))
+        .sort((a, b) => Number(hasAccount(b)) - Number(hasAccount(a)))
+      // 没接账号的渠道默认不占版面：渠道包自带十来个渠道，空卡跟已登录的同类
+      // 渠道（WorkBuddy 国内/国际版这种）长得一样，摆在一起就是「重复的空卡」。
+      // 它们收进「未接入渠道」，点一下才摊开——想接新的随时能接，平时不碍事。
+      // statuses 还没回来时先全摆出来，否则首屏会像卡全丢了。
+      const [showEmpty, setShowEmpty] = useState(false)
+      const filledProviders = statuses === undefined ? visibleProviders : visibleProviders.filter(hasAccount)
+      const emptyProviders = statuses === undefined ? [] : visibleProviders.filter(row => !hasAccount(row))
       // 「＋ 添加渠道」列的是所有可收起的卡：两张固定卡 + 每个渠道。
       const hideableCards = [...FIXED_CARDS, ...CHANNEL_PROVIDERS]
       const hiddenProviders = hideableCards.filter(row => hidden.includes(row.id))
@@ -5010,7 +5021,7 @@ function sameChannelTransport(left, right) {
 
       // 计数只数页面上还在的卡：收起的那几张不参与分母，否则会出现「4/11」这种
       // 永远补不齐的数字。两张固定卡（MiMo、CodeBuddy CLI）也只在没被收起时算。
-      const connected = statuses === undefined ? 0 : visibleProviders.filter(row => (statuses[row.id]?.accounts?.enabled ?? 0) > 0).length
+      const connected = statuses === undefined ? 0 : filledProviders.length
       const failed = !ready && pack.state === 'failed'
 
       // 风险告知：没接受过就先把整页挡住。接受后写进设置，之后不再打扰。
@@ -5037,7 +5048,7 @@ function sameChannelTransport(left, right) {
               h('p', { className: 'ofm_pagesub' }, t('chan.sub'))),
             h('div', { className: 'ofm_pills' },
               h(Pill, { strong: true, tone: ready ? 'ok' : failed ? 'err' : 'warn' },
-                ready ? `${connected}/${visibleProviders.length} ${t('chan.state.on')}` : t('chan.state.off')),
+                ready ? `${connected}/${filledProviders.length} ${t('chan.state.on')}` : t('chan.state.off')),
               h(Pill, null, `${t('chan.meta.accounts')} ${statuses === undefined ? '—' : visibleProviders.reduce((sum, row) => sum + (statuses[row.id]?.accounts?.enabled ?? 0), 0)}`))),
           auto == null ? null : h('div', { className: 'ofm_row' },
             h(Switch, { checked: auto.enabled === true, label: t('chan.auto.title'), onChange: () => void toggleAuto() }),
@@ -5049,7 +5060,7 @@ function sameChannelTransport(left, right) {
         !available ? h('div', { className: 'ofm_callout' }, h('div', null, t('chan.rpc.unavailable'))) : null,
         !ready && available ? h('div', { className: 'ofm_chanwrap' },
           [0, 1, 2].map(index => h('div', { className: 'ofm_skel', key: index, style: { minHeight: 168 } }))) : null,
-        ready ? h('div', { className: 'ofm_chanwrap' }, [hidden.includes('mimo') ? null : h(MiMoCard, { key: 'mimo', t, onRemove }), hidden.includes('cli-lane') ? null : h(CliLaneCard, { key: 'cli-lane', t, onRemove }), h(GatewayCard, { key: 'gateway', t, rpc: available ? rpc : null }), h(ResignCard, { key: 'resign', t }), h(ModelSyncCard, { key: 'model-sync', t }), hidden.includes('doubao') ? null : h(ChannelCard, { key: 'doubao', channel: DOUBAO_CHANNEL, status: doubaoStatus, rpc: doubaoRpc, t, onError, onChanged, onRemove }), ...visibleProviders.map(channel => h(ChannelCard, {
+        ready ? h('div', { className: 'ofm_chanwrap' }, [hidden.includes('mimo') ? null : h(MiMoCard, { key: 'mimo', t, onRemove }), hidden.includes('cli-lane') ? null : h(CliLaneCard, { key: 'cli-lane', t, onRemove }), h(GatewayCard, { key: 'gateway', t, rpc: available ? rpc : null }), h(ResignCard, { key: 'resign', t }), h(ModelSyncCard, { key: 'model-sync', t }), hidden.includes('doubao') ? null : h(ChannelCard, { key: 'doubao', channel: DOUBAO_CHANNEL, status: doubaoStatus, rpc: doubaoRpc, t, onError, onChanged, onRemove }), ...filledProviders.map(channel => h(ChannelCard, {
           key: channel.id,
           channel,
           status: statuses?.[channel.id],
@@ -5059,6 +5070,27 @@ function sameChannelTransport(left, right) {
           onChanged,
           onRemove,
         }))]) : null,
+        // 未接入的渠道：默认折叠成一行，点开才摊成卡片。它们不参与上面的
+        // 「已连接/总数」计数，避免出现 4/11 那种永远补不齐的数字。
+        ready && emptyProviders.length > 0 ? h('div', { className: 'ofm_addzone' },
+          h('button', {
+            type: 'button',
+            className: 'ofm_btn ofm_addbtn',
+            'aria-expanded': showEmpty ? 'true' : 'false',
+            title: t('chan.empty.sub'),
+            onClick: () => setShowEmpty(value => !value),
+          }, `${showEmpty ? '－' : '＋'} ${t('chan.empty.title')} (${emptyProviders.length})`),
+          showEmpty ? h('div', { className: 'ofm_chanwrap', style: { marginTop: 12 } },
+            emptyProviders.map(channel => h(ChannelCard, {
+              key: channel.id,
+              channel,
+              status: statuses?.[channel.id],
+              rpc: available ? rpc : null,
+              t,
+              onError,
+              onChanged,
+              onRemove,
+            }))) : null) : null,
         // 页面最底下的「＋」：把收起来的卡加回来。名单就在这一行，一眼看到自己
         // 藏了什么，不用去设置里翻。
         ready ? h('div', { className: 'ofm_addzone' },
