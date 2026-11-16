@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { FreeModelAdapter, ROUTE_MAIN, ROUTE_REGION } from '../adapter.js'
-import { buildEacCatalog, isEacEntry, parseListing } from '../catalog.js'
+import { isEacEntry } from '../catalog.js'
 import { buildAggregateCatalog, isAggregateEntry } from '../aggregate.js'
 import { buildComboCatalog, isComboEntry, normalizeCombos, pruneRotation } from '../combos.js'
 import { JsonStore, RETIRED_SETTINGS, SETTINGS_INITIAL, STATS_INITIAL, STATS_VERSION, migrateSettings, migrateStats, pruneDays, recordTurn, recordUsage, isModelHidden } from '../store.js'
@@ -9,7 +9,6 @@ import { STATE, detectEgress, probeCatalog } from '../probe.js'
 import { CODE, UpstreamError } from '../http.js'
 import { runModelTest, modelAvailability } from '../model-test.js'
 import { DEFAULT_LEVEL } from '../effort.js'
-import { fetchSealedListing } from '../eac.js'
 import { createForwardCompletion, publicModelRows } from './completion.js'
 
 // 这个插件只做「登录账号之后的渠道」。没有凭据就能调的匿名清单与 Kilo 车道
@@ -65,7 +64,10 @@ export function createModelRuntime({
   onTopology = () => {},
 }) {
   let catalog = []
-  let sealedCatalog = sealedCredential() === null ? [] : buildEacCatalog(catalogStore.get().sealIds ?? [])
+  // 3.3.4: 免登录车道整条拆掉。这里以前会把 catalog.json 里缓存的 sealIds 复活成
+  // 「免登录免费模型」，于是删掉车道之后选择器里还留着一排 amd/、opencode/-free。
+  // 现在恒为空，且下面 refreshSealedRoster 不再联网、不再写缓存。
+  let sealedCatalog = []
   /** The aggregate lane: one row per enabled provider/model the user configured.
    *  Derived from settings, not from a listing, so it is rebuilt on every merge. */
   let aggregateCatalog = []
@@ -181,32 +183,11 @@ export function createModelRuntime({
   }
 
   async function refreshSealedRoster() {
-    const credential = sealedCredential()
-    if (credential === null) {
-      sealedCatalog = []
-      onSealedUnavailable()
-      return
-    }
-    try {
-      const ids = parseListing(await fetchSealedListing(credential, { signal: lifetime.signal }))
-      if (disposed) return
-      // 独立应用授权变更时，旧账号正在返回的清单不得覆盖新状态。
-      if (Object.hasOwn(credential, 'userToken') && sealedCredential()?.userToken !== credential.userToken) return
-      if (ids.length > 0) {
-        sealedCatalog = buildEacCatalog(ids)
-        catalogStore.update({ sealIds: sealedCatalog.map(entry => entry.id) })
-      }
-    } catch (error) {
-      if (disposed) return
-      if (Object.hasOwn(credential, 'userToken') && sealedCredential()?.userToken !== credential.userToken) return
-      if (error?.code === CODE.credential) {
-        sealedCatalog = []
-        catalogStore.update({ sealIds: [] })
-        logger.warn?.('get-it-for-free: the sealed lane refused its credential; its models are hidden until it is accepted again')
-        return
-      }
-      logger.warn?.(`get-it-for-free: sealed lane listing failed (${error?.code ?? 'unknown'}); keeping its cached roster`)
-    }
+    // 免登录车道已下线：不读凭据、不拉清单、不写缓存，只把残留清干净。
+    if (sealedCatalog.length > 0) sealedCatalog = []
+    const stale = catalogStore.get().sealIds
+    if (Array.isArray(stale) && stale.length > 0) catalogStore.update({ sealIds: [] })
+    onSealedUnavailable()
   }
 
   async function refreshSealedLane() {
