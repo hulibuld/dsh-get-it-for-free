@@ -4907,7 +4907,13 @@ function sameChannelTransport(left, right) {
         return () => { alive = false }
       }, [])
       const hidden = hiddenChannels ?? []
-      const visibleProviders = CHANNEL_PROVIDERS.filter(row => !hidden.includes(row.id))
+      // 有账号的渠道排前面：十几个空渠道卡压在顶上，每次都得往下扒拉才找得到
+      // 自己在用的那几张。statuses 还没回来时保持原顺序，免得卡片先乱跳一遍；
+      // Array.prototype.sort 是稳定的，同组内仍是固定顺序。
+      const hasAccount = row => (statuses?.[row.id]?.accounts?.enabled ?? 0) > 0 ? 0 : 1
+      const visibleProviders = CHANNEL_PROVIDERS
+        .filter(row => !hidden.includes(row.id))
+        .sort((a, b) => hasAccount(a) - hasAccount(b))
       // 「＋ 添加渠道」列的是所有可收起的卡：两张固定卡 + 每个渠道。
       const hideableCards = [...FIXED_CARDS, ...CHANNEL_PROVIDERS]
       const hiddenProviders = hideableCards.filter(row => hidden.includes(row.id))
