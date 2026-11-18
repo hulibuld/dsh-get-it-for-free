@@ -1324,7 +1324,12 @@ export async function runSelfTest({ cliPath, token = '', timeoutMs = 90_000 } = 
  *   empty list means "just use the account the CLI is signed into".
  * @returns `{ adapter, status, probe, dispose }`.
  */
-export function createCliLane({ logger = console, loadAccounts } = {}) {
+export function createCliLane({ logger = console, loadAccounts, enabled } = {}) {
+  /**
+   * 车道总开关。关掉时这条路由一条模型都不投放：用户要的是「这条通道别出现在
+   * 选择器里」，而不是「卸载 CLI」——已经登着的账号、装好的客户端都不该被动。
+   */
+  const isEnabled = () => (typeof enabled === 'function' ? enabled() !== false : true)
   let located
   let locatedAt = 0
   let accounts
@@ -1423,6 +1428,9 @@ export function createCliLane({ logger = console, loadAccounts } = {}) {
     },
 
     async listModels(provider) {
+      // 关掉开关和没装 CLI 是同一件事：空列表把整组从选择器里摘掉，
+      // 而不是挂一排「点了就失败」的模型。
+      if (!isEnabled()) return []
       // No CLI means no route: an empty list keeps the group out of the picker
       // instead of offering models that cannot answer.
       const cli = await probe()
@@ -1567,11 +1575,12 @@ export function createCliLane({ logger = console, loadAccounts } = {}) {
     async status({ force = false } = {}) {
       const cli = await probe({ force })
       if (cli === null) {
-        return { provider: CLI_ROUTE, installed: false, path: '', version: '', accounts: [], models: [] }
+        return { provider: CLI_ROUTE, enabled: isEnabled(), installed: false, path: '', version: '', accounts: [], models: [] }
       }
       const list = await listAccounts({ force })
       return {
         provider: CLI_ROUTE,
+        enabled: isEnabled(),
         installed: true,
         path: cli.path,
         version: cli.version,

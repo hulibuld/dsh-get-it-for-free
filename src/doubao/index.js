@@ -268,12 +268,15 @@ export function createDoubao({ home, logger, env = process.env, onChange } = {})
         return result
       }
       if (task.checkedInToday === true) {
-        const result = { status: 'already', message: '今天已经签过了', task: task.code, steps }
+        const streak = task.continuousDays > 0 ? `，已连签 ${task.continuousDays} 天` : ''
+        const result = { status: 'already', message: `今天已经签过了${streak}`, task: task.code, steps }
         await rememberCheckin(account, { at: Date.now(), status: 'already', task: task.code })
         return result
       }
       if (dryRun) {
-        return { status: 'available', message: `可签：${task.title}`, task: task.code, steps }
+        const reward = task.checkinReward?.reward_amount
+        const hint = reward ? `（${reward}）` : ''
+        return { status: 'available', message: `可签：${task.title}${hint}`, task: task.code, steps }
       }
       let receipt = null
       try {
@@ -282,7 +285,10 @@ export function createDoubao({ home, logger, env = process.env, onChange } = {})
       } catch (error) {
         const detailCode = error instanceof DoubaoError ? error.code : ''
         if (detailCode === ERROR.RUNTIME_UNAVAILABLE) {
-          const message = '签到要求客户端运行时生成的风控参数，脚本不伪造：请在豆包客户端里手动点一次签到'
+          // 710010702 是 /alice/ug/campaign/landing/checkin 对 web 会话的无条件系统错误：
+          // 抓包实测 22 组参数（scene/biz_params/AgwCommonParam/referer/桌面端 aid）全部同码，
+          // 活动页自己也写着「该活动仅支持在豆包电脑版参与」。不是脚本缺参数，是服务端看客户端上下文。
+          const message = '签到接口只认豆包电脑客户端：web 会话调 /alice/ug/campaign/landing/checkin 恒返回 710010702（已实测 22 组参数），请在电脑客户端里点一次签到'
           await rememberCheckin(account, { at: Date.now(), status: 'needs-manual', task: task.code, message })
           return { status: 'needs-manual', message, task: task.code, steps }
         }
@@ -389,6 +395,7 @@ export function createDoubao({ home, logger, env = process.env, onChange } = {})
       claimed: rows.filter(row => row.status === 'claimed').length,
       already: rows.filter(row => row.status === 'already').length,
       inactive: rows.filter(row => row.status === 'inactive').length,
+      needsManual: rows.filter(row => row.status === 'needs-manual').length,
       failed: rows.filter(row => row.status === 'error').length,
     }
   }
@@ -475,8 +482,10 @@ export function createDoubao({ home, logger, env = process.env, onChange } = {})
     try {
       const store = await load()
       const disabled = disabledSet(store)
-      const enabled = new Set(store.accounts.filter(row => row.enabled !== false).map(row => row.id))
-      if (enabled.size === 0) return []
+      // 这里不看账号数量。原来 enabled.size === 0 就返回空表，把
+      // 「没登录 / 卡被关掉」和「这个渠道没有模型」混成一件事：右下角选择器
+      // 看不到豆包，而面板上明明写着「模型 12/12」。目录是服务的属性，
+      // 账号可用性是请求的属性，两件事不共用一个闸门。
       const roster = (store.roster ?? []).filter(row => !disabled.has(row.id))
       if (roster.length > 0) {
         return roster.map(row => ({

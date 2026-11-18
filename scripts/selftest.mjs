@@ -53,6 +53,35 @@ console.log('\n2) 宿主半身 import')
   else bad(line.split('\n').slice(0, 8).join('\n      '))
 }
 
+// ── 2b. apply() 能不能真的跑起来 ────────────────────────────────────────────
+// 语法绿 ≠ 插件能挂。踩过一次：apply 顶层误用了 `scoped`，抛 ReferenceError，
+// 结果一条路由都没注册，设置页只显示「无法连接插件后端 / not found」。
+// 这里拿一个「什么都能调、什么都返回自己」的 Proxy 当 ctx：apply 不抛就算过。
+console.log('\n2b) apply() 试跑')
+{
+  const script = `
+    const P = new Proxy(function () {}, {
+      get(t, k) {
+        if (k === 'then' || k === Symbol.toPrimitive || k === Symbol.iterator || k === 'toJSON' || k === Symbol.toStringTag) return undefined
+        if (k === 'length') return 0
+        if (k === 'name') return 'stub'
+        if (k === 'toString') return () => '[stub]'
+        return P
+      },
+      apply() { return P },
+      construct() { return P },
+      has() { return true },
+    })
+    import(${JSON.stringify(resolve(here, 'index.js'))})
+      .then(m => { m.apply(P, {}); console.log('APPLY OK') })
+      .catch(e => { console.error('APPLY FAIL ' + (e && e.message)); process.exit(1) })
+  `
+  const result = spawnSync(process.execPath, ['--preserve-symlinks', '-e', script], { encoding: 'utf8' })
+  const line = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim()
+  if (result.status === 0 && line.includes('APPLY OK')) ok('apply() 没抛（路由注册路径可走）')
+  else bad(line.split('\n').slice(0, 8).join('\n      '))
+}
+
 // ── 3. 软链有没有断 ─────────────────────────────────────────────────────────
 console.log('\n3) 软链')
 {

@@ -173,6 +173,8 @@ export const SETTINGS_INITIAL = {
   /** Advertisement only: retain catalog entries and historical model resolution. */
   hiddenModelIds: [],
   hideEacModels: false,
+  /** CodeBuddy CLI 通道总开关：关掉只是让这条路由不投放模型，CLI 本身不动。 */
+  cliLaneEnabled: true,
   /** 设置页里被收起来的渠道卡片（右上角「×」）。只影响这一页的排列：账号、
    *  令牌、模型开关都不动，页面底部的「＋」把它原样加回来。 */
   hiddenChannels: [],

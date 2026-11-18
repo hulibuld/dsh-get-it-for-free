@@ -57,12 +57,17 @@ import { CAVEMAN_LEVELS, PONYTAIL_LEVELS } from './src/token-saver/prompts.js'
 import { OPTIMIZATIONS } from './src/local-optimize.js'
 import { createModelRuntime, createRuntimeStores } from './src/core/runtime.js'
 import { createMiMo, MIMO_PROVIDER } from './src/mimo/provider.js'
+import { createQwenWork, QWENWORK_PROVIDER } from './src/qwenwork/provider.js'
+import { createMeoo } from './src/meoo/index.js'
+import { createMeooWeb, MEEO_WEB_PROVIDER } from './src/meoo-web/provider.js'
 import { createCliLane, CLI_ROUTE } from './src/cli-lane.js'
 import { createModelSync } from './src/model-sync.js'
 import { createDoubao } from './src/doubao/index.js'
 import { DOUBAO_PROVIDER, createDoubaoAdapter } from './src/doubao/adapter.js'
 import { createResignBridge } from './src/resign-bridge.js'
 import { readBiliCompat, setBiliPassthrough } from './src/bili-config.js'
+import { sweepCodeArts } from './src/codearts-refresh.js'
+import { sweepQoderCheckin, QODER_CHECKIN_SCHEMA } from './src/qoder-checkin.js'
 import { uninstallPlugin, spawnDetachedRemoval } from './src/uninstall.js'
 
 export { fromOpenAiMessages } from './src/core/completion.js'
@@ -519,6 +524,129 @@ export function apply(ctx, config) {
     logger.warn?.(`get-it-for-free: MiMo 通道未挂载（${error?.message ?? error}）`)
   }
 
+  // ── 千问办公（QwenWork）─────────────────────────────────────────────────────
+  // 凭据两条路：本地 device flow 落盘的明文凭据（跨平台），或上游读 Windows
+  // 桌面端加密凭据的那条路。都没有就一条模型都不投放，选择器里看不到它，
+  // 不影响其它渠道。
+  // 跟 MiMo 一样的规矩：任何装配异常只让它自己缺席。
+  let qwenworkBridge = {
+    status: async () => ({ signedIn: false, provider: QWENWORK_PROVIDER, reason: '千问办公通道未挂载' }),
+    login: () => ({ url: '', pending: false }),
+    logout: async () => ({ signedIn: false }),
+    reload: async () => ({ signedIn: false }),
+    quota: async () => ({ signedIn: false, error: '千问办公通道未挂载' }),
+    renew: async () => ({ ok: false, error: '千问办公通道未挂载' }),
+    setModelDisabled: () => ({ disabledModels: [] }),
+    setAllModelsDisabled: () => ({ disabledModels: [] }),
+    degrade: async modelId => ({ ok: false, modelId: String(modelId ?? ''), message: '千问办公通道未挂载' }),
+    test: async () => ({ ok: false, ms: 0, message: '千问办公通道未挂载' }),
+  }
+  try {
+    const qwenwork = createQwenWork({ logger, onTopology: () => emitTopology() })
+    ctx.llm.registerAdapter([QWENWORK_PROVIDER], qwenwork.adapter)
+    ctx.llm.registerConfigurableProviders?.([
+      { provider: QWENWORK_PROVIDER, displayName: '千问办公', settingsNs: 'qwenwork', settingsPath: [], declared: true },
+    ])
+    ctx.effect(() => () => { qwenwork.dispose() }, 'get-it-for-free: qwenwork channel')
+    qwenworkBridge = {
+      status: () => qwenwork.status(),
+      login: () => qwenwork.login(),
+      logout: () => qwenwork.logout(),
+      reload: () => qwenwork.reload(),
+      quota: () => qwenwork.quota(),
+      renew: () => qwenwork.renew(),
+      setModelDisabled: (modelId, disabled) => qwenwork.setModelDisabled(modelId, disabled),
+      setAllModelsDisabled: disabled => qwenwork.setAllModelsDisabled(disabled),
+      degrade: modelId => qwenwork.degrade(modelId),
+      test: () => qwenwork.test(),
+    }
+  } catch (error) {
+    logger.warn?.(`get-it-for-free: 千问办公通道未挂载（${error?.message ?? error}）`)
+  }
+
+  // ── 秒悟（meoo）─────────────────────────────────────────────────────────────
+  // 这条不提供模型，只提供「一键上线」的算力与部署额度，所以它没有适配器、
+  // 不往选择器里投放任何东西 —— 一张卡，把用户自己的积分和用量摆出来就够。
+  // 数据一律走官方 CLI：额度真源在它那儿；而且 oauth 的 401 自动刷新是 CLI 的
+  // 责任，插件抢着刷会把用户的 refreshToken 用废。装配失败只让这张卡缺席。
+  let meooBridge = {
+    status: async () => ({
+      cli: { installed: false, path: '', version: '', minRequired: '0.5.8', outdated: false },
+      auth: { loggedIn: false, credentialType: '', edition: '', username: '', reason: '秒悟通道未挂载', code: 'NOT_MOUNTED', hint: '' },
+      plan: null,
+      points: null,
+      deployQuota: null,
+      team: null,
+      skill: { installed: false, target: '', fileCount: 0 },
+      partial: true,
+      warnings: [],
+      fetchedAt: new Date().toISOString(),
+      cached: false,
+    }),
+    login: () => ({ pending: true, command: 'meoo login', hint: '在终端跑一次 meoo login。' }),
+  }
+  try {
+    const meoo = createMeoo({ logger })
+    ctx.effect(() => () => { meoo.dispose() }, 'get-it-for-free: meoo channel')
+    meooBridge = {
+      status: options => meoo.status(options),
+      login: () => meoo.login(),
+    }
+  } catch (error) {
+    logger.warn?.(`get-it-for-free: 秒悟通道未挂载（${error?.message ?? error}）`)
+  }
+
+  // ── 秒悟 · 网页版（meoo.com）模型通道 ───────────────────────────────────────
+  // 跟上面那张卡不同：这条走网页自己的 agent 接口，把额度变成能选的模型。凭据优先
+  // 用 CLI 登录态里的 accessToken，没有就让用户贴一份 Cookie —— 401 一律报
+  // NEED_LOGIN，不在插件里偷偷刷令牌。装配失败只让自己缺席，别的渠道照旧。
+  let meooWebBridge = {
+    status: async () => ({
+      provider: MEEO_WEB_PROVIDER,
+      displayName: '秒悟 · 网页版',
+      signedIn: false,
+      account: null,
+      models: 0,
+      modelNames: [],
+      modelList: [],
+      disabledModels: [],
+      secret: null,
+      login: { mode: 'paste' },
+      error: '秒悟网页通道未挂载',
+    }),
+    login: async () => ({ ok: false, stored: false, error: '秒悟网页通道未挂载' }),
+    logout: async () => ({ signedIn: false, removed: false }),
+    models: async () => ({ models: [] }),
+    refresh: async () => [],
+    test: async () => ({ ok: false, ms: 0, message: '秒悟网页通道未挂载', models: 0 }),
+    setModelDisabled: () => ({ disabledModels: [] }),
+    setAllModelsDisabled: () => ({ disabledModels: [] }),
+  }
+  try {
+    const meooWeb = createMeooWeb({ logger, onTopology: () => emitTopology() })
+    ctx.llm.registerAdapter([MEEO_WEB_PROVIDER], meooWeb.adapter)
+    ctx.llm.registerConfigurableProviders?.([{
+      provider: MEEO_WEB_PROVIDER,
+      displayName: '秒悟 · 网页版',
+      settingsNs: 'meoo-web',
+      settingsPath: [],
+      declared: true,
+    }])
+    ctx.effect(() => () => { meooWeb.dispose() }, 'get-it-for-free: meoo-web channel')
+    meooWebBridge = {
+      status: () => meooWeb.status(),
+      login: text => meooWeb.login(text),
+      logout: () => meooWeb.logout(),
+      models: () => meooWeb.models(),
+      refresh: () => meooWeb.refresh(),
+      test: () => meooWeb.test(),
+      setModelDisabled: (id, disabled) => meooWeb.setModelDisabled(id, disabled),
+      setAllModelsDisabled: disabled => meooWeb.setAllModelsDisabled(disabled),
+    }
+  } catch (error) {
+    logger.warn?.(`get-it-for-free: 秒悟网页通道未挂载（${error?.message ?? error}）`)
+  }
+
   // ── CodeBuddy CLI 通道 ──────────────────────────────────────────────────────
   // 同一家厂商的第二条路：不在插件里手搓 HTTP（那种流量迟早被当成滥用），
   // 而是驱动用户自己装好、自己登录的官方 CLI。官方客户端发什么它就发什么。
@@ -528,6 +656,19 @@ export function apply(ctx, config) {
   // 所以这里只读它的凭据，不另存一份 —— 两处各存一份迟早会有一处过期。
   let credentialsService
   let credentialRefOf
+  /** CodeArts 令牌续期：面板按钮与后台定时器都走这一个函数。 */
+  let codeArtsSweep = async () => ({ checked: 0, skipped: true, reason: 'channel pack 未挂载' })
+  let codeArtsLastSweep = null
+  /**
+   * Qoder 每日签到：刷一次账号池里的中国版账号，能领的领掉。
+   *
+   * 为什么不等渠道包的自动签到：那边按「今天跑过没有」记日子，而 Qoder 的活动
+   * UTC+8 10:00 才刷新 —— 早上开机那一轮把今天记成跑过了，10:00 之后就不会再签，
+   * 面板上只留一句「N 个未开启」，用户只能自己去点。这里按活动本身判断签没签
+   * （见 src/qoder-checkin.js 顶部注释），签过就跳过。
+   */
+  let qoderCheckinSweep = async () => ({ checked: 0, skipped: true, reason: '凭据服务未就绪' })
+  let qoderCheckinLast = null
   async function loadCliAccounts() {
     const service = credentialsService
     if (service === undefined) return []
@@ -577,7 +718,7 @@ export function apply(ctx, config) {
     selfTest: async () => ({ ok: false, code: 'CLI_NOT_FOUND', message: 'CodeBuddy CLI 通道没有挂载', durationMs: 0 }),
   }
   try {
-    const lane = createCliLane({ logger, loadAccounts: loadCliAccounts })
+    const lane = createCliLane({ logger, loadAccounts: loadCliAccounts, enabled: () => settings.get().cliLaneEnabled !== false })
     ctx.llm.registerAdapter([CLI_ROUTE], lane.adapter)
     ctx.effect(() => () => { lane.dispose() }, 'get-it-for-free: codebuddy cli lane')
     cliLane = {
@@ -1156,6 +1297,133 @@ export function apply(ctx, config) {
     // CLI 通道要读同一批令牌：凭据服务在宿主里，这里把作用域里的那份留给它用。
     credentialsService = scoped.credentials
     scoped.effect(() => () => { stopped = true; credentialsService = undefined }, 'get-it-for-free: channel pack')
+
+    // ── CodeArts 令牌自动续期 ────────────────────────────────────────────────
+    // 渠道包只在 401 时才去续期，而华为这边令牌过期回的是
+    // `400 APIG.0602 the security token has expired`，那条路永远走不到：
+    // 账号在面板上还是「已启用」，但每次调用模型都"操作失败"。
+    // 这里按 expires_at 提前 30 分钟换新，20 分钟扫一轮。
+    const refOfCodeArts = async name => {
+      if (credentialRefOf === undefined) {
+        try {
+          credentialRefOf = (await import('@deepseek-ai/dsh-credentials')).credentialRef
+        } catch {
+          credentialRefOf = null
+        }
+      }
+      return credentialRefOf === null ? name : credentialRefOf(name)
+    }
+    codeArtsSweep = async ({ force = false } = {}) => {
+      const service = credentialsService
+      if (service === undefined) return { checked: 0, skipped: true, reason: '凭据服务未就绪' }
+      const result = await sweepCodeArts({
+        accounts: async () => {
+          const statePath = path.join(os.homedir(), '.dsh', 'channel-pack', 'state.json')
+          let state
+          try {
+            state = JSON.parse(await fs.promises.readFile(statePath, 'utf8'))
+          } catch {
+            return []
+          }
+          const rows = Array.isArray(state?.accounts) ? state.accounts : []
+          return rows
+            .filter(row => row !== null && typeof row === 'object' && row.provider === 'codearts')
+            .filter(row => typeof row.credentialRef === 'string' && row.credentialRef !== '')
+            .map(row => ({ id: String(row.id), credentialRef: String(row.credentialRef), nickname: row.nickname }))
+        },
+        read: async ref => {
+          const resolved = await service.resolve(await refOfCodeArts(ref))
+          return resolved === undefined || resolved === null ? undefined : { value: resolved.value }
+        },
+        write: async (ref, value) => {
+          await service.set(await refOfCodeArts(ref), value)
+        },
+        log: line => {
+          logger.info?.(`get-it-for-free: ${line}`)
+          // 打包后的 App 里控制台看不见，留一份在盘上。
+          try {
+            const dir = path.join(os.homedir(), '.dsh', 'get-it-for-free')
+            fs.mkdirSync(dir, { recursive: true })
+            fs.appendFileSync(path.join(dir, 'codearts-refresh.log'), `${new Date().toISOString()} | ${line}\n`)
+          } catch { /* 日志写不进去不影响续期本身 */ }
+        },
+        force,
+      })
+      codeArtsLastSweep = result
+      if (result.refreshed > 0) emitTopology()
+      return result
+    }
+    const codeArtsTimer = setInterval(() => { void codeArtsSweep() }, 20 * 60 * 1000)
+    codeArtsTimer.unref?.()
+    const codeArtsWarm = setTimeout(() => { void codeArtsSweep() }, 10 * 1000)
+    codeArtsWarm.unref?.()
+    scoped.effect(() => () => {
+      clearInterval(codeArtsTimer)
+      clearTimeout(codeArtsWarm)
+    }, 'get-it-for-free: codearts token refresh')
+
+    // ── Qoder 每日签到 ────────────────────────────────────────────────────────
+    // 渠道包的自动签到只跑「启动那一轮 + 每天 10:05 一轮」，而 Qoder 的每日活动
+    // 10:00 才刷新：早上 7 点开机那轮看到的是昨天那一轮，`lastDate` 却已经记成今天。
+    // 那台机器要是 10:05 没开着（或者 10:05 之后才开机、又被 `lastDate` 挡住），
+    // 这一天就再没人签，面板上只剩「N 个未开启」，用户只能自己去点按钮。
+    // 这里按「活动列表里有没有 CLAIMED」判断今天到底签没签，签过的账号落盘跳过，
+    // 每半小时再看一次没签成的，跨过 10:00 自然就补上了。
+    qoderCheckinSweep = async ({ force = false } = {}) => {
+      const service = credentialsService
+      if (service === undefined) return { checked: 0, skipped: true, reason: '凭据服务未就绪' }
+      const cachePath = path.join(os.homedir(), '.dsh', 'get-it-for-free', 'qoder-checkin.json')
+      let cache = null
+      try {
+        cache = JSON.parse(await fs.promises.readFile(cachePath, 'utf8'))
+      } catch { cache = null }
+      const result = await sweepQoderCheckin({
+        accounts: async () => {
+          const statePath = path.join(os.homedir(), '.dsh', 'channel-pack', 'state.json')
+          let state
+          try {
+            state = JSON.parse(await fs.promises.readFile(statePath, 'utf8'))
+          } catch {
+            return []
+          }
+          const rows = Array.isArray(state?.accounts) ? state.accounts : []
+          return rows
+            .filter(row => row !== null && typeof row === 'object')
+            .filter(row => row.provider === 'qodercn' && row.enabled !== false)
+            .filter(row => typeof row.credentialRef === 'string' && row.credentialRef !== '')
+            .map(row => ({ id: String(row.id), provider: 'qodercn', credentialRef: String(row.credentialRef), nickname: row.nickname }))
+        },
+        read: async ref => {
+          const resolved = await service.resolve(await refOfCodeArts(ref))
+          return resolved === undefined || resolved === null ? undefined : { value: resolved.value }
+        },
+        state: cache,
+        force,
+        log: line => {
+          logger.info?.(`get-it-for-free: ${line}`)
+          try {
+            const dir = path.join(os.homedir(), '.dsh', 'get-it-for-free')
+            fs.mkdirSync(dir, { recursive: true })
+            fs.appendFileSync(path.join(dir, 'qoder-checkin.log'), `${new Date().toISOString()} | ${line}\n`)
+          } catch { /* 日志写不进去不影响签到本身 */ }
+        },
+      })
+      qoderCheckinLast = result
+      if (result.schema !== QODER_CHECKIN_SCHEMA && result.state?.schema !== QODER_CHECKIN_SCHEMA) return result
+      try {
+        fs.mkdirSync(path.dirname(cachePath), { recursive: true })
+        fs.writeFileSync(cachePath, JSON.stringify(result.state, null, 2))
+      } catch { /* 缓存写不进去只意味着下一轮会重复查一次 */ }
+      return result
+    }
+    const qoderCheckinTimer = setInterval(() => { void qoderCheckinSweep() }, 30 * 60 * 1000)
+    qoderCheckinTimer.unref?.()
+    const qoderCheckinWarm = setTimeout(() => { void qoderCheckinSweep() }, 20 * 1000)
+    qoderCheckinWarm.unref?.()
+    scoped.effect(() => () => {
+      clearInterval(qoderCheckinTimer)
+      clearTimeout(qoderCheckinWarm)
+    }, 'get-it-for-free: qoder daily checkin')
     // Dynamic import: the pack's own imports (the kernel's llm and credential
     // modules) are host-provided, and a composition that lacks them must still
     // load this plugin's free lane. `pack.js` is the bundled form of the
@@ -1199,17 +1467,68 @@ export function apply(ctx, config) {
   // 账号存在 ~/.dsh/get-it-for-free/doubao.json，一个账号一条 cookie；额度、
   // 模型目录、每日签到都走同一个客户端身份。放在我们自己这一层而不是 pack.js
   // 里，是因为这份协议还在频繁试错，改坏不该拖累整个渠道层。
-  const doubao = createDoubao({ logger, onChange: () => emitTopology() })
-
   // 把豆包那 12 个模型真正挂给宿主的 LLM 层 —— 面板上的卡只管「看」，这里才让
   // 它们出现在右下角的模型选择器里。和 MiMo 一样是可选通道：挂不上就只让它自己
   // 缺席，绝不把整份插件带下水。
+  // `llm/adapters-updated` 不是随便 emit 的：它在 `LlmRuntime` 里由路由集合的
+  // 唯一变更点 `commitRoutes()` 广播，对外能触发它的只有 `registerAdapter` 与
+  // `handle.replace()`。所以先拿句柄，再把「重播一次」做成闭包喂给适配器 ——
+  // 目录换一版（补拉完成、加账号、点刷新）就用同名路由 replace 一次，
+  // 选择器才会重读 `modelCatalog()`。只注册不重播，等于后面拿到的模型
+  // 「只有插件自己知道」。
+  //
+  // 节流 3 秒：豆包的 notify 会被额度查询、签到这类与目录无关的动作触发，
+  // 每次都重播会让 UI 反复重拉目录；真正换目录的动作本来也不会密集到毫秒级。
+  let doubaoRegistration = null
+  let doubaoReannouncedAt = 0
+  const reannounceDoubao = () => {
+    if (!doubaoRegistration) return
+    const now = Date.now()
+    if (now - doubaoReannouncedAt < 3_000) return
+    doubaoReannouncedAt = now
+    try {
+      doubaoRegistration.replace([DOUBAO_PROVIDER])
+    } catch (error) {
+      logger.warn?.(`get-it-for-free: 豆包目录重播失败（${error?.message ?? error}）`)
+    }
+  }
+  const doubao = createDoubao({
+    logger,
+    onChange: () => {
+      emitTopology()
+      reannounceDoubao()
+    },
+  })
   try {
-    ctx.llm.registerAdapter([DOUBAO_PROVIDER], createDoubaoAdapter({ doubao, logger }))
+    doubaoRegistration = ctx.llm.registerAdapter(
+      [DOUBAO_PROVIDER],
+      createDoubaoAdapter({ doubao, logger, onRoster: reannounceDoubao }),
+    )
   } catch (error) {
     logger.warn?.(`get-it-for-free: 豆包模型未注册（${error?.message ?? error}）`)
   }
 
+  // ── 内置签到：豆包自己跑 ────────────────────────────────────────────────────
+  // 「自动保养」那张卡已经删掉，续期与签到全部沉到后台，用户不需要知道有这回事：
+  // CodeArts 令牌每小时自己续、Qoder 与豆包每半小时自己签一轮。面板上的
+  // 「一键领取」保留，只是不想等的时候手动兜底。
+  const doubaoCheckinTimer = setInterval(() => {
+    void doubao.checkinAll({ dryRun: false }).catch(error => {
+      logger.warn?.('get-it-for-free: 豆包自动签到失败：' + (error?.message ?? error))
+    })
+  }, 30 * 60 * 1000)
+  doubaoCheckinTimer.unref?.()
+  const doubaoCheckinWarm = setTimeout(() => {
+    void doubao.checkinAll({ dryRun: false }).catch(() => {})
+  }, 45 * 1000)
+  doubaoCheckinWarm.unref?.()
+  // 这里在 apply 顶层，不在 ctx.inject 的闭包里：用 ctx，不是 scoped。
+  // （写错成 scoped 会让 apply 整个抛 ReferenceError，插件一条路由都注册不上，
+  //   设置页只会显示「无法连接插件后端 / not found」。）
+  ctx.effect(() => () => {
+    clearInterval(doubaoCheckinTimer)
+    clearTimeout(doubaoCheckinWarm)
+  }, 'get-it-for-free: doubao daily checkin')
   // ── 签名中转（给 billion-context 递凭据）────────────────────────────────────
   // CodeArts 的签名盖住了请求体，bili 要压缩就得自己重签，重签就得知道是哪一号
   // 账号的 AK/SK。它扫 <DSH_HOME>/jet-hub/state.json 找 provider==='codearts'
@@ -1253,8 +1572,16 @@ export function apply(ctx, config) {
     picks,
     // MiMo 没有账号池，卡片只需要一个只读状态：是否已从桌面端拿到凭证 + 剩余额度。
     mimo: mimoBridge,
+    // 千问办公：只读状态 + 登录/退出/重读目录三个动作。
+    qwenwork: qwenworkBridge,
+    meoo: meooBridge,
+    // 秒悟 · 网页版：贴 Cookie / 贴 token、列模型、开关模型。
+    meooWeb: meooWebBridge,
     // CLI 通道的状态：是否装了官方 CLI、什么版本、能出哪些模型。
     cliLane,
+    // 关掉/打开 CLI 车道之后，选择器里的那一组要立刻跟着变：adapter 只会在
+    // listModels 被问到时才知道开关改了，所以这里主动问一次。
+    refreshCliLane: async () => { try { await ctx.llm?.listModels?.(CLI_ROUTE) } catch { /* 选择器下次自己会问 */ } },
     // 模型目录同步：上次同步时间、各渠道模型数、新增/下线 diff 历史。
     modelSync,
     // 豆包工作：多账号凭据、额度、模型目录、每日签到。
@@ -1425,6 +1752,12 @@ export function apply(ctx, config) {
     // The absorbed channel pack's liveness, for the 免费接入 page: the page
     // renders its channel grid from this bit plus the pack's own RPC.
     channels: () => channelPack,
+    // `createApiRoutes` 在模块顶层，闭包里的东西必须从这里递进去 —— 路由里
+    // 直接写 `codeArtsSweep` 会 ReferenceError（node --check 抓不到）。
+    codeArtsRefresh: async options => codeArtsSweep(options),
+    codeArtsRefreshLast: () => codeArtsLastSweep,
+    qoderCheckin: async options => qoderCheckinSweep(options),
+    qoderCheckinLast: () => qoderCheckinLast,
     chanRelay: {
       status: chanRelayStatus,
       apply: async patch => {
@@ -2192,6 +2525,34 @@ export function createApiRoutes(deps) {
           return send(500, { error: String(error?.message ?? error).slice(0, 300) })
         }
       }
+      // ── CodeArts 令牌续期 ───────────────────────────────────────────────────
+      // 华为过期回 400 APIG.0602，渠道包的 401 兜底够不到，所以插件自己按
+      // expires_at 续。面板上的「立即续期」按钮打这个口，后台每 20 分钟也会自己跑。
+      if (method === 'GET' && routePath === '/codearts/refresh') {
+        return send(200, { last: deps.codeArtsRefreshLast() })
+      }
+      if (method === 'POST' && routePath === '/codearts/refresh') {
+        try {
+          const body = await readJson(req)
+          return send(200, await deps.codeArtsRefresh({ force: body?.force === true }))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // ── Qoder 每日签到 ─────────────────────────────────────────────────────
+      // 渠道包那边按「今天跑过没有」记日子，10:00（UTC+8）之前跑过就把整天挡掉，
+      // 中国版账号因此常年显示「未开启」。这里按活动本身判断，GET 看结果、POST 立刻跑。
+      if (method === 'GET' && routePath === '/qoder/checkin') {
+        return send(200, { last: deps.qoderCheckinLast() })
+      }
+      if (method === 'POST' && routePath === '/qoder/checkin') {
+        try {
+          const body = await readJson(req)
+          return send(200, await deps.qoderCheckin({ force: body?.force === true }))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
       // ── 与 bili 共存（华为云链路不压缩）──────────────────────────────────────
       // CodeArts 的签名盖住请求体，bili 只能「重签后压缩」或「拒转发」；它的重签
       // 实测过不了上游（补尾斜杠 + 给部分模型加 maas_type: benefit），所以唯一
@@ -2234,6 +2595,208 @@ export function createApiRoutes(deps) {
         const force = url.searchParams.get('refresh') === '1'
         try {
           return send(200, await deps.mimo.status({ force }))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // ── 千问办公（QwenWork）──────────────────────────────────────────────────
+      // 没登录就是一条模型都不投放，所以卡片要能自己起登录、退出、重新读目录。
+      if (method === 'GET' && routePath === '/qwenwork/status') {
+        try {
+          return send(200, await deps.qwenwork.status())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/qwenwork/login') {
+        try {
+          return send(200, deps.qwenwork.login())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/qwenwork/logout') {
+        try {
+          return send(200, await deps.qwenwork.logout())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/qwenwork/reload') {
+        try {
+          return send(200, await deps.qwenwork.reload())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // 额度与续期：卡片上那两个按钮要的东西。额度只在服务端，所以每次点都要真的问一次；
+      // 续期会轮换 refresh_token（单代际），只允许用户手点触发。
+      if (method === 'GET' && routePath === '/qwenwork/quota') {
+        try {
+          return send(200, await deps.qwenwork.quota())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/qwenwork/renew') {
+        try {
+          return send(200, await deps.qwenwork.renew())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // 模型开关：跟豆包同一条约定（{ids,disabled} 或 {all:true,disabled}）。
+      // 一次请求上游只带一个 model key，所以「关掉」只等于不在选择器里列它。
+      if (method === 'POST' && routePath === '/qwenwork/models/toggle') {
+        try {
+          const body = await readJson(req)
+          const disabled = body?.disabled !== false
+          if (body?.all === true) return send(200, deps.qwenwork.setAllModelsDisabled(disabled))
+          const ids = Array.isArray(body?.ids) ? body.ids.filter(id => typeof id === 'string' && id !== '') : []
+          // 没给 ids 也没 all：不动文件，回当前状态，让调用方自己看清发的是什么。
+          if (ids.length === 0) {
+            const current = await deps.qwenwork.status()
+            const off = (current?.modelList ?? []).filter(row => row.disabled === true).map(row => row.id)
+            return send(200, { disabledModels: off })
+          }
+          let last = { disabledModels: [] }
+          for (const id of ids) last = deps.qwenwork.setModelDisabled(id, disabled)
+          return send(200, last)
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // 降智测试：真发一条消息让它画 ASCII，回 {ok, modelId, nickname, text, firstMs, totalMs}。
+      if (method === 'POST' && routePath === '/qwenwork/degrade') {
+        try {
+          const body = await readJson(req)
+          const modelId = typeof body?.modelId === 'string' ? body.modelId : ''
+          return send(200, await deps.qwenwork.degrade(modelId))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // 账号测试：只问一句「在的」，用来确认这条通道此刻还通。
+      if (method === 'POST' && routePath === '/qwenwork/test') {
+        try {
+          return send(200, await deps.qwenwork.test())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // ── 秒悟（meoo）额度积分 ─────────────────────────────────────────────────
+      // 数据只有一个来源：官方 CLI。插件自己不拼 HTTP，因为 oauth 的 401 自动
+      // 刷新归 CLI 管，抢着刷会把用户的 refreshToken 用废。
+      if (method === 'GET' && routePath === '/meoo/status') {
+        try {
+          return send(200, await deps.meoo.status({ force: url.searchParams.get('refresh') === '1' }))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/meoo/login') {
+        try {
+          return send(200, deps.meoo.login())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/meoo/upgrade') {
+        try {
+          return send(200, await deps.meoo.upgrade())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      for (const [route, handler] of [
+        ['/meoo/test', () => deps.meoo.test()],
+        ['/meoo/renew', () => deps.meoo.renew()],
+        ['/meoo/logout', () => deps.meoo.logout()],
+        ['/meoo/claim', () => deps.meoo.claim()],
+      ]) {
+        if (method === 'POST' && routePath === route) {
+          try {
+            return send(200, await handler())
+          } catch (error) {
+            return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+          }
+        }
+      }
+      if (method === 'POST' && routePath === '/meoo/cli/enabled') {
+        try {
+          const body = await readJson(req)
+          return send(200, await deps.meoo.setCliEnabled(body?.enabled !== false))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/meoo/enabled') {
+        try {
+          const body = await readJson(req)
+          return send(200, await deps.meoo.setEnabled(body?.enabled !== false))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // ── 秒悟 · 网页版（meoo.com）模型通道 ─────────────────────────────────────
+      // 凭据是用户自己的 Cookie 或 CLI 的 accessToken，插件只负责带上它去问一次
+      // 模型目录、把额度变成选择器里的模型。401 一律原样回给卡片，让用户自己重贴。
+      if (method === 'GET' && routePath === '/meooweb/status') {
+        try {
+          return send(200, await deps.meooWeb.status())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/meooweb/login') {
+        try {
+          const body = await readJson(req)
+          return send(200, await deps.meooWeb.login(body?.text ?? body?.cookie ?? body?.token ?? ''))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/meooweb/logout') {
+        try {
+          return send(200, await deps.meooWeb.logout())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'GET' && routePath === '/meooweb/models') {
+        try {
+          return send(200, await deps.meooWeb.models())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/meooweb/models/refresh') {
+        try {
+          const rows = await deps.meooWeb.refresh()
+          return send(200, { models: rows.map(row => ({ id: row.id, name: row.name })) })
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/meooweb/test') {
+        try {
+          return send(200, await deps.meooWeb.test())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/meooweb/model/disabled') {
+        try {
+          const body = await readJson(req)
+          return send(200, deps.meooWeb.setModelDisabled(body?.id ?? body?.model, body?.disabled !== false))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/meooweb/model/all') {
+        try {
+          const body = await readJson(req)
+          return send(200, deps.meooWeb.setAllModelsDisabled(body?.disabled !== false))
         } catch (error) {
           return send(500, { error: String(error?.message ?? error).slice(0, 300) })
         }
@@ -2407,7 +2970,7 @@ export function createApiRoutes(deps) {
         const patch = await readJson(req)
         const visibility = validateModelVisibility(patch)
         const current = deps.settings.get()
-        const next = sanitizeSettings({ ...current, ...pick(patch, ['enabled', 'exposeRegionModels', 'probeIntervalMinutes', 'defaultMaxTokens', 'announcementAck', 'feedUrl', 'feedPollMinutes', 'notifyOs', 'updateCheckHours', 'autoReloadWatch', 'riskAccepted']), ...visibility }, current)
+        const next = sanitizeSettings({ ...current, ...pick(patch, ['enabled', 'exposeRegionModels', 'probeIntervalMinutes', 'defaultMaxTokens', 'announcementAck', 'feedUrl', 'feedPollMinutes', 'notifyOs', 'updateCheckHours', 'autoReloadWatch', 'riskAccepted', 'cliLaneEnabled']), ...visibility }, current)
         // 渠道卡片上的「×」：整张名单一起来，服务端不猜增量。只影响设置页里
         // 显示哪些卡，不动账号、令牌、模型开关——所以这里不需要任何清理动作。
         if (patch.hiddenChannels !== undefined) {
@@ -2468,6 +3031,7 @@ export function createApiRoutes(deps) {
           return send(500, { error: 'could not persist settings' })
         }
         if (Object.keys(visibility).length > 0) deps.onVisibilityChanged?.()
+        if (patch.cliLaneEnabled !== undefined) await deps.refreshCliLane?.()
         await deps.syncForward()
         await deps.syncRelay()
         await deps.syncEgress()

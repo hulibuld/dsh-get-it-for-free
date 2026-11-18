@@ -31873,8 +31873,19 @@ function createDirectFetch(options = {}) {
     // — re-chaining as downstream (install 8)`，随后就是整轮卡死十几分钟与
     // `UND_ERR_CONNECT_TIMEOUT`、`upstream 502`。要复现这套实验，显式设
     // GET_IT_FOR_FREE_HOST_FETCH=1；调用方自带 dispatcher（出口代理）时始终用 undici。
+    //
+    // 3.5.0：改成按域名挑。华为云（CodeArts）的请求是签名盖住请求体的，bili 对它只能
+    // 重签或原样放行，所以这条链路必须让 bili 看得见（走宿主 fetch），再配合
+    // src/bili-config.js 打开 `resign.sdk-hmac-sha256.passthrough`，bili 只记账不动手。
+    // 其余渠道继续走 undici —— 3.0.42 那次卡死的量级来自「全部渠道一起挤进全局 fetch」，
+    // 只放签名链路进去就没有那个量级。=1 全部走宿主 fetch，=0 回到 3.0.42 旧行为。
     const requestedDispatcher = init?.dispatcher;
-    if (process.env.GET_IT_FOR_FREE_HOST_FETCH === "1" && requestedDispatcher === undefined && typeof globalThis.fetch === "function") {
+    const hostFetchMode = process.env.GET_IT_FOR_FREE_HOST_FETCH ?? "";
+    const hostFetchUsable = requestedDispatcher === undefined && typeof globalThis.fetch === "function";
+    const hostTarget = typeof target === "string" ? target : String(target?.href ?? target ?? "");
+    const huaweiCloud = /(^|\/\/|\.)((my)?huaweicloud(-inc)?\.(com|cn))(:|\/|$)/i.test(hostTarget);
+    const wantsHostFetch = hostFetchMode === "1" || (hostFetchMode !== "0" && huaweiCloud);
+    if (wantsHostFetch && hostFetchUsable) {
       const { dispatcher: _dropDispatcher, ...hostInit } = requestInit ?? {};
       return globalThis.fetch(target, hostInit);
     }
@@ -62381,6 +62392,20 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
   };
   const pendingSmsMsgid = /* @__PURE__ */ new Map();
   const pendingLoginFailures = /* @__PURE__ */ new Map();
+  /**
+   * 「登录已成功，但占位账号被合并/删除」的回执表。
+   *
+   * 为什么必须有它（用户报障 2026-11-18：华为云网页里明明登录成功，插件页
+   * 却永远停在「登录成功后本页会自动完成」）：account.create 先建占位账号，
+   * 前端拿**占位 id** 轮询 login.poll。codearts 登录成功后若发现**同一华为
+   * 身份已存在于别的条目**，会把新鲜凭据写进老条目、再把占位条目删掉 ——
+   * login.poll 找不到条目，只能一直回 done:false，凭据其实早就落库了。
+   * 现在删除占位条目前先记一张成功回执，login.poll 优先读它。
+   *
+   * pendingLoginFailures 是同一类缺陷的另一半：失败分支删掉占位账号却
+   * 不登记失败，前端同样只能干等到 10 分钟超时。两者必须成对存在。
+   */
+  const pendingLoginSuccesses = /* @__PURE__ */ new Map();
   const badgePreferences = createBadgePreferenceStore(ctx);
   const autoCheckin = createAutoCheckin({
     store: createAutoCheckinStore(ctx),
@@ -62691,6 +62716,7 @@ async function handleMethod(method, payload, signal) {
             });
           }).catch((error) => {
             ctx.logger.warn(`[channel-pack] background ${GEMINI.id} login failed for ${id}: ${String(error)}`);
+            pendingLoginFailures.set(id, (error instanceof Error ? error.message : String(error)).slice(0, 500));
             void pool.removeAccount(id).catch(() => {
             });
           });
@@ -62731,6 +62757,7 @@ async function handleMethod(method, payload, signal) {
             });
           }).catch((err) => {
             ctx.logger.warn(`[channel-pack] background ${product.id} login failed for ${id}: ${err}`);
+            pendingLoginFailures.set(id, (err instanceof Error ? err.message : String(err)).slice(0, 500));
             void pool.removeAccount(id).catch(() => {
             });
           });
@@ -62766,6 +62793,7 @@ async function handleMethod(method, payload, signal) {
                 await ctx.credentials.set(credentialRef13(entry.credentialRef), loginResult.access);
                 await pool.updateAccount(entry.id, { nickname, expiresAt, refreshable: Boolean(credential?.refresh_token), enabled: true });
                 ctx.logger.warn(`[channel-pack] codearts 该账号（account_id=${identity}）已存在于 ${entry.id}，本次登录只更新凭据，不再新建账号`);
+                pendingLoginSuccesses.set(id, { accountId: entry.id, login: nickname });
                 void pool.removeAccount(id).catch(() => {
                 });
                 return;
@@ -62774,6 +62802,7 @@ async function handleMethod(method, payload, signal) {
             await pool.updateAccount(id, { nickname, expiresAt, refreshable: Boolean(credential?.refresh_token) });
           }).catch((error) => {
             ctx.logger.warn(`[channel-pack] background codearts login failed for ${id}: ${String(error)}`);
+            pendingLoginFailures.set(id, (error instanceof Error ? error.message : String(error)).slice(0, 500));
             void pool.removeAccount(id).catch(() => {
             });
           });
@@ -62800,6 +62829,7 @@ async function handleMethod(method, payload, signal) {
             });
           }).catch((error) => {
             ctx.logger.warn(`[channel-pack] background ${LOBSTERAI.id} login failed for ${id}: ${String(error)}`);
+            pendingLoginFailures.set(id, (error instanceof Error ? error.message : String(error)).slice(0, 500));
             void pool.removeAccount(id).catch(() => {
             });
           });
@@ -62833,6 +62863,7 @@ async function handleMethod(method, payload, signal) {
             });
           }).catch((error) => {
             ctx.logger.warn(`[channel-pack] background ${product2.id} login failed for ${id}: ${String(error)}`);
+            pendingLoginFailures.set(id, (error instanceof Error ? error.message : String(error)).slice(0, 500));
             void pool.removeAccount(id).catch(() => {
             });
           });
@@ -62860,6 +62891,7 @@ async function handleMethod(method, payload, signal) {
             });
           }).catch((error) => {
             ctx.logger.warn(`[channel-pack] background ${TRAE.id} login failed for ${id}: ${String(error)}`);
+            pendingLoginFailures.set(id, (error instanceof Error ? error.message : String(error)).slice(0, 500));
             void pool.removeAccount(id).catch(() => {
             });
           });
@@ -62884,6 +62916,7 @@ async function handleMethod(method, payload, signal) {
             });
           }).catch((error) => {
             ctx.logger.warn(`[channel-pack] background ${CLINE.id} login failed for ${id}: ${String(error)}`);
+            pendingLoginFailures.set(id, (error instanceof Error ? error.message : String(error)).slice(0, 500));
             void pool.removeAccount(id).catch(() => {
             });
           });
@@ -62920,6 +62953,7 @@ async function handleMethod(method, payload, signal) {
             });
           }).catch((error) => {
             ctx.logger.warn(`[channel-pack] background ${LOOMY.id} wechat login failed for ${id}: ${String(error)}`);
+            pendingLoginFailures.set(id, (error instanceof Error ? error.message : String(error)).slice(0, 500));
             void pool.removeAccount(id).catch(() => {
             });
           });
@@ -62964,6 +62998,7 @@ async function handleMethod(method, payload, signal) {
             });
           }).catch((error) => {
             ctx.logger.warn(`[channel-pack] background ${RACCOON.id} login failed for ${id}: ${String(error)}`);
+            pendingLoginFailures.set(id, (error instanceof Error ? error.message : String(error)).slice(0, 500));
             void pool.removeAccount(id).catch(() => {
             });
           });
@@ -63005,6 +63040,7 @@ async function handleMethod(method, payload, signal) {
             });
           }).catch((error) => {
             ctx.logger.warn(`[channel-pack] background ${MINIMAX.id} login failed for ${id}: ${String(error)}`);
+            pendingLoginFailures.set(id, (error instanceof Error ? error.message : String(error)).slice(0, 500));
             void pool.removeAccount(id).catch(() => {
             });
           });
@@ -63053,6 +63089,7 @@ async function handleMethod(method, payload, signal) {
             await pool.updateAccount(id, { nickname: `ZCode ${label}` });
           }).catch((error) => {
             ctx.logger.warn(`[channel-pack] background ${ZCODE.id} login failed for ${id}: ${String(error)}`);
+            pendingLoginFailures.set(id, (error instanceof Error ? error.message : String(error)).slice(0, 500));
             void pool.removeAccount(id).catch(() => {
             });
           });
@@ -63202,6 +63239,11 @@ async function handleMethod(method, payload, signal) {
       }
       case "login.poll": {
         const req = payload;
+        const merged = pendingLoginSuccesses.get(req.accountId);
+        if (merged !== void 0) {
+          pendingLoginSuccesses.delete(req.accountId);
+          return { ok: true, value: { done: true, success: true, login: merged.login ?? "", accountId: merged.accountId ?? req.accountId } };
+        }
         const failure = pendingLoginFailures.get(req.accountId);
         if (failure !== void 0) {
           pendingLoginFailures.delete(req.accountId);

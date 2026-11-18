@@ -314,6 +314,29 @@ export async function fetchLaunch(cookieHeader, options) {
   }
 }
 
+// 签到状态的位置随活动版本变过三次：
+//   daily_checkin.checked_in_today   ← 2026-11 的 daily_signin 任务在这里（实测）
+//   campaign_task_data.checked_in_today
+//   checked_in_today（顶层）
+// 三个都读，都没有就留 undefined——不能当 false，否则面板会把「没有这条状态」
+// 显示成「今天没签」，然后每次刷新都去重复发一次签到请求。
+export function readCheckinState(task) {
+  const daily = task?.daily_checkin ?? {}
+  const campaign = task?.campaign_task_data ?? {}
+  const checkedInToday = typeof daily.checked_in_today === 'boolean'
+    ? daily.checked_in_today
+    : typeof campaign.checked_in_today === 'boolean'
+      ? campaign.checked_in_today
+      : typeof task?.checked_in_today === 'boolean' ? task.checked_in_today : undefined
+  return {
+    checkedInToday,
+    continuousDays: Number(daily.continuous_days) || 0,
+    lastCheckinDate: String(daily.last_checkin_date ?? ''),
+    totalDays: Number(daily.total_days) || 0,
+    checkinReward: daily.reward && typeof daily.reward === 'object' ? daily.reward : null,
+  }
+}
+
 export async function fetchCampaignDetail(cookieHeader, group, options) {
   const data = await post('/alice/ug/campaign/v3/detail', cookieHeader, { campaign_group_code: group }, options)
   const tasks = Array.isArray(data?.tasks) ? data.tasks : []
@@ -327,11 +350,7 @@ export async function fetchCampaignDetail(cookieHeader, group, options) {
       title: String(task?.title ?? ''),
       status: Number(task?.task_status) || 0,
       reward: Array.isArray(task?.reward_summaries) ? task.reward_summaries : [],
-      // 签到任务是唯一带「今天签了没」的任务；别的任务没这个字段就是 undefined，
-      // 不能当成 false，否则面板会把「还没到期」显示成「没签」。
-      checkedInToday: typeof task?.campaign_task_data?.checked_in_today === 'boolean'
-        ? task.campaign_task_data.checked_in_today
-        : typeof task?.checked_in_today === 'boolean' ? task.checked_in_today : undefined,
+      ...readCheckinState(task),
     })),
     total: parseAmount(data?.progress?.total_amount),
   }
@@ -345,8 +364,26 @@ export function findDailyCheckin(tasks) {
     ?? null
 }
 
-export async function claimCheckin(cookieHeader, group, options) {
-  const data = await post('/alice/ug/campaign/landing/checkin', cookieHeader, { scene: group }, options)
+// 请求体按服务端 IDL 来：{scene, biz_params(map), AgwCommonParam}。
+// 少给 biz_params 会被网关当成非法 request（400 InvalidRequest, expected map），
+// 只给 {scene} 则能过校验但业务侧恒系统错误——见 docs/FIXES.md 的实测记录。
+export async function claimCheckin(cookieHeader, group, options = {}) {
+  const { bizParams, agwParams, ...rest } = options
+  const body = {
+    scene: group,
+    biz_params: bizParams && typeof bizParams === 'object' ? bizParams : {},
+    AgwCommonParam: {
+      aid: CLIENT.aid,
+      app_name: 'doubao',
+      device_platform: 'web',
+      pc_version: APP_VERSION,
+      language: 'zh',
+      region: 'CN',
+      samantha_web: 1,
+      ...(agwParams && typeof agwParams === 'object' ? agwParams : {}),
+    },
+  }
+  const data = await post('/alice/ug/campaign/landing/checkin', cookieHeader, body, rest)
   return {
     checkedIn: data?.checked_in === true,
     checkedInToday: data?.checked_in_today === true,

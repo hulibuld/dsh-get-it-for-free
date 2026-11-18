@@ -433,6 +433,14 @@ window.__ModuleLoader__.load({
         'chan.login.expired': '等待超时，请重新发起登录。',
         'chan.login.done': '已接入：{login}',
         'chan.login.failed': '登录未完成：{reason}',
+        'chan.paste.title': '接入 {name}',
+        'chan.paste.step1': '在 meoo.com 里登录，开发者工具 → Network 随便点一个请求，复制整条 Cookie。',
+        'chan.paste.step2': '也可以直接贴一个 access token（带不带 Bearer 都行）。只存本机，权限 0600。',
+        'chan.paste.placeholder': 'xxx=…; yyy=…   或   Bearer eyJ…',
+        'chan.paste.hint': '贴完点「保存并验证」：会立刻拿这份凭据问一次模型目录，不通就把原因写在这儿。',
+        'chan.paste.save': '保存并验证',
+        'chan.paste.empty': '还没贴东西。',
+        'chan.paste.done': '已接入秒悟 · 网页版。',
         'chan.test.ok': '连接正常（{ms} ms）',
         'chan.test.failed': '测试失败：{reason}',
         'chan.claim.result': '已领取 {count} 个账号，共 {credit} 积分。',
@@ -1192,6 +1200,14 @@ window.__ModuleLoader__.load({
         'chan.login.expired': 'Timed out — please start the sign-in again.',
         'chan.login.done': 'Connected: {login}',
         'chan.login.failed': 'Sign-in did not complete: {reason}',
+        'chan.paste.title': 'Connect {name}',
+        'chan.paste.step1': 'Sign in at meoo.com, open DevTools → Network, click any request and copy the whole Cookie header.',
+        'chan.paste.step2': 'An access token works too (with or without the Bearer prefix). Kept on this machine only, mode 0600.',
+        'chan.paste.placeholder': 'xxx=…; yyy=…   or   Bearer eyJ…',
+        'chan.paste.hint': 'Save asks the model catalog once with this credential; any failure is written right here.',
+        'chan.paste.save': 'Save and verify',
+        'chan.paste.empty': 'Nothing pasted yet.',
+        'chan.paste.done': 'Connected: 秒悟 · 网页版.',
         'chan.test.ok': 'Connection healthy ({ms} ms)',
         'chan.test.failed': 'Test failed: {reason}',
         'chan.claim.result': 'Claimed for {count} account(s), {credit} credits in total.',
@@ -3414,6 +3430,8 @@ window.__ModuleLoader__.load({
       { id: 'mimo', name: 'MiMo', org: '小米 · 桌面端额度', accent: '#FF6900' },
       { id: 'cli-lane', name: 'CodeBuddy CLI', org: '腾讯 · 官方客户端通道', accent: '#0A7AFF' },
       { id: 'doubao', name: '豆包工作', org: '字节 · 网页版额度', accent: '#2C6BFF' },
+      { id: 'qwenwork', name: '千问办公', org: '阿里 · QwenWork', accent: '#615CED' },
+      { id: 'meoo-web', name: '秒悟 · 网页版', org: '秒悟 · meoo.com', accent: '#12B886' },
     ]
 
     /** 与现有 RPC 的能力对应：余额、每日领取及独立签到状态分别判断。 */
@@ -3431,6 +3449,10 @@ window.__ModuleLoader__.load({
       minimax: { claim: true, status: true },
       zcode: { claim: true, status: true, unit: 'tokens' },
       gemini: {},
+      // 上游没有签到接口，不开 claim。
+      qwenwork: { status: true },
+      // 秒悟网页同样没有签到，只报登录态和模型数。
+      'meoo-web': { status: true },
     }
 
     /** 豆包不走 pack（协议在我们自己的 src/doubao 里），但界面要跟别的渠道一模
@@ -3442,6 +3464,28 @@ window.__ModuleLoader__.load({
       org: '字节 · 网页版额度',
       accent: '#2C6BFF',
       login: 'cookie',
+    }
+
+    /** 千问办公同理：卡是同一张 ChannelCard，方法名由 QWENWORK_RPC 翻译成
+     *  /qwenwork/* 的 REST。差别只有登录：它走插件自己的 device flow，
+     *  account.create 拿授权地址，login.poll 只问凭据有没有落盘。 */
+    const QWENWORK_CHANNEL = {
+      id: 'qwenwork',
+      name: '千问办公',
+      org: '阿里 · QwenWork',
+      accent: '#615CED',
+      login: 'device',
+    }
+
+    /** 秒悟 · 网页版：没有设备授权流，也没有官方 SDK —— 凭据就是用户自己浏览器
+     *  里那份 Cookie（或 meoo CLI 落盘的 accessToken），所以登录形态是「贴」。
+     *  贴进来的东西只落在插件自己的状态文件里，权限 0600。 */
+    const MEOOWEB_CHANNEL = {
+      id: 'meoo-web',
+      name: '秒悟 · 网页版',
+      org: '秒悟 · meoo.com',
+      accent: '#12B886',
+      login: 'paste',
     }
 
     /**
@@ -3622,6 +3666,259 @@ function sameChannelTransport(left, right) {
         }
       }
       call.transport = () => DOUBAO_TRANSPORT
+      return call
+    }
+
+    /** 千问办公那条 REST 的固定传输标识：和豆包一样，让 sameChannelTransport
+     *  认为「没换过传输」，卡片不会每 500ms 重挂一次。 */
+    const QWENWORK_TRANSPORT = { name: 'qwenwork-rest' }
+
+    /** /qwenwork/status 的形状在演进中：老宿主只回 modelNames（名字数组），
+     *  新的回 modelList（带 disabled 的对象数组）。两条都认，别让卡片在
+     *  半新半旧的后端上变成「目录空着」。 */
+    function qwenworkModelsOf(data) {
+      if (Array.isArray(data?.modelList)) {
+        return data.modelList
+          .filter(row => row !== null && typeof row === 'object' && typeof row.id === 'string' && row.id !== '')
+          .map(row => ({
+            id: row.id,
+            name: typeof row.name === 'string' && row.name !== '' ? row.name : row.id,
+            disabled: row.disabled === true,
+            dead: row.dead === true,
+          }))
+      }
+      const names = Array.isArray(data?.modelNames) ? data.modelNames : []
+      return names
+        .filter(name => typeof name === 'string' && name !== '')
+        .map(name => ({ id: name, name, disabled: false, dead: false }))
+    }
+
+    /**
+     * 千问办公不走 pack，所以把 ChannelCard 要的方法名翻成 /qwenwork/* 的 REST。
+     *
+     * 一个隐式账号：凭据在插件自己的文件里，所以 account.list 最多回一行，
+     * account.update 直接接受（没有可启停的第二份），account.delete 就是退出登录。
+     */
+    function createQwenWorkRpc() {
+      const call = async (method, payload, timeoutMs) => {
+        const body = payload !== null && typeof payload === 'object' ? payload : {}
+        const modelId = typeof body.modelId === 'string' ? body.modelId : ''
+        const disabled = body.disabled !== false
+        // 额度那条要真问一次服务端（本机没有余额副本），给宽一点。
+        const readStatus = timeoutMs && timeoutMs > 30_000 ? 60_000 : 30_000
+        switch (method) {
+          case 'account.list': {
+            const data = await api('/qwenwork/status', { timeout: readStatus })
+            if (data?.signedIn !== true) return { accounts: [] }
+            const account = data?.account ?? null
+            const nickname = String(account?.name ?? account?.email ?? '').trim() || '千问办公'
+            return {
+              accounts: [{ id: 'qwenwork', nickname, enabled: true, expiresAt: 0, refreshable: true }],
+            }
+          }
+          case 'model.list': {
+            const data = await api('/qwenwork/status', { timeout: readStatus })
+            return { models: qwenworkModelsOf(data) }
+          }
+          case 'model.refresh':
+            // 宿主还是老版本时这条路由不存在，404 会把整张卡弹成「操作失败」。
+            // 刷新失败不影响阅读目录，所以吞掉错误。
+            try { await post('/qwenwork/reload', {}, 180_000) } catch { /* 老宿主没有这条路由 */ }
+            return { refreshed: ['qwenwork'] }
+          case 'model.setDisabled':
+            return post('/qwenwork/models/toggle', { ids: [modelId], disabled }, 30_000)
+          case 'model.setAllDisabled':
+            return post('/qwenwork/models/toggle', { all: true, disabled }, 60_000)
+          case 'model.clearDead':
+            return { ok: true }
+          case 'credits.status': {
+            // 千问办公没有签到：只回一条「今天没签到、没领到」，
+            // CHANNEL_CREDITS 也只开 status 不开 claim。
+            const data = await api('/qwenwork/status', { timeout: readStatus })
+            if (data?.signedIn !== true) return { accounts: [] }
+            return {
+              accounts: [{
+                accountId: 'qwenwork',
+                status: { todayCheckedIn: false, todayCredit: 0, lastCheckinAt: 0, lastStatus: '' },
+              }],
+            }
+          }
+          case 'credits.balances': {
+            // ChannelCard 读 row.balance.total，不是顶层 total —— 少包一层整张卡
+            // 就显示「未返回余额数据」。
+            const data = await api('/qwenwork/quota', { timeout: 90_000 })
+            // 没登录就回空表：回一条带 error 的行会让卡底冒出「1 个账号余额没读到」，
+            // 而这时候根本没有账号，纯噪音。
+            if (data?.signedIn !== true) return { accounts: [] }
+            const quota = data?.quota ?? null
+            const total = Number.isFinite(quota?.remaining) ? quota.remaining
+              : Number.isFinite(quota?.left) ? quota.left : 0
+            return {
+              accounts: [{
+                accountId: 'qwenwork',
+                nickname: '千问办公',
+                balance: {
+                  total,
+                  unit: typeof quota?.unit === 'string' && quota.unit !== '' ? quota.unit : '',
+                },
+              }],
+            }
+          }
+          case 'account.test': {
+            const result = await post('/qwenwork/test', {}, 180_000)
+            return {
+              ok: result?.ok === true,
+              ms: Number(result?.ms ?? result?.totalMs ?? 0),
+              latencyMs: Number(result?.firstMs ?? 0),
+              message: result?.ok === true
+                ? String(result?.message ?? result?.text ?? '').slice(0, 80)
+                : String(result?.message ?? result?.error ?? '失败'),
+            }
+          }
+          case 'account.refresh': {
+            try {
+              const result = await post('/qwenwork/renew', {}, 90_000)
+              return { ok: result?.ok === true }
+            } catch { return { ok: false } }
+          }
+          case 'account.update':
+            // 只有一个隐式账号，没有真正的启停；接受就行，别把按钮点成红的。
+            return { ok: true }
+          case 'account.delete':
+            return post('/qwenwork/logout', {}, 25_000)
+          case 'account.create': {
+            const reply = await post('/qwenwork/login', {}, 30_000)
+            const raw = typeof reply?.url === 'string' ? reply.url : ''
+            let loginUrl = ''
+            if (raw !== '') {
+              try {
+                const target = new URL(raw)
+                if (['http:', 'https:'].includes(target.protocol) && raw.length <= 2048) loginUrl = raw
+              } catch { /* 不是绝对地址就当没有：卡片会让你手动点链接 */ }
+            }
+            return { accountId: 'qwenwork-login', loginUrl }
+          }
+          case 'login.poll': {
+            const data = await api('/qwenwork/status', { timeout: 15_000 })
+            const error = typeof data?.error === 'string' ? data.error : ''
+            if (error !== '') return { done: true, success: false, error }
+            if (data?.signedIn === true) {
+              const account = data?.account ?? null
+              const login = String(account?.email ?? account?.name ?? '').trim() || '千问办公'
+              return { done: true, success: true, login }
+            }
+            return { done: false }
+          }
+          case 'degrade.test':
+            return post('/qwenwork/degrade', { modelId }, 240_000)
+          default:
+            // 宿主版本比这页新时可能多出几个方法；不认识的当作「这事没有」，
+            // 返回空结果而不是抛错——抛错会让整张卡片变成一条红色「操作失败」。
+            return { ok: true, unsupported: String(method) }
+        }
+      }
+      call.transport = () => QWENWORK_TRANSPORT
+      return call
+    }
+
+    /** 秒悟 · 网页版那条 REST 的固定传输标识（理由同上）。 */
+    const MEOOWEB_TRANSPORT = { name: 'meoo-web-rest' }
+
+    /**
+     * 秒悟 · 网页版：把 ChannelCard 的方法名翻成 /meooweb/* 的 REST。
+     *
+     * 只有一份隐式凭据（Cookie 或 accessToken），所以账号面永远最多一行；
+     * 登录不是跳转而是「贴」，account.create 收的就是那段文本。上游没有签到接口，
+     * 也没有余额数字，credits 只回一条空状态 —— CHANNEL_CREDITS 也只开 status。
+     */
+    function createMeooWebRpc() {
+      const call = async (method, payload, timeoutMs) => {
+        const body = payload !== null && typeof payload === 'object' ? payload : {}
+        const modelId = typeof body.modelId === 'string' ? body.modelId : ''
+        const disabled = body.disabled !== false
+        const readStatus = timeoutMs && timeoutMs > 30_000 ? 90_000 : 30_000
+        switch (method) {
+          case 'account.list': {
+            const data = await api('/meooweb/status', { timeout: readStatus })
+            if (data?.signedIn !== true) return { accounts: [], error: data?.error ?? '' }
+            const account = data?.account ?? null
+            const nickname = String(account?.name ?? '').trim() || '秒悟 · 网页版'
+            return {
+              accounts: [{ id: 'meoo-web', nickname, enabled: true, expiresAt: 0, refreshable: true }],
+            }
+          }
+          case 'model.list': {
+            const data = await api('/meooweb/status', { timeout: readStatus })
+            // 形状和千问办公一样（modelList 优先、modelNames 兜底），直接复用。
+            return { models: qwenworkModelsOf(data) }
+          }
+          case 'model.refresh':
+            // 上游没登录时这条会 500：卡片只要目录，失败就不刷新，别弹红。
+            try { await post('/meooweb/models/refresh', {}, 90_000) } catch { /* 没凭据或过期 */ }
+            return { refreshed: ['meoo-web'] }
+          case 'model.setDisabled':
+            return post('/meooweb/model/disabled', { id: modelId, disabled }, 30_000)
+          case 'model.setAllDisabled':
+            return post('/meooweb/model/all', { disabled }, 30_000)
+          case 'model.clearDead':
+            return { ok: true }
+          case 'credits.status': {
+            // 没有签到：只回一条「今天没有可领的」。
+            const data = await api('/meooweb/status', { timeout: readStatus })
+            if (data?.signedIn !== true) return { accounts: [] }
+            return {
+              accounts: [{
+                accountId: 'meoo-web',
+                status: { todayCheckedIn: false, todayCredit: 0, lastCheckinAt: 0, lastStatus: '' },
+              }],
+            }
+          }
+          case 'credits.balances':
+            // 网页版不给余额数字（额度显示在它自己的站点里）；回空表，别让卡底
+            // 冒出一条「1 个账号余额没读到」的噪音。
+            return { accounts: [] }
+          case 'account.test': {
+            const result = await post('/meooweb/test', {}, 120_000)
+            return {
+              ok: result?.ok === true,
+              ms: Number(result?.ms ?? 0),
+              latencyMs: 0,
+              message: String(result?.message ?? result?.error ?? '失败').slice(0, 120),
+            }
+          }
+          case 'account.refresh': {
+            try {
+              await post('/meooweb/models/refresh', {}, 90_000)
+              return { ok: true }
+            } catch { return { ok: false } }
+          }
+          case 'account.update':
+            return { ok: true }
+          case 'account.delete':
+            return post('/meooweb/logout', {}, 25_000)
+          case 'account.create': {
+            // 贴凭据就是「建账号」：文本进 /meooweb/login，落盘后立刻验一次目录。
+            const text = typeof body.text === 'string' ? body.text : ''
+            if (text.trim() === '') return { ok: false, needsText: true, accountId: 'meoo-web' }
+            const reply = await post('/meooweb/login', { text }, 120_000)
+            return {
+              ok: reply?.ok === true,
+              accountId: 'meoo-web',
+              error: typeof reply?.error === 'string' ? reply.error : '',
+            }
+          }
+          case 'login.poll': {
+            const data = await api('/meooweb/status', { timeout: 15_000 })
+            if (data?.signedIn === true) return { done: true, success: true, login: '秒悟 · 网页版' }
+            return { done: false }
+          }
+          case 'degrade.test':
+            return { ok: true, unsupported: 'degrade.test' }
+          default:
+            return { ok: true, unsupported: String(method) }
+        }
+      }
+      call.transport = () => MEOOWEB_TRANSPORT
       return call
     }
 
@@ -3986,6 +4283,13 @@ function sameChannelTransport(left, right) {
         setBusy(value => value === 'add' ? '' : value)
       }, [rpc])
       const startLogin = async () => {
+        // 贴凭据：不跳转、不占 popup，直接把面板摆出来等用户交 Cookie / token。
+        if (channel.login === 'paste') {
+          setNotice('')
+          setLogin({ paste: true, text: '', error: '', startedAt: Date.now() })
+          setOpen('accounts')
+          return
+        }
         if (loginAttempt.current && !loginAttempt.current.cancelled) return
         const attempt = { popup: null, cancelled: false, transport: channelTransport(rpc) }
         const current = () => !attempt.cancelled && sameChannelTransport(attempt.transport, channelTransport(rpc))
@@ -4038,10 +4342,36 @@ function sameChannelTransport(left, right) {
         }
       }
 
+      /** 贴凭据的分支：把文本交给 account.create（REST 那头落到插件自己的状态文件），
+       *  成功才关面板并重读账号/模型；失败把原因留在面板里，别把用户贴的东西吃了。 */
+      const submitPaste = async () => {
+        if (login === null || login.paste !== true) return
+        const text = String(login.text ?? '').trim()
+        if (text === '') { setLogin({ ...login, error: t('chan.paste.empty') }); return }
+        setBusy('add')
+        try {
+          const value = await rpc('account.create', { provider: channel.id, text }, 120_000)
+          if (value?.ok !== true) {
+            setLogin({ ...login, error: String(value?.error ?? t('chan.login.failed').replace('{reason}', '—')) })
+            return
+          }
+          setLogin(null)
+          setNotice(t('chan.paste.done'))
+          onChanged()
+          void loadAccounts()
+          void loadModels()
+          void loadCredits()
+        } catch (error) {
+          setLogin({ ...login, error: String(error?.message ?? error) })
+        } finally { setBusy('') }
+      }
+
       // Poll the placeholder until its credential lands. Ten minutes matches the
       // window the pack keeps a pending login link alive for.
       useEffect(() => {
-        if (login === null) return undefined
+        // 贴凭据的渠道没有「等浏览器那边完成」这回事：面板开着由用户自己提交，
+        // 没有可轮询的账号，别每 3 秒空问一次。
+        if (login === null || login.paste === true) return undefined
         let alive = true
         const timer = setInterval(async () => {
           if (Date.now() - login.startedAt > 10 * 60_000) {
@@ -4293,7 +4623,30 @@ function sameChannelTransport(left, right) {
                   }),
                 }, model.dead === true ? t('chan.model.restore') : model.disabled === true ? t('chan.model.on') : t('chan.model.off'))))))) : null)
 
-      const modal = login === null ? null : h('div', { className: 'ofm_scrim' },
+      const modal = login === null ? null : login.paste === true
+        ? h('div', { className: 'ofm_scrim' },
+          h('div', { className: 'ofm_modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': t('chan.paste.title').replace('{name}', channel.name) },
+            h('div', { className: 'ofm_modalhead' }, t('chan.paste.title').replace('{name}', channel.name)),
+            h('div', { className: 'ofm_modalbody ofm_loginbody' },
+              h('div', { className: 'ofm_loginstep' }, h('b', null, '1'), h('span', null, t('chan.paste.step1'))),
+              h('div', { className: 'ofm_loginstep' }, h('b', null, '2'), h('span', null, t('chan.paste.step2'))),
+              h('textarea', {
+                className: 'ofm_mono',
+                rows: 5,
+                spellCheck: false,
+                placeholder: t('chan.paste.placeholder'),
+                value: login.text ?? '',
+                style: { width: '100%', resize: 'vertical', wordBreak: 'break-all' },
+                onInput: event => setLogin({ ...login, text: event.target.value, error: '' }),
+              }),
+              login.error ? h('p', { className: 'ofm_note' }, login.error) : h('p', { className: 'ofm_note ofm_scanline' }, t('chan.paste.hint'))),
+            h('div', { className: 'ofm_modalfoot' },
+              h('button', {
+                type: 'button', className: 'ofm_btn primary', disabled: busy === 'add',
+                onClick: () => { void submitPaste() },
+              }, t('chan.paste.save')),
+              h('button', { type: 'button', className: 'ofm_btn ghost', onClick: () => setLogin(null) }, t('chan.login.cancel')))))
+        : h('div', { className: 'ofm_scrim' },
         h('div', { className: 'ofm_modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': t('chan.login.title').replace('{name}', channel.name) },
           h('div', { className: 'ofm_modalhead' }, t('chan.login.title').replace('{name}', channel.name)),
           h('div', { className: 'ofm_modalbody ofm_loginbody' },
@@ -4456,6 +4809,7 @@ function sameChannelTransport(left, right) {
     // 签名中转：CodeArts 的签名把请求体也盖住了，bili 想压缩上下文就得自己重签，
     // 重签就得知道是哪一号账号的 AK/SK。这个卡只做一件事 —— 把账号的
     // credentialRef 递进 bili 扫的那个文件；密钥本体始终留在宿主凭据库里。
+
     function ResignCard(props) {
       const { t } = props
       const [state, setState] = useState(undefined)
@@ -4638,6 +4992,122 @@ function sameChannelTransport(left, right) {
             `${t('gw.testChat')} HTTP ${test.chat.status}`) : null))
     }
 
+    /**
+     * 渠道网关的对外钥匙。
+     *
+     * 后端的 /chan-gateway 是插件自己的一扇门：调用方拿这张卡里生成的 key 进来，
+     * 插件把它转给本机 pack 的 loopback OpenAI 端点，网关自己的凭据不出主机。
+     * 所以这张卡只摆四件事：开关、地址、key（生成/隐藏/复制/换一把）、以及它现在
+     * 到底有没有在听——拿不到 key 的人看不出它开没开。
+     */
+    function ChanRelayCard(props) {
+      const { t } = props
+      const [state, setState] = useState(undefined)
+      const [busy, setBusy] = useState('')
+      const [keyValue, setKeyValue] = useState('')
+      const [shown, setShown] = useState(false)
+      const load = useCallback(async () => {
+        try { setState(await api('/chan-gateway', { timeout: 20_000 })) }
+        catch (error) { setState({ error: String(error?.message ?? error) }) }
+      }, [])
+      useEffect(() => { void load() }, [load])
+      const readKey = useCallback(async () => {
+        try { const value = await api('/chan-gateway/key', { timeout: 15_000 }); return String(value?.key ?? '') }
+        catch (error) { showToast({ title: String(error?.message ?? error).slice(0, 160), tone: 'warn' }); return '' }
+      }, [])
+      const copy = useCallback(async (text, label) => {
+        try {
+          await navigator.clipboard.writeText(String(text))
+          showToast({ title: t('gw.copied'), body: label })
+        } catch (error) {
+          showToast({ title: String(error?.message ?? error).slice(0, 160), body: label, tone: 'warn' })
+        }
+      }, [t])
+      const toggle = useCallback(async () => {
+        const wanted = !(state?.relay?.enabled === true)
+        setBusy('apply')
+        try {
+          const value = await post('/chan-gateway/apply', { enabled: wanted }, 30_000)
+          setState(current => ({ ...(current ?? {}), ...(value !== null && typeof value === 'object' ? value : {}) }))
+        } catch (error) {
+          showToast({ title: t('chan.error').replace('{reason}', String(error?.message ?? error).slice(0, 160)), tone: 'warn' })
+        } finally { setBusy('') }
+      }, [state, t])
+      const mint = useCallback(async () => {
+        setBusy('rotate')
+        try {
+          const value = await post('/chan-gateway/rotate', undefined, 20_000)
+          const minted = String(value?.key ?? '')
+          setKeyValue(minted)
+          setShown(true)
+          if (minted !== '') await copy(minted, 'API Key')
+          await load()
+        } catch (error) {
+          showToast({ title: t('chan.error').replace('{reason}', String(error?.message ?? error).slice(0, 160)), tone: 'warn' })
+        } finally { setBusy('') }
+      }, [load, copy, t])
+
+      const info = state ?? {}
+      const failure = typeof info.error === 'string' ? info.error : ''
+      const relay = info.relay !== null && typeof info.relay === 'object' ? info.relay : {}
+      const upstream = info.gateway !== null && typeof info.gateway === 'object' ? info.gateway : {}
+      const enabled = relay.enabled === true
+      const running = relay.running === true
+      const port = typeof relay.port === 'number' && relay.port > 0 ? relay.port : 0
+      const host = typeof relay.host === 'string' && relay.host !== '' ? relay.host : '127.0.0.1'
+      const base = enabled && port !== 0 ? `http://${host}:${port}/v1` : ''
+      const relayError = typeof relay.error === 'string' ? relay.error : ''
+      const hasKey = relay.hasKey === true || keyValue !== ''
+      const tone = enabled ? (running ? 'ok' : 'warn') : ''
+
+      return h('div', { className: `ofm_chan ofm_glass${enabled ? '' : ' off'}`, 'data-state': enabled ? 'on' : 'off' },
+        h('div', { className: 'ofm_chanhead' },
+          h('span', { className: 'ofm_chanid' },
+            h('b', null, '渠道网关'),
+            h('span', null, '对外一把 key · 全部免费渠道')),
+          h('span', { className: 'ofm_chanstate' },
+            h('span', { className: `ofm_dot ${tone}` }),
+            state === undefined ? '…' : enabled ? (running ? '在听' : '没起来') : '关')),
+        failure !== '' ? h('p', { className: 'ofm_note' }, failure) : null,
+        h('div', { className: 'ofm_chanmeta' },
+          h('span', null, '地址 ', h('b', null, base === '' ? '—' : base)),
+          base === '' ? null : h('button', { type: 'button', className: 'ofm_btn', onClick: () => void copy(base, '地址') }, t('gw.copy')),
+          h('span', null, '上游端口 ', h('b', null, typeof upstream.port === 'number' ? String(upstream.port) : '—')),
+          hasKey
+            ? h('span', null, 'key ',
+              h('b', null, shown && keyValue !== '' ? keyValue : '•'.repeat(12)),
+              h('button', {
+                type: 'button', className: 'ofm_btn',
+                onClick: async () => {
+                  if (!shown && keyValue === '') { const value = await readKey(); if (value === '') return; setKeyValue(value) }
+                  setShown(value => !value)
+                },
+              }, shown ? t('gw.hide') : t('gw.show')),
+              h('button', {
+                type: 'button', className: 'ofm_btn',
+                onClick: async () => {
+                  const value = keyValue !== '' ? keyValue : await readKey()
+                  if (value === '') return
+                  setKeyValue(value)
+                  await copy(value, 'API Key')
+                },
+              }, t('gw.copy')))
+            : null),
+        base === '' || !hasKey ? null : h('p', { className: 'ofm_note' },
+          `base_url: ${base}   api_key: ••••`),
+        hasKey ? null : h('p', { className: 'ofm_note' }, '还没有 key：点一下「生成 API Key」就会写进设置，key 只在本机。'),
+        relayError === '' ? null : h('p', { className: 'ofm_note' }, relayError),
+        h('div', { className: 'ofm_chanacts' },
+          h(Switch, {
+            checked: enabled,
+            label: '对外开放',
+            disabled: busy !== '',
+            onChange: () => { void toggle() },
+          }),
+          h(Button, { disabled: busy !== '', onClick: () => { void mint() } },
+            busy === 'rotate' ? '…' : hasKey ? '换一把 key' : '生成 API Key')))
+    }
+
     function MiMoCard(props) {
       const { t, onRemove } = props
       const [state, setState] = useState(undefined)
@@ -4689,6 +5159,444 @@ function sameChannelTransport(left, right) {
           }, busy ? '…' : '刷新额度')))
     }
 
+
+    /**
+     * 秒悟（meoo）的卡。
+     *
+     * 它不投模型：这条渠道给的是「一键上线」的算力、部署额度和技能。所以这张卡
+     * 跟渠道卡同形（同样三格、同样一排动作），但格子里装的是计划、积分、技能状态。
+     *
+     * 数据全部来自官方 CLI 的一次 `meoo account --json`，插件自己不拼 HTTP ——
+     * oauth 的令牌刷新归 CLI 管，谁抢着刷谁把用户的登录弄丢。
+     */
+    /**
+     * 秒悟的账号行。两张卡共用一份 —— 平台只有一个身份（oauth 单账号），
+     * 所以这里不铺列表，只把这一条的积分、今日登录分和操作摆齐，
+     * 行状跟其它渠道卡里的账号行保持一致：名字 / 状态 / 余额角标 / 一排小按钮。
+     */
+    function MeooAccountRow(props) {
+      const { state, reload, t } = props
+      const [busy, setBusy] = useState('')
+      const [note, setNote] = useState('')
+
+      const auth = state?.auth ?? {}
+      const live = state?.live ?? null
+      const daily = live?.daily ?? null
+      const disabled = state?.disabled === true
+      const name = typeof auth.username === 'string' && auth.username !== '' ? auth.username : '秒悟账号'
+      const balance = Number.isFinite(live?.availableBalance) ? live.availableBalance : null
+      const off = disabled === true
+
+      const run = useCallback(async (name, job) => {
+        setBusy(name)
+        setNote('')
+        try {
+          const reply = await job()
+          if (reply !== null && reply !== undefined && reply.ok === false) {
+            setNote(typeof reply.hint === 'string' && reply.hint !== '' ? reply.hint : String(reply.error ?? reply.message ?? '没成功'))
+          } else if (typeof reply?.message === 'string' && reply.message !== '') {
+            setNote(reply.message)
+          }
+          await reload()
+        } catch (error) {
+          setNote(String(error?.message ?? error))
+        } finally { setBusy('') }
+      }, [reload])
+
+      const act = (key, label, job, cls) => h('button', {
+        type: 'button', className: 'ofm_minibtn' + (cls === undefined ? '' : ' ' + cls), disabled: busy !== '',
+        'aria-busy': busy === key ? 'true' : undefined,
+        onClick: () => { void run(key, job) },
+      }, busy === key ? '…' : label)
+
+      return h(Fragment, null,
+        h('div', { className: 'ofm_acct' + (off ? ' pending' : '') },
+          h('span', { className: 'ofm_acctname', title: name }, name),
+          h('span', { className: 'ofm_acctmeta' },
+            (off ? t('chan.disabled') : t('chan.enabled')),
+            auth.edition === '' ? '' : ` · ${auth.edition}`,
+            auth.credentialType === '' ? '' : ` · ${auth.credentialType}`),
+          daily !== null && daily?.granted === true
+            ? h('span', { className: 'ofm_creditbadge' },
+              Number.isFinite(daily.amount) && daily.amount > 0 ? `今日 +${daily.amount}` : '今日已领')
+            : null,
+          balance === null
+            ? h('span', { className: 'ofm_note' }, '积分 —')
+            : h('span', { className: 'ofm_creditbadge strong' }, `积分 ${balance}`),
+          h('span', { className: 'ofm_acctacts' },
+            act('test', t('chan.act.test'), () => post('/meoo/test', {}, 90_000)),
+            act('claim', '签到', () => post('/meoo/claim', {}, 120_000)),
+            act('renew', t('chan.act.refresh'), () => post('/meoo/renew', {}, 30_000)),
+            act('toggle', off ? t('chan.act.enable') : t('chan.act.disable'),
+              () => post('/meoo/enabled', { enabled: off })),
+            act('remove', t('chan.act.delete'), () => post('/meoo/logout', {}, 30_000), 'danger'))),
+        note === '' ? null : h('p', { className: 'ofm_note' }, note))
+    }
+
+    function MeooCard(props) {
+      const { t, onRemove } = props
+      const [state, setState] = useState(undefined)
+      const [busy, setBusy] = useState('')
+      const [note, setNote] = useState('')
+
+      const load = useCallback(async force => {
+        try { setState(await api(`/meoo/status${force ? '?refresh=1' : ''}`, { timeout: 30_000 })) }
+        catch (error) { setState({ error: String(error?.message ?? error) }) }
+      }, [])
+
+      useEffect(() => { void load(false) }, [load])
+
+      const cli = state?.cli ?? {}
+      const auth = state?.auth ?? {}
+      const points = state?.points ?? null
+      const plan = state?.plan ?? null
+      const quota = state?.deployQuota ?? null
+      const warnings = Array.isArray(state?.warnings) ? state.warnings : []
+      const installed = cli.installed === true
+      const loggedIn = auth.loggedIn === true
+      const kind = !installed ? 'off' : loggedIn ? 'on' : 'err'
+      const stateText = state === undefined ? '…' : !installed ? '未装 CLI' : loggedIn ? t('chan.state.on') : t('chan.state.off')
+
+      // 积分和「没读到」必须分开：null 是没拿到，0 是真用完。
+      const balance = Number.isFinite(points?.availableBalance) ? points.availableBalance : null
+      const modelTotal = Number.isFinite(state?.models) ? state.models : 0
+      const modelEnabled = Number.isFinite(state?.modelsEnabled) ? state.modelsEnabled : modelTotal
+      const creditLabel = state === undefined ? '…' : balance === null ? '—' : String(balance)
+      const disabled = busy !== ''
+
+      // 「刷新模型」：秒悟是部署平台，没有可投放的模型。这一下把 CLI 状态和积分
+      // 重新读一遍，并把「确实没有模型可刷」写成一行说明，省得用户反复点。
+      const reloadModels = useCallback(async () => {
+        setBusy('models')
+        setNote('')
+        try {
+          await load(true)
+          setNote('秒悟是部署平台，没有可投放的模型；状态和积分已重新读取。')
+        } catch (error) {
+          setNote(String(error?.message ?? error))
+        } finally { setBusy('') }
+      }, [load])
+
+      const claimCredit = useCallback(async () => {
+        setBusy('claim')
+        setNote('')
+        try {
+          const reply = await post('/meoo/claim', {}, 120_000)
+          if (reply?.ok === true) {
+            setNote(reply?.already === true ? '今天的登录积分已经领过了' : '已领到今日积分')
+          } else {
+            setNote(typeof reply?.hint === 'string' && reply.hint !== ''
+              ? reply.hint
+              : String(reply?.error ?? reply?.message ?? '没领到'))
+          }
+          await load(true)
+        } catch (error) {
+          setNote(String(error?.message ?? error))
+        } finally { setBusy('') }
+      }, [load])
+
+      const login = useCallback(async () => {
+        setBusy('add')
+        try {
+          const reply = await post('/meoo/login', {}, 20_000)
+          setNote(typeof reply?.hint === 'string' && reply.hint !== '' ? reply.hint : '浏览器里点完「授权」，这一格会自己亮。')
+          // 用户在浏览器里点完「授权」，CLI 才把 token 落盘。这里自己盯着状态，
+          // 不用他回来点任何东西；90 秒还没好就把提示留着，别一直转圈。
+          for (let i = 0; i < 45; i++) {
+            await new Promise(done => setTimeout(done, 2_000))
+            let next = null
+            try { next = await api('/meoo/status?refresh=1', { timeout: 30_000 }) } catch { next = null }
+            if (next?.auth?.loggedIn === true) {
+              setState(next)
+              setNote('')
+              showToast({ title: '秒悟已登录', body: String(next?.auth?.username ?? '') })
+              break
+            }
+          }
+        } catch (error) {
+          setNote(String(error?.message ?? error))
+        } finally { setBusy('') }
+      }, [])
+
+      const refresh = useCallback(async () => {
+        setBusy('refresh')
+        try { await load(true) }
+        finally { setBusy('') }
+      }, [load])
+
+      return h('article', {
+        className: `ofm_chan ofm_glass${kind === 'on' ? '' : ' off'}`,
+        'data-state': kind,
+        style: { '--chan-accent': 'linear-gradient(135deg,#2f7d6e,#5ec6a8)' },
+      },
+        h('div', { className: 'ofm_chanhead' },
+          h('span', { className: 'ofm_chanid' },
+            h('b', null, '秒悟'),
+            h('span', null, 'meoo · 额度积分')),
+          h('span', { className: 'ofm_chanstate' },
+            h('span', { className: `ofm_dot ${kind === 'on' ? 'ok' : kind === 'err' ? 'err' : ''}` }),
+            stateText),
+          typeof onRemove === 'function'
+            ? h('button', {
+              type: 'button',
+              className: 'ofm_chanclose',
+              title: t('chan.hide'),
+              'aria-label': t('chan.hide'),
+              onClick: () => onRemove({ id: 'meoo', name: '秒悟' }),
+            }, '×')
+            : null),
+        h('div', { className: 'ofm_chanmeta' },
+          h(Switch, {
+            checked: state?.disabled !== true,
+            label: '保持启用',
+            disabled,
+            onChange: async () => {
+              setBusy('enabled')
+              try { await post('/meoo/enabled', { enabled: state?.disabled === true }); await load(true) }
+              catch (error) { setNote(String(error?.message ?? error)) }
+              finally { setBusy('') }
+            },
+          }),
+          h('span', null, state?.disabled === true
+            ? '已停用：这一格不再读取额度'
+            : '秒悟是部署平台，没有可投放的模型 —— 模型选择器里不会出现它，这张卡只摆账号与积分')),
+        h('div', { className: 'ofm_chanmeta' },
+          h('span', null, `${t('chan.meta.accounts')} `, h('b', null, state === undefined ? '…' : `${loggedIn ? 1 : 0}/1`)),
+          h('span', null, '模型 ', h('b', null, state === undefined ? '…' : `${modelEnabled}/${modelTotal}`)),
+          h('span', { className: 'ofm_credittotal' }, '剩余积分 ', h('b', null, creditLabel))),
+        h('div', { className: 'ofm_chanacts' },
+          h('button', {
+            type: 'button', className: 'ofm_btn', disabled,
+            'aria-busy': busy === 'add' ? 'true' : undefined,
+            onClick: () => { void login() },
+          }, busy === 'add' ? '…' : t('chan.act.add')),
+          installed ? h('button', {
+            type: 'button', className: 'ofm_btn ghost', disabled,
+            'aria-busy': busy === 'refresh' ? 'true' : undefined,
+            onClick: () => { void refresh() },
+          }, busy === 'refresh' ? t('chan.credits.loading') : t('chan.credits.refresh')) : null,
+          h('button', {
+            type: 'button', className: 'ofm_btn ghost', disabled: disabled || !installed,
+            'aria-busy': busy === 'models' ? 'true' : undefined,
+            onClick: () => { void reloadModels() },
+          }, busy === 'models' ? '…' : '刷新模型'),
+          h('button', {
+            type: 'button', className: 'ofm_btn ghost', disabled: disabled || !installed,
+            'aria-busy': busy === 'claim' ? 'true' : undefined,
+            onClick: () => { void claimCredit() },
+          }, busy === 'claim' ? '…' : '一键领取')),
+        note === '' ? null : h('p', { className: 'ofm_note' }, note),
+        state?.error !== undefined ? h('p', { className: 'ofm_balanceerror', role: 'alert' }, String(state.error))
+          : installed ? null
+            : h('p', { className: 'ofm_note' }, 'npm i -g @aliyun-meoo/cli@latest 装完之后这一格会自己亮。'),
+        !installed && state?.error === undefined ? null
+          : loggedIn || state === undefined ? null
+            : h('p', { className: 'ofm_note' }, String(auth.reason === '' ? '还没登录秒悟' : auth.reason)),
+        warnings.length === 0 ? null : h('p', { className: 'ofm_note' }, warnings.join(' · ')),
+        loggedIn
+          ? h(MeooAccountRow, { key: 'meoo-account', state, reload: () => load(true), t })
+          : state === undefined ? null : h('p', { className: 'ofm_note' }, t('chan.noAccount')))
+    }
+
+
+    /**
+     * 秒悟 CLI 的卡。
+     *
+     * 和「秒悟」那张分开：那张管账号与积分（额度记在平台账本上），这张管
+     * CLI 本身（装没装、哪个版本、这台机器上到底有没有登录态）。混在一张卡里
+     * 会出现「账号 1/1」和「未装 CLI」同时成立的读法，用户没法判断该修哪个。
+     */
+    function MeooCliCard(props) {
+      const { t, onRemove } = props
+      const [state, setState] = useState(undefined)
+      const [busy, setBusy] = useState('')
+      const [open, setOpen] = useState('')
+      const [note, setNote] = useState('')
+
+      const load = useCallback(async force => {
+        try { setState(await api(`/meoo/status${force ? '?refresh=1' : ''}`, { timeout: 30_000 })) }
+        catch (error) { setState({ error: String(error?.message ?? error) }) }
+      }, [])
+
+      useEffect(() => { void load(false) }, [load])
+
+      const cli = state?.cli ?? {}
+      const auth = state?.auth ?? {}
+      const installed = cli.installed === true
+      const loggedIn = auth.loggedIn === true
+      const version = typeof cli.version === 'string' && cli.version !== '' ? cli.version : ''
+      const minVersion = typeof cli.minRequired === 'string' && cli.minRequired !== '' ? cli.minRequired : ''
+      const outdated = cli.outdated === true
+      const path = typeof cli.path === 'string' ? cli.path : ''
+      const kind = !installed ? 'off' : loggedIn ? 'on' : 'err'
+      const stateText = state === undefined ? '…' : !installed ? '未装 CLI' : loggedIn ? t('chan.state.on') : t('chan.state.off')
+      const disabled = busy !== ''
+      const toggle = key => () => setOpen(prev => (prev === key ? '' : key))
+
+      const cliDisabled = state?.cliDisabled === true
+
+      // 渠道开关走设置页同一条 POST：关掉只是不投放模型，CLI 与登录态都不动。
+      const toggleEnabled = useCallback(async () => {
+        setBusy('cliEnabled')
+        try {
+          await post('/meoo/cli/enabled', { enabled: cliDisabled })
+          await load(true)
+          showToast({ title: cliDisabled ? '已打开秒悟 CLI 通道' : '已关闭秒悟 CLI 通道' })
+        } catch (error) {
+          setNote(String(error?.message ?? error).slice(0, 200))
+        } finally {
+          setBusy('')
+        }
+      }, [cliDisabled, load])
+
+      const login = useCallback(async () => {
+        setBusy('add')
+        try {
+          const reply = await post('/meoo/login', {}, 20_000)
+          setNote(typeof reply?.hint === 'string' && reply.hint !== '' ? reply.hint : '浏览器里点完「授权」，这一格会自己亮。')
+          for (let i = 0; i < 45; i++) {
+            await new Promise(done => setTimeout(done, 2_000))
+            let next = null
+            try { next = await api('/meoo/status?refresh=1', { timeout: 30_000 }) } catch { next = null }
+            if (next?.auth?.loggedIn === true) {
+              setState(next)
+              setNote('')
+              showToast({ title: '秒悟已登录', body: String(next?.auth?.username ?? '') })
+              break
+            }
+          }
+        } catch (error) {
+          setNote(String(error?.message ?? error))
+        } finally { setBusy('') }
+      }, [])
+
+      const reloadModels = useCallback(async () => {
+        setBusy('models')
+        setNote('')
+        try {
+          await load(true)
+          setNote('秒悟是部署平台，没有可投放的模型；状态和积分已重新读取。')
+        } catch (error) {
+          setNote(String(error?.message ?? error))
+        } finally { setBusy('') }
+      }, [load])
+
+      const claimCredit = useCallback(async () => {
+        setBusy('claim')
+        setNote('')
+        try {
+          const reply = await post('/meoo/claim', {}, 120_000)
+          if (reply?.ok === true) {
+            setNote(reply?.already === true ? '今天的登录积分已经领过了' : '已领到今日积分')
+          } else {
+            setNote(typeof reply?.hint === 'string' && reply.hint !== ''
+              ? reply.hint
+              : String(reply?.error ?? reply?.message ?? '没领到'))
+          }
+          await load(true)
+        } catch (error) {
+          setNote(String(error?.message ?? error))
+        } finally { setBusy('') }
+      }, [load])
+
+      const upgrade = useCallback(async () => {
+        setBusy('upgrade')
+        try {
+          const reply = await post('/meoo/upgrade', {}, 200_000)
+          if (reply?.ok === true) {
+            setNote('')
+            showToast({ title: '秒悟 CLI 已升级', body: String(reply?.cli?.version ?? '') })
+            await load(true)
+          } else {
+            setNote(String(reply?.error ?? '升级没成功'))
+          }
+        } catch (error) {
+          setNote(String(error?.message ?? error))
+        } finally { setBusy('') }
+      }, [load])
+
+      return h('div', {
+        className: `ofm_chan ofm_glass${kind === 'on' ? '' : ' off'}`,
+        'data-state': kind,
+      },
+        h('div', { className: 'ofm_chanhead' },
+          h('span', { className: 'ofm_chanid' },
+            h('b', null, '秒悟 CLI'),
+            h('span', null, 'meoo · 官方客户端通道')),
+          h('span', { className: 'ofm_chanstate' },
+            h('span', { className: `ofm_dot ${kind === 'on' ? 'ok' : kind === 'err' ? 'err' : ''}` }),
+            stateText),
+          typeof onRemove === 'function'
+            ? h('button', {
+              type: 'button',
+              className: 'ofm_chanclose',
+              title: t('chan.hide'),
+              'aria-label': t('chan.hide'),
+              onClick: () => onRemove({ id: 'meoo-cli', name: '秒悟 CLI' }),
+            }, '×')
+            : null),
+        h('div', { className: 'ofm_chanmeta' },
+          h(Switch, {
+            checked: !cliDisabled,
+            label: '在选择器里投放',
+            disabled,
+            onChange: () => { void toggleEnabled() },
+          }),
+          h('span', null, state === undefined
+            ? ''
+            : cliDisabled
+              ? '已关闭：这张卡不再检测 CLI'
+              : '开着：CLI 在就照常读账号与积分（秒悟没有可投放的模型）')),
+        h('div', { className: 'ofm_chanmeta' },
+          h('span', null, '版本 ', h('b', { className: outdated ? 'ofm_credittotal' : undefined }, state === undefined ? '…' : version === '' ? '—' : `v${version}`)),
+          h('span', null, `${t('chan.meta.accounts')} `, h('b', null, state === undefined ? '…' : `${loggedIn ? 1 : 0}/1`)),
+          h('span', null, '最低 ', h('b', null, minVersion === '' ? '—' : `v${minVersion}`))),
+        note === '' ? null : h('p', { className: 'ofm_note' }, note),
+        typeof state?.error === 'string' && state.error !== ''
+          ? h('p', { className: 'ofm_balanceerror', role: 'alert' }, state.error)
+          : null,
+        !installed && state !== undefined
+          ? h('p', { className: 'ofm_note' }, 'npm i -g @aliyun-meoo/cli@latest 装完之后这一格会自己亮。')
+          : installed
+            ? h('p', { className: 'ofm_note' },
+              loggedIn
+                ? `命令：${path === '' ? '没找到 meoo' : path}`
+                : 'CLI 装好了，但还没登录。点「添加账号」，浏览器里点完「授权」，这一格会自己亮。')
+            : null,
+        outdated
+          ? h('p', { className: 'ofm_note' }, `CLI 版本低于要求（${minVersion === '' ? '见文档' : `v${minVersion}`}），点「升级 CLI」。`)
+          : null,
+        loggedIn
+          ? h('div', { className: 'ofm_acctlist' },
+            h(MeooAccountRow, { key: 'meoo-account', state, reload: () => load(true), t }))
+          : null,
+        h('div', { className: 'ofm_chanacts' },
+          h('button', {
+            type: 'button', className: 'ofm_btn', disabled: disabled || !installed,
+            'aria-busy': busy === 'add' ? 'true' : undefined,
+            onClick: () => { void login() },
+          }, busy === 'add' ? '…' : t('chan.act.add')),
+          h('button', {
+            type: 'button', className: 'ofm_btn ghost', disabled,
+            'aria-busy': busy === 'cliEnabled' ? 'true' : undefined,
+            onClick: () => { void load(true) },
+          }, busy === 'cliEnabled' ? '…' : '重新检测'),
+          installed ? h('button', {
+            type: 'button', className: 'ofm_btn ghost', disabled,
+            'aria-busy': busy === 'upgrade' ? 'true' : undefined,
+            onClick: () => { void upgrade() },
+          }, busy === 'upgrade' ? '…' : outdated ? '升级 CLI' : '检查更新') : null,
+          h('button', {
+            type: 'button', className: 'ofm_btn ghost', disabled: disabled || !installed,
+            'aria-busy': busy === 'models' ? 'true' : undefined,
+            onClick: () => { void reloadModels() },
+          }, busy === 'models' ? '…' : '刷新模型'),
+          h('button', {
+            type: 'button', className: 'ofm_btn ghost', disabled: disabled || !installed,
+            'aria-busy': busy === 'claim' ? 'true' : undefined,
+            onClick: () => { void claimCredit() },
+          }, busy === 'claim' ? '…' : '一键领取')))
+    }
 
     /**
      * The CodeBuddy CLI lane's card.
@@ -4747,6 +5655,21 @@ function sameChannelTransport(left, right) {
       const version = typeof state?.version === 'string' ? state.version : ''
       const accounts = Array.isArray(state?.accounts) ? state.accounts : []
       const nicknames = accounts.map(row => row?.nickname).filter(name => typeof name === 'string' && name !== '')
+      // CLI 车道的开关走设置页同一条 POST：关掉只是不投放模型，CLI 与账号都不动。
+      const toggleEnabled = useCallback(async () => {
+        const wanted = state?.enabled === false
+        setBusy(true)
+        try {
+          await post('/settings', { cliLaneEnabled: wanted })
+          await load(true)
+          showToast({ title: wanted ? '已打开 CLI 通道' : '已关闭 CLI 通道' })
+        } catch (error) {
+          showToast({ title: String(error?.message ?? error).slice(0, 160), tone: 'warn' })
+        } finally {
+          setBusy(false)
+        }
+      }, [load, state])
+
       return h('div', {
         className: `ofm_chan ofm_glass${installed ? '' : ' off'}`,
         'data-state': installed ? 'on' : 'off',
@@ -4767,6 +5690,18 @@ function sameChannelTransport(left, right) {
               onClick: () => onRemove({ id: 'cli-lane', name: 'CodeBuddy CLI' }),
             }, '×')
             : null),
+        h('div', { className: 'ofm_chanmeta' },
+          h(Switch, {
+            checked: state?.enabled !== false,
+            label: '在选择器里投放',
+            disabled: busy,
+            onChange: () => { void toggleEnabled() },
+          }),
+          h('span', null, state === undefined
+            ? ''
+            : state.enabled === false
+              ? '已关闭：模型选择器里看不到这一组'
+              : '开着：CLI 在，就投放')),
         h('div', { className: 'ofm_chanmeta' },
           h('span', null, `版本 `, h('b', null, state === undefined ? '…' : version === '' ? '—' : version)),
           h('span', null, `账号 `, h('b', null, state === undefined ? '…' : String(nicknames.length === 0 ? 1 : nicknames.length))),
@@ -4897,6 +5832,40 @@ function sameChannelTransport(left, right) {
         }
       }, [])
       useEffect(() => { void loadDoubao() }, [loadDoubao])
+      // 千问办公同样不经 pack：计数由它自己的 /qwenwork/status 喂给同一张 ChannelCard。
+      const qwenRpc = useMemo(() => createQwenWorkRpc(), [])
+      const [qwenStatus, setQwenStatus] = useState(undefined)
+      const loadQwen = useCallback(async () => {
+        try {
+          const data = await api('/qwenwork/status', { timeout: 30_000 })
+          const signedIn = data?.signedIn === true
+          const models = qwenworkModelsOf(data)
+          setQwenStatus({
+            accounts: { total: signedIn ? 1 : 0, enabled: signedIn ? 1 : 0 },
+            models: { total: models.length, disabled: models.filter(model => model.disabled === true).length },
+          })
+        } catch {
+          setQwenStatus({ accounts: { total: 0, enabled: 0 }, models: { total: 0, disabled: 0 } })
+        }
+      }, [])
+      useEffect(() => { void loadQwen() }, [loadQwen])
+      // 秒悟 · 网页版：同一张 ChannelCard，计数由 /meooweb/status 喂。
+      const meooWebRpc = useMemo(() => createMeooWebRpc(), [])
+      const [meooWebStatus, setMeooWebStatus] = useState(undefined)
+      const loadMeooWeb = useCallback(async () => {
+        try {
+          const data = await api('/meooweb/status', { timeout: 30_000 })
+          const signedIn = data?.signedIn === true
+          const models = qwenworkModelsOf(data)
+          setMeooWebStatus({
+            accounts: { total: signedIn ? 1 : 0, enabled: signedIn ? 1 : 0 },
+            models: { total: models.length, disabled: models.filter(model => model.disabled === true).length },
+          })
+        } catch {
+          setMeooWebStatus({ accounts: { total: 0, enabled: 0 }, models: { total: 0, disabled: 0 } })
+        }
+      }, [])
+      useEffect(() => { void loadMeooWeb() }, [loadMeooWeb])
       const [error, setError] = useState('')
       // 卡片右上角的「×」把这张卡从这一页收起来，底部的「＋」加回来。
       // 名单存在插件设置里（换台机器、重开 App 都是同样的排列）；账号、令牌、
@@ -5011,8 +5980,10 @@ function sameChannelTransport(left, right) {
       const onChanged = useCallback(() => {
         void loadStatus()
         void loadDoubao()
+        void loadQwen()
+        void loadMeooWeb()
         try { window.dispatchEvent(new CustomEvent('ofm:channels')) } catch { /* no window */ }
-      }, [loadStatus, loadDoubao])
+      }, [loadStatus, loadDoubao, loadQwen, loadMeooWeb])
 
       const onError = useCallback((channel, err) => {
         const reason = String(err?.message ?? err)
@@ -5060,7 +6031,7 @@ function sameChannelTransport(left, right) {
         !available ? h('div', { className: 'ofm_callout' }, h('div', null, t('chan.rpc.unavailable'))) : null,
         !ready && available ? h('div', { className: 'ofm_chanwrap' },
           [0, 1, 2].map(index => h('div', { className: 'ofm_skel', key: index, style: { minHeight: 168 } }))) : null,
-        ready ? h('div', { className: 'ofm_chanwrap' }, [hidden.includes('mimo') ? null : h(MiMoCard, { key: 'mimo', t, onRemove }), hidden.includes('cli-lane') ? null : h(CliLaneCard, { key: 'cli-lane', t, onRemove }), h(GatewayCard, { key: 'gateway', t, rpc: available ? rpc : null }), h(ResignCard, { key: 'resign', t }), h(ModelSyncCard, { key: 'model-sync', t }), hidden.includes('doubao') ? null : h(ChannelCard, { key: 'doubao', channel: DOUBAO_CHANNEL, status: doubaoStatus, rpc: doubaoRpc, t, onError, onChanged, onRemove }), ...filledProviders.map(channel => h(ChannelCard, {
+        ready ? h('div', { className: 'ofm_chanwrap' }, [hidden.includes('mimo') ? null : h(MiMoCard, { key: 'mimo', t, onRemove }), hidden.includes('cli-lane') ? null : h(CliLaneCard, { key: 'cli-lane', t, onRemove }), h(GatewayCard, { key: 'gateway', t, rpc: available ? rpc : null }), h(ChanRelayCard, { key: 'chan-relay', t }), h(ResignCard, { key: 'resign', t }), h(ModelSyncCard, { key: 'model-sync', t }), hidden.includes('doubao') ? null : h(ChannelCard, { key: 'doubao', channel: DOUBAO_CHANNEL, status: doubaoStatus, rpc: doubaoRpc, t, onError, onChanged, onRemove }), ...filledProviders.map(channel => h(ChannelCard, {
           key: channel.id,
           channel,
           status: statuses?.[channel.id],
@@ -5069,7 +6040,7 @@ function sameChannelTransport(left, right) {
           onError,
           onChanged,
           onRemove,
-        }))]) : null,
+        })), hidden.includes('meoo') ? null : h(MeooCard, { key: 'meoo', t, onRemove }), hidden.includes('meoo-cli') ? null : h(MeooCliCard, { key: 'meoo-cli', t, onRemove }), hidden.includes('qwenwork') ? null : h(ChannelCard, { key: 'qwenwork', channel: QWENWORK_CHANNEL, status: qwenStatus, rpc: qwenRpc, t, onError, onChanged, onRemove }), hidden.includes('meoo-web') ? null : h(ChannelCard, { key: 'meoo-web', channel: MEOOWEB_CHANNEL, status: meooWebStatus, rpc: meooWebRpc, t, onError, onChanged, onRemove })]) : null,
         // 未接入的渠道：默认折叠成一行，点开才摊成卡片。它们不参与上面的
         // 「已连接/总数」计数，避免出现 4/11 那种永远补不齐的数字。
         ready && emptyProviders.length > 0 ? h('div', { className: 'ofm_addzone' },

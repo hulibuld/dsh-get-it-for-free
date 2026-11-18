@@ -152,7 +152,7 @@ function reasoningLevelOf(entry, requested) {
  * @param doubao - `src/doubao/index.js` 的运行时（提供 `models` / `pickAccount`）。
  * @param logger - 日志。
  */
-export function createDoubaoAdapter({ doubao, logger = console } = {}) {
+export function createDoubaoAdapter({ doubao, logger = console, onRoster = null } = {}) {
   // 目录走两条路：
   //   1. 注册那一刻要的答案 —— 只读本地快照，绝不等网络。宿主在挂载时问一次
   //      listModels，那一问超时或抛错，这一组模型就再也不出现（而且没有重试
@@ -178,11 +178,28 @@ export function createDoubaoAdapter({ doubao, logger = console } = {}) {
     return []
   }
 
+  /**
+   * 目录换了一版就叫外面重挂一次路由。
+   *
+   * 宿主的选择器（`buildModelCatalog`）是在 `modelCatalog()` 那一刻算出来的，
+   * 客户端只在收到 `llm/adapters-updated` 时才重读；注册完就不再广播的插件，
+   * 后面拿到的模型等于「只有自己知道」。所以每拉完一次目录都重播一遍。
+   */
+  function announce() {
+    if (typeof onRoster !== 'function') return
+    try {
+      onRoster()
+    } catch (error) {
+      logger.warn?.(`get-it-for-free: 豆包目录广播失败：${error?.message ?? error}`)
+    }
+  }
+
   /** 后台补拉一次目录（加账号、点「刷新模型」之后用）。 */
   function warm() {
     if (refreshing) return
     refreshing = true
     void doubao.models()
+      .then(() => { announce() })
       .catch(error => {
         logger.warn?.(`get-it-for-free: 豆包模型目录读取失败：${error?.message ?? error}`)
       })
@@ -346,9 +363,10 @@ export function createDoubaoAdapter({ doubao, logger = console } = {}) {
     },
 
     async listModels(provider) {
-      // 没有账号时给空表：宁可这组不出现在选择器里，也不提供一条按不动的模型。
-      const account = await doubao.pickAccount()
-      if (!account) return []
+      // 目录不设账号门槛。原来这里「没有账号就返回空表」，代价是整组模型直接
+      // 从右下角选择器里消失；而账号能不能用是发请求那一刻才知道的事
+      // (stream() 会明确回「还没有登录账号：在设置的豆包卡里点添加账号」)。
+      // 一个随时会整组消失的渠道，比一条选了才报错的模型更难用。
       const entries = await roster()
       return entries.map(entry => {
         const menu = effortMenuOf(entry)
@@ -364,6 +382,18 @@ export function createDoubaoAdapter({ doubao, logger = console } = {}) {
     },
 
     resolveModel,
+
+    /**
+     * 基类里 `stream` 是**唯一**抽象方法（`LlmAdapter.stream`），其余都有默认
+     * 实现。只给 `prepareCall` 是不够的：宿主有几条路径直接拿
+     * `registration.adapter.stream(options)`（版本差异、探测、以及 `prepareCall`
+     * 抛错后的回退），拿到 undefined 就是 TypeError，而注册外面那层 try/catch
+     * 会把它咽掉 —— 表现就是「面板上模型数正常、右下角没有这一组」。
+     * 所以两条入口都给，model 从 options 里取。
+     */
+    stream(options) {
+      return stream(options, String(options?.model ?? ''))
+    },
 
     async prepareCall(provider, model) {
       return {
