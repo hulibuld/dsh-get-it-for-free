@@ -22,3 +22,9 @@ docs-merge/
 # Finder 复制出来的副本（同名带空格），只在本地存在
 client 2.js
 * 2.js
+# 一次性调试脚本与探针归档：本机取证用，不进仓库
+scripts/_*.mjs
+scripts/probes/
+# 工作区过程文档（计划书 / 进度）：本地流程用，不进仓库
+计划书.md
+进度.md

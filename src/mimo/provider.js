@@ -30,7 +30,7 @@ import { MiMoSession } from './session.js'
 import { MiMoQuotaReader } from './quota.js'
 import { createChannel } from '../channel.js'
 import { readSse } from '../http.js'
-import { readStream } from '../stream.js'
+import { finishReason, readStream } from '../stream.js'
 import { toChatMessages } from '../messages.js'
 
 export { MIMO_DISPLAY_NAME, MIMO_PROVIDER }
@@ -171,7 +171,12 @@ export function createMiMo({ logger = console, onTopology = () => {} } = {}) {
       .then(() => channel.push(undefined))
       .catch(error => channel.push(error instanceof Error ? error : new Error(String(error))))
 
-    yield* readStream(channel.read(), 'chat', new Map(), () => Date.now(), {})
+    // readStream 只把上游的 finish 记进快照，不产出 finish 块 —— 而宿主的块协议
+    // 靠 finish 块收尾。以前这里直接结束，网关于是判定「流没结束就断了」，
+    // 统一回 502 incomplete_stream（即使正文已经正常吐完）。
+    const outcome = yield* readStream(channel.read(), 'chat', new Map(), () => Date.now(), {})
+    if (outcome.sawUsage === true) yield { type: 'usage', usage: outcome.usage }
+    yield { type: 'finish', reason: outcome.brokenToolCall === true ? { kind: 'max-tokens' } : finishReason(outcome.finish) }
   }
 
   const adapter = {

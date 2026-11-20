@@ -19,18 +19,28 @@
  * @module src/qwenwork/provider.js
  */
 
-import fs from 'node:fs'
-import path from 'node:path'
+import {
+  accountCredential,
+  applyRefreshed,
+  isAccountExpired,
+  loadStore,
+  mintAccountId,
+  pickUsableAccount,
+  publicAccount,
+  writeStore,
+} from './account-store.js'
+import { requestTokenRefresh } from './auth.js'
 import { startChatShim } from './chat-shim.js'
 import { createCatalogStore } from './catalog.js'
 import { getAccountContext, getValidCredential, getValidToken } from './credentials-seam.js'
+import { resolveGatewayEndpoint, relaxTlsForVpc } from './endpoint.js'
 import { clearLocalCredential, describeHold, getLocalCredential } from './local-credentials.js'
-import { startDeviceLogin } from './login-device-flow.js'
+import { decodeJwt, startDeviceLogin } from './login-device-flow.js'
 import { FALLBACK_QWENWORK_MODELS, MAX_OUTPUT_TOKENS } from './models.js'
+import { fetchAccountOverview } from './rest.js'
 import { createChannel } from '../channel.js'
 import { toChatMessages, toToolDefs } from '../messages.js'
-import { resolveDshHome } from '../store.js'
-import { readStream } from '../stream.js'
+import { finishReason, readStream } from '../stream.js'
 
 export const QWENWORK_PROVIDER = 'qwenwork'
 export const QWENWORK_DISPLAY_NAME = '千问办公'
@@ -59,34 +69,28 @@ export const DEGRADE_PROMPT = [
   '- 只输出图形本身，前后不要加任何解释。',
 ].join('\n')
 
-/** 插件自己的开关状态（关掉的模型不进选择器），不写进凭据文件。 */
-function statePath() {
-  return path.join(resolveDshHome(), 'get-it-for-free', 'qwenwork.json')
-}
+/**
+ * 第一条账号固定用这个 id：卡片里的旧代码（余额、用量）还写死着它，
+ * 沿用下来就不用两边一起改。
+ */
+const LEGACY_ACCOUNT_ID = 'qwenwork'
 
-/** 懒读：每次要用都读一遍，别在进程里养第二份真源。 */
+/** 插件自己的状态（账号 + 关掉的模型），都存在 get-it-for-free/qwenwork.json。 */
 function readState() {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(statePath(), 'utf8'))
-    return {
-      disabledModels: Array.isArray(parsed?.disabledModels)
-        ? parsed.disabledModels.filter(id => typeof id === 'string' && id !== '')
-        : [],
-    }
-  } catch {
-    return { disabledModels: [] }
-  }
+  return loadStore()
 }
 
-function writeState(next) {
-  try {
-    const file = statePath()
-    fs.mkdirSync(path.dirname(file), { recursive: true })
-    fs.writeFileSync(file, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 })
-    return true
-  } catch {
-    return false
-  }
+/**
+ * 只改一部分，其余原样写回。
+ *
+ * 以前这里是「整份 writeState({disabledModels})」—— 单份凭据时没事，多账号
+ * 之后那样写会把 accounts 整个抹掉，所以一律走合并。
+ */
+function patchState(patch) {
+  const current = readState()
+  const merged = { ...current, ...(patch ?? {}) }
+  const written = writeStore(merged)
+  return written.ok === true ? written.store : merged
 }
 
 /** 目录里一条记录取 id：上游几个版本的字段名不一样，按顺序退。 */
@@ -120,10 +124,63 @@ export function createQwenWork({ logger = console, onTopology = () => {} } = {})
   let lastError = ''
 
   /**
-   * 拿一份凭据：先看本地 device flow 文件（跨平台，谁都能拿到），没有再退回
-   * 上游那条 Windows 桌面端路径（在 Windows 上登录过桌面端的人零操作可用）。
+   * 把一条账号的 token 换新并写回账号库。
+   *
+   * 服务端的 refresh_token 是单代际轮换的：换到新的就必须立刻落盘，否则下一次
+   * 用的还是旧的那一只，直接被拒。失败就把原因留在 lastError，凭据原样退回。
+   *
+   * @param account - 账号条目
+   * @returns 换过（或没换成功）的账号条目
    */
-  async function resolveCredential() {
+  async function refreshAccount(account) {
+    const refreshToken = typeof account?.refreshToken === 'string' ? account.refreshToken : ''
+    if (refreshToken === '') return account
+    try {
+      const refreshed = await requestTokenRefresh(refreshToken)
+      const next = applyRefreshed(readState(), account.id, refreshed)
+      if (next.account !== null) {
+        writeStore(next.store)
+        return next.account
+      }
+    } catch (error) {
+      // 换不动不算致命：可能只是这台机器暂时没网，带着旧 token 先试一次。
+      lastError = error?.message ?? String(error)
+      logger.warn?.(`get-it-for-free: 千问办公账号续期失败（${account.nickname}）：${lastError}`)
+    }
+    return account
+  }
+
+  /**
+   * 按 id 取账号；不给 id 就是当前 active 那一条。
+   *
+   * @param accountId - 指定账号（测试、查额度时用）
+   */
+  function findAccount(accountId) {
+    const store = readState()
+    if (typeof accountId === 'string' && accountId.trim() !== '') {
+      return store.accounts.find(row => row.id === accountId.trim()) ?? null
+    }
+    return pickUsableAccount(store)
+  }
+
+  /**
+   * 拿一份凭据：账号库里 active（或指定）的那一条，过期就顺手续期。
+   *
+   * 只有一种情况会去问接缝：这台机器还从没进过多账号形态、账号库里一条都没有
+   * —— 那是 Windows 上靠桌面端登过录的老用户，白捡一份凭据。**一旦迁移过，
+   * 账号库就是唯一真源**，删空也不再回退，否则删掉的号会自己复活。
+   */
+  async function resolveCredential(accountId) {
+    const store = readState()
+    let account = findAccount(accountId)
+    if (account !== null && isAccountExpired(account) === true) {
+      account = await refreshAccount(account)
+    }
+    if (account !== null) return accountCredential(account)
+
+    if (store.managed === true) return undefined
+
+    // 迁移前的老路：本地 device flow 文件 → Windows 桌面端凭据。
     const local = await getLocalCredential()
     if (local !== undefined) return local
     try {
@@ -147,8 +204,8 @@ export function createQwenWork({ logger = console, onTopology = () => {} } = {})
    * 下一次 `status()` 自然就 signedIn 了。
    */
   function login() {
-    if (loginRun !== null) return { url: loginRun.url, pending: true }
-    const state = { url: '', pending: true, error: '' }
+    if (loginRun !== null) return { url: loginRun.url, pending: true, accountId: loginRun.accountId }
+    const state = { url: '', pending: true, error: '', accountId: '' }
     loginRun = state
     void startDeviceLogin({
       onUrl: url => {
@@ -160,6 +217,9 @@ export function createQwenWork({ logger = console, onTopology = () => {} } = {})
         state.url = state.url === '' ? result.url : state.url
         state.pending = false
         lastError = ''
+        // 登录只负责把 token 拿回来，落到哪条账号由账号库决定。
+        const added = admitAccount(result.credential, result.claims)
+        state.accountId = added?.id ?? ''
         onTopology()
       })
       .catch(error => {
@@ -172,6 +232,150 @@ export function createQwenWork({ logger = console, onTopology = () => {} } = {})
         if (loginRun === state) loginRun = null
       })
     return { url: state.url, pending: true }
+  }
+
+  /**
+   * 一条凭据进账号库：同一个用户（uid 相同，退到 token 相同）就算已经在了，
+   * 只更新 token —— 反复点登录不该在卡片上堆出一串自己。
+   *
+   * @param credential - device flow 回来的凭据
+   * @param claims - 可选，JWT 载荷（没有就从 token 里解）
+   */
+  function admitAccount(credential, claims) {
+    if (credential === undefined || credential === null) return null
+    const jwt = claims ?? (typeof credential.token === 'string' ? decodeJwt(credential.token) : {})
+    const user = credential.user ?? {}
+    const uid = String(user.uid ?? user.id ?? jwt.user_id ?? jwt.sub ?? '')
+    const store = readState()
+    const existing = store.accounts.find(row => {
+      const rowUid = String(row?.user?.uid ?? row?.user?.id ?? '')
+      if (uid !== '' && rowUid !== '') return rowUid === uid
+      return row.token === credential.token
+    })
+    const seed = {
+      id: existing?.id ?? (store.accounts.length === 0 ? LEGACY_ACCOUNT_ID : mintAccountId()),
+      nickname: existing?.nickname ?? user.name ?? user.username ?? jwt.username ?? jwt.email ?? '',
+      token: credential.token,
+      refreshToken: credential.refreshToken,
+      expiresAt: credential.expiresAt,
+      user: { ...(existing?.user ?? {}), ...user },
+      loginDeviceId: credential.loginDeviceId ?? existing?.loginDeviceId ?? '',
+      enabled: true,
+      addedAt: existing?.addedAt ?? Date.now(),
+      lastUsedAt: Date.now(),
+    }
+    const accounts = existing === undefined
+      ? store.accounts.concat([seed])
+      : store.accounts.map(row => (row.id === existing.id ? seed : row))
+    const next = writeStore({
+      ...store,
+      accounts,
+      activeAccountId: store.activeAccountId === '' ? seed.id : store.activeAccountId,
+    })
+    return next.store.accounts.find(row => row.id === seed.id) ?? null
+  }
+
+  /**
+   * 换账号 = 换 token，所以 shim 里那条签名会话必须跟着重建。
+   *
+   * signer-session 自己只在 token 变化时重建（chat-shim.js 的 getSession），
+   * 但那是「下一次请求」的事；账号这一侧换了之后旧 shim 还握着上一个账号的
+   * 签名缓存，主动关掉最省心。
+   */
+  function recycleShim() {
+    const closing = shim?.close
+    shim = null
+    if (typeof closing === 'function') Promise.resolve(closing()).catch(() => {})
+  }
+
+  /** 账号列表：只给前端看该看的字段，token 一个字母都不出去。 */
+  function accountList() {
+    const store = readState()
+    return {
+      accounts: store.accounts.map(row => publicAccount(row, store.activeAccountId)),
+      activeAccountId: store.activeAccountId,
+    }
+  }
+
+  /**
+   * 新增账号：起一次 device flow，等用户在浏览器里授权。
+   *
+   * 跟 login() 的区别只是「多账号之后它有个明确的语义」：返回的那条 url 授完
+   * 权就多一条账号，原来那条不动。
+   */
+  function accountCreate() {
+    return login()
+  }
+
+  /**
+   * 切换使用的账号。
+   *
+   * @param body - `{ accountId }`
+   */
+  async function accountUse(body) {
+    const wanted = String(body?.accountId ?? '').trim()
+    if (wanted === '') return { ok: false, error: '缺少 accountId' }
+    const store = readState()
+    const account = store.accounts.find(row => row.id === wanted)
+    if (account === undefined) return { ok: false, error: '没有这个账号' }
+    if (account.enabled === false) return { ok: false, error: '这个账号已被停用' }
+    const next = writeStore({ ...store, activeAccountId: wanted })
+    recycleShim()
+    onTopology()
+    // 顺手把 lastUsedAt 记上：卡片按它排序时「刚切过去的那个」要在最上面。
+    return { ok: true, status: await status(), accounts: accountList().accounts, activeAccountId: next.store.activeAccountId }
+  }
+
+  /**
+   * 改一条账号：昵称、启停。
+   *
+   * 停用的如果是当前账号，active 会自己退到下一条（写盘时 pickActiveId 干这事）。
+   */
+  async function accountUpdate(body) {
+    const wanted = String(body?.accountId ?? '').trim()
+    const patch = body?.patch ?? {}
+    const store = readState()
+    const account = store.accounts.find(row => row.id === wanted)
+    if (account === undefined) return { ok: false, error: '没有这个账号' }
+    const updated = { ...account }
+    const nickname = typeof patch.nickname === 'string' ? patch.nickname.trim() : ''
+    if (nickname !== '') updated.nickname = nickname.slice(0, 64)
+    if (typeof patch.enabled === 'boolean') updated.enabled = patch.enabled
+    const next = writeStore({
+      ...store,
+      accounts: store.accounts.map(row => (row.id === wanted ? updated : row)),
+    })
+    recycleShim()
+    onTopology()
+    return { ok: true, accounts: accountList().accounts, activeAccountId: next.store.activeAccountId }
+  }
+
+  /**
+   * 删一条账号。
+   *
+   * 删的是当前账号时，active 自动落到下一条；删成空的话顺手把那份老的
+   * 单份凭据文件也清掉 —— 不然它会在下次重启时把刚删的号带回来。
+   */
+  async function accountDelete(body) {
+    const wanted = String(body?.accountId ?? '').trim()
+    if (wanted === '') return { ok: false, error: '缺少 accountId' }
+    const store = readState()
+    if (store.accounts.some(row => row.id === wanted) !== true) {
+      return { ok: false, error: '没有这个账号' }
+    }
+    const accounts = store.accounts.filter(row => row.id !== wanted)
+    const next = writeStore({ ...store, accounts })
+    if (accounts.length === 0 && wanted === LEGACY_ACCOUNT_ID) {
+      // 迁移过来的那条就是那份旧文件本身，一起清掉，别留复活的口子。
+      try {
+        clearLocalCredential()
+      } catch {
+        /* 删不掉也就算了，反正账号库已经空 */
+      }
+    }
+    recycleShim()
+    onTopology()
+    return { ok: true, accounts: accountList().accounts, activeAccountId: next.store.activeAccountId }
   }
 
   /** 懒启动本地 shim：失败就是失败，下次再试。 */
@@ -238,11 +442,15 @@ export function createQwenWork({ logger = console, onTopology = () => {} } = {})
     }
     const models = catalog.models()
     const disabled = disabledSet()
+    const list = accountList()
     return {
       provider: QWENWORK_PROVIDER,
       displayName: QWENWORK_DISPLAY_NAME,
       signedIn,
       account,
+      // 卡片上的账号块读这两项：accounts 里没有 token，可以放心落缓存。
+      accounts: list.accounts,
+      activeAccountId: list.activeAccountId,
       models: models.length,
       modelNames: models.map(entry => nameOf(entry, idOf(entry))).filter(name => name !== ''),
       // ChannelCard 读这一份：modelNames 保留给旧调用（它没有开关状态）。
@@ -270,8 +478,12 @@ export function createQwenWork({ logger = console, onTopology = () => {} } = {})
    *
    * 未选档位时保持历史行为（整窗给答案），不让菜单反过来削减默认额度。
    */
-  const EFFORT_IDS = ['low', 'medium', 'high']
   const EFFORT_CEILING = { low: 4096, medium: 8192, high: MAX_OUTPUT_TOKENS }
+  // 宿主只认对象数组：normalizeModelInfo 逐条校验 effort.id / effort.name，
+  // 字符串数组会让 id 变成 undefined，整组模型报
+  // "adapter returned invalid or duplicate reasoning effort metadata"。
+  const EFFORT_IDS = Object.keys(EFFORT_CEILING)
+  const EFFORT_MENU = EFFORT_IDS.map(id => ({ id, name: id }))
 
   function outputCeiling(effort, requested) {
     const key = typeof effort === 'string' ? effort.trim().toLowerCase() : ''
@@ -377,7 +589,12 @@ export function createQwenWork({ logger = console, onTopology = () => {} } = {})
       }
     })()
 
-    yield* readStream(channel.read(), 'chat', new Map(), () => Date.now(), {})
+    // readStream 只把上游的 finish 记进快照，不产出 finish 块 —— 而宿主的块协议
+    // 靠 finish 块收尾。以前这里直接结束，网关于是判定「流没结束就断了」，
+    // 统一回 502 incomplete_stream（即使正文已经正常吐完）。
+    const outcome = yield* readStream(channel.read(), 'chat', new Map(), () => Date.now(), {})
+    if (outcome.sawUsage === true) yield { type: 'usage', usage: outcome.usage }
+    yield { type: 'finish', reason: outcome.brokenToolCall === true ? { kind: 'max-tokens' } : finishReason(outcome.finish) }
   }
 
   async function resolveModel(provider, model) {
@@ -396,7 +613,7 @@ export function createQwenWork({ logger = console, onTopology = () => {} } = {})
       context: { contextWindow: 1_000_000 },
       defaultMaxTokens: MAX_OUTPUT_TOKENS,
       // 思考强度菜单：档位只在 max_tokens 上落地（见 outputCeiling）。
-      reasoning: { efforts: EFFORT_IDS, defaultEffort: 'medium' },
+      reasoning: { efforts: EFFORT_MENU, defaultEffort: 'medium' },
     }
   }
 
@@ -431,7 +648,7 @@ export function createQwenWork({ logger = console, onTopology = () => {} } = {})
             name: nameOf(entry, id),
             description: '千问办公 · 桌面端额度',
             inputModalities: ['text'],
-            reasoning: { efforts: EFFORT_IDS, defaultEffort: 'medium' },
+            reasoning: { efforts: EFFORT_MENU, defaultEffort: 'medium' },
           }
         })
         .filter(row => row !== null)
@@ -459,11 +676,42 @@ export function createQwenWork({ logger = console, onTopology = () => {} } = {})
    * 路径必须真的发一次请求。失败也回一条能读的原因，让卡片自己说明白，而不是
    * 空着——空着的时候用户只能猜是没登录还是接口挂了。
    */
-  async function quota() {
+  async function quota(accountId) {
+    // 失败也要带上 accountId：卡片按账号分行显示，出错的那一行得能对上号。
+    const asked = findAccount(accountId)
     try {
-      const overview = await getAccountContext({})
+      const store = readState()
+      const account = asked
+      if (account === null) {
+        // 还没进多账号形态：交给接缝，它会自己读那份单份凭据并处理刷新。
+        if (store.managed === true) {
+          return { signedIn: false, error: '还没登录千问办公', at: Date.now() }
+        }
+        const overview = await getAccountContext({})
+        return {
+          signedIn: true,
+          accountId: null,
+          quota: overview?.quota ?? null,
+          usage: overview?.usage ?? null,
+          plan: overview?.plan ?? null,
+          degraded: overview?.degraded === true,
+          at: Date.now(),
+        }
+      }
+
+      // 多账号之后额度必须按「这一条账号的 token」问：接缝读的是那份单份
+      // 凭据文件，问出来的永远是它自己那个号，卡片上就会张冠李戴。
+      const credential = accountCredential(
+        isAccountExpired(account) === true ? await refreshAccount(account) : account,
+      )
+      const baseUrl = resolveGatewayEndpoint(credential)
+      const overview = await fetchAccountOverview(credential.token, {
+        baseUrl,
+        fetchImpl: relaxTlsForVpc(baseUrl),
+      })
       return {
         signedIn: true,
+        accountId: account.id,
         quota: overview?.quota ?? null,
         usage: overview?.usage ?? null,
         plan: overview?.plan ?? null,
@@ -471,7 +719,12 @@ export function createQwenWork({ logger = console, onTopology = () => {} } = {})
         at: Date.now(),
       }
     } catch (error) {
-      return { signedIn: false, error: error?.message ?? String(error), at: Date.now() }
+      return {
+        signedIn: false,
+        accountId: asked?.id ?? null,
+        error: error?.message ?? String(error),
+        at: Date.now(),
+      }
     }
   }
 
@@ -481,12 +734,28 @@ export function createQwenWork({ logger = console, onTopology = () => {} } = {})
    * 和额度查询分开的理由：服务端的 refresh_token 是单代际轮换的，换一次就把
    * 旧的不认了。这种事只该在用户明确点「续期」时发生，不能藏在定时任务里。
    */
-  async function renew() {
-    try {
-      await getValidToken({ forceRefresh: true })
-      return { ok: true, refreshed: true, status: await status() }
-    } catch (error) {
-      return { ok: false, error: error?.message ?? String(error), status: await status() }
+  async function renew(accountId) {
+    const account = findAccount(accountId)
+    if (account === null) {
+      // 老路：只有那份单份凭据时，续期还是交给接缝去刷。
+      try {
+        await getValidToken({ forceRefresh: true })
+        return { ok: true, refreshed: true, status: await status() }
+      } catch (error) {
+        return { ok: false, error: error?.message ?? String(error), status: await status() }
+      }
+    }
+    if (String(account.refreshToken ?? '') === '') {
+      return { ok: false, error: '这条账号没有 refresh token，需要重新登录一次', status: await status() }
+    }
+    const next = await refreshAccount(account)
+    const refreshed = next.token !== account.token
+    return {
+      ok: refreshed,
+      refreshed,
+      accountId: account.id,
+      error: refreshed ? undefined : (lastError === '' ? '续期没有换到新 token' : lastError),
+      status: await status(),
     }
   }
 
@@ -502,7 +771,8 @@ export function createQwenWork({ logger = console, onTopology = () => {} } = {})
     const current = new Set(readState().disabledModels)
     if (disabled === true) current.add(id)
     else current.delete(id)
-    writeState({ disabledModels: [...current] })
+    // 只合 disabledModels：整份覆盖会把 accounts 一起抹掉。
+    patchState({ disabledModels: [...current] })
     onTopology()
     return { disabledModels: [...current] }
   }
@@ -518,7 +788,7 @@ export function createQwenWork({ logger = console, onTopology = () => {} } = {})
     } else {
       for (const entry of catalog.models()) current.delete(idOf(entry))
     }
-    writeState({ disabledModels: [...current] })
+    patchState({ disabledModels: [...current] })
     onTopology()
     return { disabledModels: [...current] }
   }
@@ -659,8 +929,26 @@ export function createQwenWork({ logger = console, onTopology = () => {} } = {})
    *
    * 拿不到 shim 或没有凭据都不算异常，回一条能读的原因给卡片。
    */
-  async function test() {
+  async function test(accountId) {
     const startedAt = Date.now()
+    const wanted = typeof accountId === 'string' ? accountId.trim() : ''
+    // 卡片可以对**任意一条**账号点测试。当前账号走真发一次消息（下面的老路）；
+    // 别的账号不能换 shim ——「切过去」是用户的决定，不是点测试的副作用 ——
+    // 所以只用它自己的 token 问一次账号接口，确认这条还活着。
+    const active = pickUsableAccount(readState())
+    if (wanted !== '' && active?.id !== wanted) {
+      let other = findAccount(wanted)
+      if (other === null) return { ok: false, ms: Date.now() - startedAt, message: '没有这个账号' }
+      if (isAccountExpired(other) === true) other = await refreshAccount(other)
+      const boxed = accountCredential(other)
+      const base = resolveGatewayEndpoint(boxed)
+      try {
+        await fetchAccountOverview(boxed.token, { baseUrl: base, fetchImpl: relaxTlsForVpc(base) })
+        return { ok: true, ms: Date.now() - startedAt, message: 'token 有效（非当前账号，只验了鉴权）' }
+      } catch (error) {
+        return { ok: false, ms: Date.now() - startedAt, message: String(error?.message ?? error).slice(0, 120) }
+      }
+    }
     let credential
     try {
       credential = await resolveCredential()
@@ -711,20 +999,63 @@ export function createQwenWork({ logger = console, onTopology = () => {} } = {})
     degrade,
     test,
 
-    /** 退出登录：删掉本地凭据，shim 也跟着重来。 */
-    logout() {
-      clearLocalCredential()
-      const closing = shim?.close
-      shim = null
-      if (typeof closing === 'function') Promise.resolve(closing()).catch(() => {})
-      onTopology()
+    /**
+     * 退出登录：删掉「当前这条」账号，shim 也跟着重来。
+     *
+     * 多账号之后不能再一把清空 —— 用户点退出指的是卡片上正在用的那个号，
+     * 其他号还得在。库空了才顺手清那份老的单份凭据文件。
+     */
+    async logout() {
+      const store = readState()
+      const account = pickUsableAccount(store)
+      if (account === null) {
+        clearLocalCredential()
+        recycleShim()
+        onTopology()
+      } else {
+        // accountDelete 里已经关过 shim、重播过拓扑了，不重复做。
+        await accountDelete({ accountId: account.id })
+      }
       return status()
     },
 
-    /** 让卡片上的「重新读取」走同一条路径。 */
+    // 账号面板要的那几个动作。全部只吃纯数据（前端 fetch 过来的 body），
+    // 不摸 fs、不碰 token：token 只在这一层里进出。
+    accounts() {
+      return accountList()
+    },
+    accountCreate,
+    accountUse,
+    accountUpdate,
+    accountDelete,
+
+    /**
+     * 让卡片上的「刷新模型」走同一条路径。
+     *
+     * 这里必须等目录真的拉回来：原来 catalog.refresh 是 fire-and-forget，
+     * 点击后立刻返回旧目录，用户看到的就是「点了没反应」。拉失败也只记在
+     * error 里，不把整张卡弹成失败。
+     */
     async reload() {
-      const credential = await resolveCredential()
-      if (credential !== undefined) catalog.refresh({ credential }).catch(() => {})
+      // 先清空上一次的失败原因：卡片读 status.error 判断这次到底成没成，
+      // 留着旧错误会让一次成功的刷新继续弹红。
+      lastError = ''
+      try {
+        const credential = await resolveCredential()
+        if (credential === undefined || credential === null) {
+          // 没凭据时这次点击什么都没发生。留空 error 会让卡片判成「已刷新」，
+          // 而模型列表一条都不会变。
+          lastError = '千问办公还没接上：先在本机 QwenWork 桌面端登录一次'
+          return status()
+        }
+        const next = await catalog.refresh({ credential })
+        if (Array.isArray(next) && next.length > 0) onTopology()
+        // 用真实目录说话：拉完还是 0 条就留原因，别回一句空 error 让卡片报成功。
+        lastError = catalog.models().length === 0 ? '千问办公没有返回任何模型' : ''
+      } catch (error) {
+        lastError = error?.message ?? String(error)
+        logger.warn?.(`get-it-for-free: 千问办公刷新模型失败：${lastError}`)
+      }
       return status()
     },
     dispose() {

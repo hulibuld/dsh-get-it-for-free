@@ -33,7 +33,6 @@ import { ROUTE_LABELS, ROUTE_MAIN, ROUTE_REGION } from './src/adapter.js'
 import { DATA_DIR_NAME, LEGACY_DATA_DIR_NAME, resolveDshHome, publicModelVisibility, validateModelVisibility, isModelHidden } from './src/store.js'
 import { isEacEntry } from './src/catalog.js'
 import { generateKey, rankLanAddresses, startForwardServer, startLanRelay } from './src/forward.js'
-import { chanGatewayCredential, chanGatewayEnabled, chanGatewayPort, startChanRelay } from './src/chan-relay.js'
 import { CODE, UpstreamError } from './src/http.js'
 import { egressActive, egressFetch, outletLabel, readOutletSelection, startEgressRelay } from './src/egress.js'
 import { directFetch } from './src/eac.js'
@@ -64,7 +63,6 @@ import { createCliLane, CLI_ROUTE } from './src/cli-lane.js'
 import { createModelSync } from './src/model-sync.js'
 import { createDoubao } from './src/doubao/index.js'
 import { DOUBAO_PROVIDER, createDoubaoAdapter } from './src/doubao/adapter.js'
-import { createResignBridge } from './src/resign-bridge.js'
 import { readBiliCompat, setBiliPassthrough } from './src/bili-config.js'
 import { sweepCodeArts } from './src/codearts-refresh.js'
 import { sweepQoderCheckin, QODER_CHECKIN_SCHEMA } from './src/qoder-checkin.js'
@@ -553,12 +551,19 @@ export function apply(ctx, config) {
       login: () => qwenwork.login(),
       logout: () => qwenwork.logout(),
       reload: () => qwenwork.reload(),
-      quota: () => qwenwork.quota(),
-      renew: () => qwenwork.renew(),
+      // 额度 / 续期 / 测活都要按账号传参：多账号之后「没有 accountId」
+      // 只表示「用当前那条」，不能当成「只有一条」。
+      quota: accountId => qwenwork.quota(accountId),
+      renew: accountId => qwenwork.renew(accountId),
       setModelDisabled: (modelId, disabled) => qwenwork.setModelDisabled(modelId, disabled),
       setAllModelsDisabled: disabled => qwenwork.setAllModelsDisabled(disabled),
       degrade: modelId => qwenwork.degrade(modelId),
-      test: () => qwenwork.test(),
+      test: accountId => qwenwork.test(accountId),
+      accounts: () => qwenwork.accounts(),
+      accountCreate: () => qwenwork.accountCreate(),
+      accountUse: body => qwenwork.accountUse(body),
+      accountUpdate: body => qwenwork.accountUpdate(body),
+      accountDelete: body => qwenwork.accountDelete(body),
     }
   } catch (error) {
     logger.warn?.(`get-it-for-free: 千问办公通道未挂载（${error?.message ?? error}）`)
@@ -606,6 +611,8 @@ export function apply(ctx, config) {
       displayName: '秒悟 · 网页版',
       signedIn: false,
       account: null,
+      accounts: [],
+      activeAccountId: '',
       models: 0,
       modelNames: [],
       modelList: [],
@@ -616,11 +623,20 @@ export function apply(ctx, config) {
     }),
     login: async () => ({ ok: false, stored: false, error: '秒悟网页通道未挂载' }),
     logout: async () => ({ signedIn: false, removed: false }),
+    accounts: async () => ({ accounts: [], activeAccountId: '' }),
+    // 通道没挂载时没有额度可查：回空表，别让卡底冒一条「余额没读到」。
+    credits: async () => ({ accounts: [], activeAccountId: '' }),
+    accountCreate: async () => ({ ok: false, error: '秒悟网页通道未挂载', accounts: [], activeAccountId: '' }),
+    accountUse: async () => ({ ok: false, error: '秒悟网页通道未挂载', accounts: [], activeAccountId: '' }),
+    accountUpdate: async () => ({ ok: false, error: '秒悟网页通道未挂载', accounts: [], activeAccountId: '' }),
+    accountRemove: async () => ({ ok: false, error: '秒悟网页通道未挂载', accounts: [], activeAccountId: '' }),
     models: async () => ({ models: [] }),
     refresh: async () => [],
     test: async () => ({ ok: false, ms: 0, message: '秒悟网页通道未挂载', models: 0 }),
     setModelDisabled: () => ({ disabledModels: [] }),
     setAllModelsDisabled: () => ({ disabledModels: [] }),
+    loginWindow: async () => ({ ok: false, error: '秒悟网页通道未挂载' }),
+    loginWindowAvailable: () => ({ available: false, staging: '' }),
   }
   try {
     const meooWeb = createMeooWeb({ logger, onTopology: () => emitTopology() })
@@ -637,11 +653,21 @@ export function apply(ctx, config) {
       status: () => meooWeb.status(),
       login: text => meooWeb.login(text),
       logout: () => meooWeb.logout(),
+      accounts: () => meooWeb.accounts(),
+      credits: () => meooWeb.credits(),
+      accountCreate: text => meooWeb.accountCreate(text),
+      accountUse: accountId => meooWeb.accountUse(accountId),
+      accountUpdate: (accountId, patch) => meooWeb.accountUpdate(accountId, patch),
+      accountRemove: accountId => meooWeb.accountRemove(accountId),
       models: () => meooWeb.models(),
       refresh: () => meooWeb.refresh(),
       test: () => meooWeb.test(),
       setModelDisabled: (id, disabled) => meooWeb.setModelDisabled(id, disabled),
       setAllModelsDisabled: disabled => meooWeb.setAllModelsDisabled(disabled),
+      // 登录窗：不传 accountId 是「添加新账号」（先清 staging 分区再开），
+      // 传 accountId 是「重登这个账号」（开它自己的分区，不清）。
+      loginWindow: options => meooWeb.loginWindow(options),
+      loginWindowAvailable: () => meooWeb.loginWindowAvailable(),
     }
   } catch (error) {
     logger.warn?.(`get-it-for-free: 秒悟网页通道未挂载（${error?.message ?? error}）`)
@@ -946,119 +972,6 @@ export function apply(ctx, config) {
     }
   }
 
-  // ── the channels' gateway relay ─────────────────────────────────────────────
-  /**
-   * The absorbed pack serves every 免费 provider through one OpenAI-compatible
-   * gateway on the loopback. The relay is this plugin's own door in front of
-   * it: callers authenticate with `chanGateway.relay.key` and the forwarded
-   * hop is re-stamped with the gateway's own credential, which never leaves
-   * the host. Off until asked for; the settings page owns the switch.
-   */
-  let chanRelay = null
-  let chanRelayError = ''
-  let chanRelaySyncInFlight = null
-
-  function chanRelayKey() {
-    const relay = settings.get().chanGateway?.relay ?? {}
-    if (typeof relay.key === 'string' && relay.key !== '') return relay.key
-    const minted = generateKey()
-    settings.update({ chanGateway: { ...(settings.get().chanGateway ?? {}), relay: { ...(settings.get().chanGateway?.relay ?? {}), key: minted } } })
-    settings.flush()
-    return minted
-  }
-
-  function rotateChanRelayKey() {
-    const minted = generateKey()
-    settings.update({ chanGateway: { ...(settings.get().chanGateway ?? {}), relay: { ...(settings.get().chanGateway?.relay ?? {}), key: minted } } })
-    settings.flush()
-    return minted
-  }
-
-  /** The gateway's address and credential, read fresh: both can move (env). */
-  function chanGatewayTarget() {
-    return {
-      port: chanGatewayPort(process.env),
-      enabledByEnv: chanGatewayEnabled(process.env),
-      credential: chanGatewayCredential({ profileContext: optional('profileContext'), env: process.env }),
-    }
-  }
-
-  async function syncChanRelay() {
-    while (chanRelaySyncInFlight !== null) await chanRelaySyncInFlight.catch(() => {})
-    const run = syncChanRelayOnce()
-    chanRelaySyncInFlight = run
-    try { await run } finally { if (chanRelaySyncInFlight === run) chanRelaySyncInFlight = null }
-  }
-  async function syncChanRelayOnce() {
-    const relay = settings.get().chanGateway?.relay ?? {}
-    const wanted = relay.enabled === true
-    const host = String(relay.host ?? '').trim() || '127.0.0.1'
-    const port = Number.isFinite(Number(relay.port)) && Number(relay.port) > 0 ? Math.trunc(Number(relay.port)) : 0
-    const target = chanGatewayTarget()
-    if (chanRelay !== null && wanted && chanRelay.host === host && chanRelay.port === port) return
-    if (chanRelay === null && !wanted) return
-    if (chanRelay !== null) {
-      const closing = chanRelay
-      chanRelay = null
-      await closing.close().catch(() => {})
-    }
-    if (!wanted) { chanRelayError = ''; return }
-    if (port !== 0 && target.port === port) {
-      chanRelayError = 'the relay needs a port of its own (the gateway listens on ' + target.port + ')'
-      logger.warn?.(`get-it-for-free: channel gateway relay not started (${chanRelayError})`)
-      return
-    }
-    try {
-      chanRelay = await startChanRelay({
-        config: () => {
-          const current = settings.get().chanGateway?.relay ?? {}
-          const targetNow = chanGatewayTarget()
-          return {
-            enabled: current.enabled === true,
-            host: String(current.host ?? '').trim() || '127.0.0.1',
-            port: current.port ?? 0,
-            lanKey: chanRelayKey(),
-            gatewayHost: '127.0.0.1',
-            gatewayPort: targetNow.port,
-            gatewayKey: targetNow.credential?.key ?? '',
-          }
-        },
-        log: message => logger.warn?.(`get-it-for-free channel relay: ${message}`),
-      })
-      chanRelayError = ''
-      // The bound port goes back into the settings, so the page shows the
-      // address that actually answers (the OS picks when 0 was asked for).
-      const settled = settings.get().chanGateway ?? {}
-      settings.update({ chanGateway: { ...settled, relay: { ...(settled.relay ?? {}), port: chanRelay.port } } })
-      settings.flush()
-    } catch (error) {
-      chanRelayError = String(error?.message ?? error)
-      logger.warn?.(`get-it-for-free: channel gateway relay could not start (${chanRelayError})`)
-    }
-  }
-
-  function chanRelayStatus() {
-    const relay = settings.get().chanGateway?.relay ?? {}
-    const target = chanGatewayTarget()
-    return {
-      relay: {
-        enabled: relay.enabled === true,
-        running: chanRelay !== null,
-        host: chanRelay?.host ?? (String(relay.host ?? '').trim() || '127.0.0.1'),
-        port: chanRelay?.port ?? relay.port ?? 0,
-        hasKey: typeof relay.key === 'string' && relay.key !== '',
-        error: chanRelayError,
-      },
-      gateway: {
-        port: target.port,
-        enabledByEnv: target.enabledByEnv,
-        keyFound: target.credential !== null,
-        keyFromEnv: target.credential?.fromEnv === true,
-        keyPath: target.credential?.path ?? '',
-      },
-    }
-  }
-
   // ── egress outlet ───────────────────────────────────────────────────────────
   /**
    * Which node the outlet is carrying traffic on, and what it costs to reach the
@@ -1113,7 +1026,7 @@ export function apply(ctx, config) {
       await closing.close().catch(() => {})
       // The way out changed under every fetch: re-detect the exit so the pill and
       // the model verdicts describe the path the next request actually takes.
-      void settleOutletWatch()
+      void settleOutletWatch().catch(() => {})
     }
     if (!wanted) {
       outletError = ''
@@ -1145,7 +1058,7 @@ export function apply(ctx, config) {
       // Same as the close path: the exit IP, its country and the region-gated
       // verdicts all moved with the outlet, so settle them now instead of at the
       // next periodic watch.
-      void settleOutletWatch()
+      void settleOutletWatch().catch(() => {})
     } catch (error) {
       outletError = String(error?.message ?? error)
       logger.warn?.(`get-it-for-free: egress outlet could not start (${outletError})`)
@@ -1508,42 +1421,11 @@ export function apply(ctx, config) {
     logger.warn?.(`get-it-for-free: 豆包模型未注册（${error?.message ?? error}）`)
   }
 
-  // ── 内置签到：豆包自己跑 ────────────────────────────────────────────────────
-  // 「自动保养」那张卡已经删掉，续期与签到全部沉到后台，用户不需要知道有这回事：
-  // CodeArts 令牌每小时自己续、Qoder 与豆包每半小时自己签一轮。面板上的
-  // 「一键领取」保留，只是不想等的时候手动兜底。
-  const doubaoCheckinTimer = setInterval(() => {
-    void doubao.checkinAll({ dryRun: false }).catch(error => {
-      logger.warn?.('get-it-for-free: 豆包自动签到失败：' + (error?.message ?? error))
-    })
-  }, 30 * 60 * 1000)
-  doubaoCheckinTimer.unref?.()
-  const doubaoCheckinWarm = setTimeout(() => {
-    void doubao.checkinAll({ dryRun: false }).catch(() => {})
-  }, 45 * 1000)
-  doubaoCheckinWarm.unref?.()
-  // 这里在 apply 顶层，不在 ctx.inject 的闭包里：用 ctx，不是 scoped。
-  // （写错成 scoped 会让 apply 整个抛 ReferenceError，插件一条路由都注册不上，
-  //   设置页只会显示「无法连接插件后端 / not found」。）
-  ctx.effect(() => () => {
-    clearInterval(doubaoCheckinTimer)
-    clearTimeout(doubaoCheckinWarm)
-  }, 'get-it-for-free: doubao daily checkin')
-  // ── 签名中转（给 billion-context 递凭据）────────────────────────────────────
-  // CodeArts 的签名盖住了请求体，bili 要压缩就得自己重签，重签就得知道是哪一号
-  // 账号的 AK/SK。它扫 <DSH_HOME>/jet-hub/state.json 找 provider==='codearts'
-  // 的条目，再按 credentialRef 去宿主凭据库取。我们只负责把账号镜像过去 ——
-  // 密钥本体不出这个进程之外的凭据库，这里落盘的是 ref 名。
-  const resign = createResignBridge({ logger })
-  // 默认不再自动镜像（3.0.42）。实测：凭据一旦递过去，bili 就对每个 CodeArts 请求
-  // 走自己的重签（日志：`[resign] re-sign arm active (sdk-hmac-sha256)`），而重签出来的
-  // 请求被华为云回了 502 —— 比原来的「原样放行」更糟。所以默认关，只在用户手动点
-  // 「同步」时写一次；要恢复自动，建一个空文件 ~/.dsh/get-it-for-free/resign-auto。
-  const resignAuto = (() => {
-    try { return fs.existsSync(path.join(os.homedir(), '.dsh', 'get-it-for-free', 'resign-auto')) } catch { return false }
-  })()
-  if (resignAuto) void resign.sync()
-
+  // ── 豆包不再有签到 ──────────────────────────────────────────────────────────
+  // 2026-11-20（D11/T7）：豆包卡片已去掉一键签到/一键领取入口，后端也就不该背着
+  // 用户每半小时去打一次上游。定时器、预热与 POST /doubao/checkin 路由都已删除；
+  // src/doubao 里的 checkin/checkinAll 函数体保留（现役无入口），要恢复签到只需
+  // 重新接一条路由 + 一个定时器，别再从零写一遍。
   // ── 与 bili 的默认校正 ──────────────────────────────────────────────────────
   // 这条链路和 billion-context 唯一稳定的组合是「原样放行」。bili 的默认判断是
   // 「有凭据就自己重签」，而它重签出来的请求华为云必拒 —— 用户装了 bili 之后
@@ -1586,8 +1468,6 @@ export function apply(ctx, config) {
     modelSync,
     // 豆包工作：多账号凭据、额度、模型目录、每日签到。
     doubao,
-    // 签名中转：把 CodeArts 账号的 credentialRef 镜像给 bili，让它能重签。
-    resign,
     // ── the aggregate lane's settings surface ────────────────────────────────
     // The registry is static data; the configured half is the settings file with
     // every key masked. Writing one provider rebuilds the catalog and re-emits
@@ -1758,33 +1638,6 @@ export function apply(ctx, config) {
     codeArtsRefreshLast: () => codeArtsLastSweep,
     qoderCheckin: async options => qoderCheckinSweep(options),
     qoderCheckinLast: () => qoderCheckinLast,
-    chanRelay: {
-      status: chanRelayStatus,
-      apply: async patch => {
-        const current = settings.get().chanGateway ?? {}
-        const relay = { ...(current.relay ?? {}) }
-        if (patch === null || typeof patch !== 'object') throw httpError(400, 'the request body must be a JSON object')
-        if (patch.enabled !== undefined) relay.enabled = patch.enabled === true
-        if (patch.host !== undefined) {
-          const host = String(patch.host ?? '').trim()
-          if (host !== '' && host !== '127.0.0.1' && host !== 'localhost' && host !== '0.0.0.0' && host !== '::') {
-            throw httpError(400, 'host must be one of 127.0.0.1, localhost, 0.0.0.0, ::')
-          }
-          relay.host = host === 'localhost' ? '127.0.0.1' : host
-        }
-        if (patch.port !== undefined) {
-          const port = Number(patch.port)
-          if (!Number.isInteger(port) || port < 0 || port > 65535) throw httpError(400, 'port must be an integer between 0 and 65535')
-          relay.port = port
-        }
-        settings.update({ chanGateway: { ...current, relay } })
-        settings.flush()
-        await syncChanRelay()
-        return chanRelayStatus()
-      },
-      key: () => chanRelayKey(),
-      rotate: rotateChanRelayKey,
-    },
     // Whether the co-paid lane is open on this host at all — the settings page's
     // one-bit answer to "why do I see no EAC group" (issue #60). Reads the gate,
     // not the listing: a closed gate and a dead relay are different sentences.
@@ -1939,7 +1792,6 @@ export function apply(ctx, config) {
   ctx.effect(() => () => {
     void forward?.close().catch(() => {})
     void relay?.close().catch(() => {})
-    void chanRelay?.close().catch(() => {})
     void outletRelay?.close().catch(() => {})
   }, 'get-it-for-free: forward listener')
 
@@ -1973,8 +1825,6 @@ export function apply(ctx, config) {
       await syncForward()
       if (disposed) return
       await syncRelay()
-      if (disposed) return
-      await syncChanRelay()
       if (disposed) return
       // Every await here is a chance for teardown to have run underneath this
       // boot: a resumed refresh would force a probe round against stores it
@@ -2417,25 +2267,14 @@ export function createApiRoutes(deps) {
           return send(400, { error: String(error?.message ?? error).slice(0, 300) })
         }
       }
-      // 签到：不带 id 就是全部账号跑一遍；dryRun 只读活动详情，不提交领取。
-      if (method === 'POST' && routePath === '/doubao/checkin') {
-        try {
-          const body = await readJson(req)
-          const dryRun = body?.dryRun === true
-          if (typeof body?.id === 'string' && body.id !== '') {
-            return send(200, { at: Date.now(), dryRun, accounts: [{ id: body.id, ...(await deps.doubao.checkin(body.id, { dryRun })) }] })
-          }
-          return send(200, await deps.doubao.checkinAll({ dryRun }))
-        } catch (error) {
-          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
-        }
-      }
       // 面板上的续期 / 刷新余额 / 刷新模型各打一块，不互相捎带。
       if (method === 'POST' && routePath === '/doubao/refresh') {
         try {
           const body = await readJson(req)
           const part = ['probe', 'quota', 'models'].includes(body?.part) ? body.part : 'all'
-          return send(200, await deps.doubao.refresh({ id: typeof body?.id === 'string' ? body.id : '', part }))
+          // 手点刷新要穿透 10 分钟目录缓存；定时任务与自动刷新不传 force，仍走节流。
+          const force = body?.force === true
+          return send(200, await deps.doubao.refresh({ id: typeof body?.id === 'string' ? body.id : '', part, force }))
         } catch (error) {
           return send(500, { error: String(error?.message ?? error).slice(0, 300) })
         }
@@ -2496,9 +2335,41 @@ export function createApiRoutes(deps) {
         }
       }
       // 登录：POST 开浏览器并开始等，GET 轮询进度，cancel 收窗。
+      //
+      // 顺序反过来了 —— 先直读本机浏览器（用户 Chrome 里本来就登着豆包，插件
+      // 却让他在一个空白浏览器里再扫一次码，纯属绕路）：读到几份就直接建号，
+      // 回 done 态，前端 login.poll 照旧认。一份都读不到才开登录窗兜底。
       if (method === 'POST' && routePath === '/doubao/login') {
         try {
-          return send(200, await deps.doubao.login.start())
+          let direct = { created: 0, skipped: 0, accounts: [], error: '' }
+          try {
+            direct = await deps.doubao.importFromBrowser()
+          } catch (error) {
+            // 直读失败不该挡住兜底：读浏览器是加速，登录窗才是保险。
+            deps.logger?.warn?.(`get-it-for-free: 豆包直读本机浏览器失败（${error?.message ?? error}）`)
+          }
+          if (Number(direct.created) > 0) {
+            const done = deps.doubao.login.remember(direct)
+            return send(200, done ?? {
+              status: 'done',
+              at: Date.now(),
+              account: direct.accounts[0] ?? null,
+              error: null,
+              browser: '',
+              steps: [],
+              accounts: direct.accounts,
+              created: direct.created,
+              skipped: direct.skipped,
+            })
+          }
+          const started = await deps.doubao.login.start()
+          return send(200, {
+            ...started,
+            // 兜底时明确告诉前端：本机没有可直读的登录态，接下来会开新窗口。
+            browser: '',
+            note: '本机浏览器没有豆包登录态，将打开新窗口登录',
+            skipped: Number(direct.skipped) || 0,
+          })
         } catch (error) {
           return send(500, { error: String(error?.message ?? error).slice(0, 300) })
         }
@@ -2508,22 +2379,6 @@ export function createApiRoutes(deps) {
       }
       if (method === 'POST' && routePath === '/doubao/login/cancel') {
         return send(200, deps.doubao.login.cancel())
-      }
-      // ── 签名中转（billion-context 重签凭据）──────────────────────────────────
-      // 只看「有没有把 ref 递过去」，不看密钥本身：凭据永远是宿主凭据库解出来的。
-      if (method === 'GET' && routePath === '/resign/status') {
-        try {
-          return send(200, await deps.resign.status())
-        } catch (error) {
-          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
-        }
-      }
-      if (method === 'POST' && routePath === '/resign/sync') {
-        try {
-          return send(200, await deps.resign.sync())
-        } catch (error) {
-          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
-        }
       }
       // ── CodeArts 令牌续期 ───────────────────────────────────────────────────
       // 华为过期回 400 APIG.0602，渠道包的 401 兜底够不到，所以插件自己按
@@ -2549,25 +2404,6 @@ export function createApiRoutes(deps) {
         try {
           const body = await readJson(req)
           return send(200, await deps.qoderCheckin({ force: body?.force === true }))
-        } catch (error) {
-          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
-        }
-      }
-      // ── 与 bili 共存（华为云链路不压缩）──────────────────────────────────────
-      // CodeArts 的签名盖住请求体，bili 只能「重签后压缩」或「拒转发」；它的重签
-      // 实测过不了上游（补尾斜杠 + 给部分模型加 maas_type: benefit），所以唯一
-      // 稳的组合是原样放行 —— 这是 bili 自己的开关，我们只做受控写入。
-      if (method === 'GET' && routePath === '/bili/status') {
-        try {
-          return send(200, readBiliCompat())
-        } catch (error) {
-          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
-        }
-      }
-      if (method === 'POST' && routePath === '/bili/passthrough') {
-        try {
-          const body = await readJson(req)
-          return send(200, setBiliPassthrough({ enabled: body?.enabled !== false }))
         } catch (error) {
           return send(500, { error: String(error?.message ?? error).slice(0, 300) })
         }
@@ -2633,14 +2469,16 @@ export function createApiRoutes(deps) {
       // 续期会轮换 refresh_token（单代际），只允许用户手点触发。
       if (method === 'GET' && routePath === '/qwenwork/quota') {
         try {
-          return send(200, await deps.qwenwork.quota())
+          // 多账号之后额度是每一条各自的：给了 accountId 就查那一条，没给查 active。
+          return send(200, await deps.qwenwork.quota(url.searchParams.get('accountId') ?? ''))
         } catch (error) {
           return send(500, { error: String(error?.message ?? error).slice(0, 300) })
         }
       }
       if (method === 'POST' && routePath === '/qwenwork/renew') {
         try {
-          return send(200, await deps.qwenwork.renew())
+          const body = await readJson(req)
+          return send(200, await deps.qwenwork.renew(body?.accountId))
         } catch (error) {
           return send(500, { error: String(error?.message ?? error).slice(0, 300) })
         }
@@ -2676,10 +2514,52 @@ export function createApiRoutes(deps) {
           return send(500, { error: String(error?.message ?? error).slice(0, 300) })
         }
       }
-      // 账号测试：只问一句「在的」，用来确认这条通道此刻还通。
+      // 账号测试：只问一句「在的」。给了 accountId 就只验那一条（不切 active）。
       if (method === 'POST' && routePath === '/qwenwork/test') {
         try {
-          return send(200, await deps.qwenwork.test())
+          const body = await readJson(req)
+          return send(200, await deps.qwenwork.test(body?.accountId))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // ── 千问办公 · 多账号 ───────────────────────────────────────────────────
+      // 账号动作一律 POST + body.accountId：id 不进 URL，免得落在访问日志里。
+      if (method === 'GET' && routePath === '/qwenwork/accounts') {
+        try {
+          return send(200, deps.qwenwork.accounts())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // 新增账号：起一次 device flow，回 { url, accountId }，授完权账号自己进库。
+      if (method === 'POST' && routePath === '/qwenwork/accounts/create') {
+        try {
+          return send(200, await deps.qwenwork.accountCreate())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // 切换当前使用的账号。成功回 { ok, status, accounts, activeAccountId }。
+      if (method === 'POST' && routePath === '/qwenwork/accounts/use') {
+        try {
+          return send(200, await deps.qwenwork.accountUse(await readJson(req)))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // 改昵称 / 启停。停用的若是当前账号，active 自己退到下一条。
+      if (method === 'POST' && routePath === '/qwenwork/accounts/update') {
+        try {
+          return send(200, await deps.qwenwork.accountUpdate(await readJson(req)))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // 删一条账号。删空且删的是迁移来的那条时，顺手清掉旧凭据文件。
+      if (method === 'POST' && routePath === '/qwenwork/accounts/remove') {
+        try {
+          return send(200, await deps.qwenwork.accountDelete(await readJson(req)))
         } catch (error) {
           return send(500, { error: String(error?.message ?? error).slice(0, 300) })
         }
@@ -2756,6 +2636,53 @@ export function createApiRoutes(deps) {
           return send(500, { error: String(error?.message ?? error).slice(0, 300) })
         }
       }
+      if (method === 'GET' && routePath === '/meooweb/accounts') {
+        try {
+          return send(200, await deps.meooWeb.accounts())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // 余额：额度只在服务端，每次点都真问一次；一条账号一次，失败也带原因。
+      if (method === 'GET' && routePath === '/meooweb/credits') {
+        try {
+          return send(200, await deps.meooWeb.credits())
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/meooweb/accounts/create') {
+        try {
+          const body = await readJson(req)
+          return send(200, await deps.meooWeb.accountCreate(body?.text ?? body?.cookie ?? body?.token ?? ''))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/meooweb/accounts/use') {
+        try {
+          const body = await readJson(req)
+          return send(200, await deps.meooWeb.accountUse(body?.accountId))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/meooweb/accounts/update') {
+        try {
+          const body = await readJson(req)
+          return send(200, await deps.meooWeb.accountUpdate(body?.accountId, body?.patch))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      if (method === 'POST' && routePath === '/meooweb/accounts/remove') {
+        try {
+          const body = await readJson(req)
+          return send(200, await deps.meooWeb.accountRemove(body?.accountId))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
       if (method === 'POST' && routePath === '/meooweb/logout') {
         try {
           return send(200, await deps.meooWeb.logout())
@@ -2772,7 +2699,9 @@ export function createApiRoutes(deps) {
       }
       if (method === 'POST' && routePath === '/meooweb/models/refresh') {
         try {
-          const rows = await deps.meooWeb.refresh()
+          // force：这是用户亲手点的「刷新模型」，凭据被判死时要去浏览器整瓶重抄一次，
+          // 不能因为「文件里那份看着没过期」就原样再问一遍、再回同一个 401。
+          const rows = await deps.meooWeb.refresh({ force: true })
           return send(200, { models: rows.map(row => ({ id: row.id, name: row.name })) })
         } catch (error) {
           return send(500, { error: String(error?.message ?? error).slice(0, 300) })
@@ -2797,6 +2726,29 @@ export function createApiRoutes(deps) {
         try {
           const body = await readJson(req)
           return send(200, deps.meooWeb.setAllModelsDisabled(body?.disabled !== false))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // 登录窗：拉起系统浏览器让用户真登录一次，登录态由插件自己的 profile 接住。
+      // 两条路 —— 不带 accountId 是「添加新账号」，带 accountId 是「重登这个账号」。
+      // 这个请求会一直等到用户登完或者关窗（最长 5 分钟），前端超时要跟着放宽。
+      if (method === 'POST' && routePath === '/meooweb/login-window') {
+        try {
+          const body = await readJson(req)
+          return send(200, await deps.meooWeb.loginWindow({
+            accountId: typeof body?.accountId === 'string' ? body.accountId : '',
+            clear: body?.clear !== false,
+          }))
+        } catch (error) {
+          return send(500, { error: String(error?.message ?? error).slice(0, 300) })
+        }
+      }
+      // 有没有可用的系统浏览器（没有就只能退回手贴 Cookie）。前端据此决定
+      // 要不要显示「开登录窗」这颗按钮，而不是让用户点了才吃一次错。
+      if (method === 'GET' && routePath === '/meooweb/login-available') {
+        try {
+          return send(200, deps.meooWeb.loginWindowAvailable())
         } catch (error) {
           return send(500, { error: String(error?.message ?? error).slice(0, 300) })
         }
@@ -3050,22 +3002,6 @@ export function createApiRoutes(deps) {
       }
       if (method === 'POST' && routePath === '/forward/rotate') {
         return send(200, { key: deps.rotateKey() })
-      }
-      // The channels' gateway relay (the pack's loopback OpenAI endpoint,
-   // re-exposed under this plugin's own key). Status never carries a secret;
-      // the key routes are read by the same fence as every other route here.
-      if (method === 'GET' && routePath === '/chan-gateway') {
-        return send(200, deps.chanRelay.status())
-      }
-      if (method === 'POST' && routePath === '/chan-gateway/apply') {
-        const body = await readJson(req)
-        return send(200, await deps.chanRelay.apply(body))
-      }
-      if (method === 'GET' && routePath === '/chan-gateway/key') {
-        return send(200, { key: deps.chanRelay.key() })
-      }
-      if (method === 'POST' && routePath === '/chan-gateway/rotate') {
-        return send(200, { key: deps.chanRelay.rotate() })
       }
       if (method === 'GET' && routePath === '/forward/lan/key') {
         return send(200, { key: deps.settings.get().forwardLanKey ?? '' })

@@ -74,7 +74,7 @@ async function readJson(url, timeoutMs = 2_000) {
 }
 
 // 一个极小的 CDP 客户端：只发请求、等同 id 的回复，事件一律丢弃。
-function connect(url, timeoutMs = 10_000) {
+export function connect(url, timeoutMs = 10_000) {
   return new Promise((resolve, reject) => {
     if (typeof WebSocket !== 'function') {
       reject(new Error('这个 Node 版本没有内置 WebSocket（需要 22 以上）'))
@@ -132,29 +132,47 @@ function connect(url, timeoutMs = 10_000) {
   })
 }
 
-function headerFromCookies(cookies) {
+function headerFromCookies(cookies, domain) {
   return cookies
-    .filter(cookie => String(cookie?.domain ?? '').includes('doubao.com'))
+    .filter(cookie => String(cookie?.domain ?? '').includes(domain))
     .filter(cookie => !SKIP_COOKIE.test(String(cookie?.name ?? '')))
     .map(cookie => `${cookie.name}=${cookie.value}`)
     .join('; ')
 }
 
-export function createLoginFlow({ logger, addAccount, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+/**
+ * 开一个干净浏览器、让用户登进去、再用 CDP 把 cookie 抓走。
+ *
+ * 默认那套参数是豆包的；秒悟网页版（meoo.com）这类「登录态就是 cookie」的站点
+ * 换 loginUrl / domain / isSignedIn 就能复用同一套流程。
+ */
+export function createLoginFlow({
+  logger,
+  addAccount,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  loginUrl = LOGIN_URL,
+  domain = 'doubao.com',
+  isSignedIn = hasSession,
+} = {}) {
   let state = { status: 'idle', at: 0, account: null, error: null, browser: '', steps: [] }
   let running = null
+  const hostPattern = new RegExp(domain.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  // 豆包能从 sessionid 里解出 uid；别的站点没有这个字段，解不出来就不写
+  function cookieUid(header) {
+    try { return uidFromCookie(header) } catch { return '' }
+  }
 
   function snapshot() {
     return { ...state, steps: [...state.steps] }
   }
 
-  async function waitForPage(port, child) {
+  async function waitForPage(port, child, pattern = /doubao\.com/) {
     const deadline = Date.now() + START_TIMEOUT_MS
     while (Date.now() < deadline) {
       if (child.exitCode !== null) throw new Error('浏览器启动后立刻退出了')
       const targets = await readJson(`http://127.0.0.1:${port}/json/list`)
       if (Array.isArray(targets)) {
-        const page = targets.find(row => row.type === 'page' && /doubao\.com/.test(String(row.url ?? ''))) ??
+        const page = targets.find(row => row.type === 'page' && pattern.test(String(row.url ?? ''))) ??
           targets.find(row => row.type === 'page')
         if (page?.webSocketDebuggerUrl) return page.webSocketDebuggerUrl
       }
@@ -182,18 +200,18 @@ export function createLoginFlow({ logger, addAccount, timeoutMs = DEFAULT_TIMEOU
     if (port === 0) throw new Error('浏览器没有开放调试端口')
     state.steps.push({ step: 'browser', port })
 
-    const wsUrl = await waitForPage(port, child)
+    const wsUrl = await waitForPage(port, child, hostPattern)
     const client = await connect(wsUrl)
-    state.steps.push({ step: 'cdp', url: LOGIN_URL })
+    state.steps.push({ step: 'cdp', url: loginUrl })
     try {
       const deadline2 = Date.now() + timeoutMs
       while (Date.now() < deadline2) {
         if (state.status === 'canceled') return null
         if (child.exitCode !== null) throw new Error('浏览器被关掉了')
         const { cookies } = await client.send('Network.getAllCookies', {})
-        const header = headerFromCookies(Array.isArray(cookies) ? cookies : [])
-        if (header !== '' && hasSession(header)) {
-          state.steps.push({ step: 'cookie', uid: uidFromCookie(header) })
+        const header = headerFromCookies(Array.isArray(cookies) ? cookies : [], domain)
+        if (header !== '' && isSignedIn(header)) {
+          state.steps.push({ step: 'cookie', uid: cookieUid(header) })
           return header
         }
         await sleep(POLL_MS)
@@ -223,7 +241,7 @@ export function createLoginFlow({ logger, addAccount, timeoutMs = DEFAULT_TIMEOU
             '--no-first-run',
             '--no-default-browser-check',
             '--disable-features=Translate,MediaRouter',
-            LOGIN_URL,
+            loginUrl,
           ],
           { stdio: 'ignore' },
         )

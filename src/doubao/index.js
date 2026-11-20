@@ -22,6 +22,7 @@ import {
   uidFromCookie,
 } from './client.js'
 import { parseCookieText, readStore, writeStore } from './store.js'
+import { browserCookieSnapshot, mergeCookie } from './chromecookie.js'
 import { createLoginFlow } from './login.js'
 
 const QUOTA_TTL_MS = 5 * 60_000
@@ -29,6 +30,15 @@ const MODELS_TTL_MS = 10 * 60_000
 const PROBE_TIMEOUT_MS = 20_000
 const DEFAULT_GROUP = 'pc_incentive_task_mvp_v3'
 const CONFIRM_DELAYS = [0, 2_000, 4_000]
+
+// 上次从哪个 profile 目录里读到了豆包登录态。下次先只读它（命中就收工），
+// 免得每次自愈都去解 4 个浏览器的钥匙串、扫 21 个目录。
+let lastBrowserProfile = ''
+
+/** 只认 sessionid：它唯一，能认人；s_v_web_id 每次开页都会重铸，认不了。 */
+function sessionIdOf(cookieHeader) {
+  return /(?:^|;\s*)sessionid=([^;]+)/.exec(String(cookieHeader ?? ''))?.[1] ?? ''
+}
 
 export function defaultDoubaoHome(env = process.env) {
   const base = env.DSH_HOME && env.DSH_HOME !== '' ? env.DSH_HOME : path.join(os.homedir(), '.dsh')
@@ -224,6 +234,61 @@ export function createDoubao({ home, logger, env = process.env, onChange } = {})
     return { account: view(account, cached(account.id)), count: next.accounts.length }
   }
 
+  /**
+   * 从本机浏览器直接接入：把每份已登录 profile 建成一条账号。
+   *
+   * 这是**主路**。用户 Chrome 里本来就登着豆包，插件却让他在一个全新的临时
+   * 浏览器里再扫一次码 —— 而自愈（healAccount）天天在读同一个 cookie 库。
+   * 登录与自愈读的是同一个源，就没理由多扫一次码。
+   *
+   * 一条 profile 一份 sessionid → 一份账号；现有库里已有同一 sessionid 的跳过
+   * （同一个人不该出现两行）。返回建了几条、跳过几条，读不到浏览器不算错误。
+   */
+  async function importFromBrowser() {
+    let snapshot = null
+    try {
+      snapshot = await browserCookieSnapshot({
+        domainHint: 'doubao',
+        requireCookies: ['s_v_web_id', 'sessionid'],
+        sessionCookie: 'sessionid',
+        preferredProfile: lastBrowserProfile,
+      })
+    } catch (error) {
+      logger?.warn?.(`[doubao] 直读本机浏览器失败：${String(error?.message ?? error).slice(0, 160)}`)
+      return { created: 0, skipped: 0, accounts: [], error: String(error?.message ?? error).slice(0, 160) }
+    }
+    if (snapshot === null) return { created: 0, skipped: 0, accounts: [], error: '' }
+    lastBrowserProfile = snapshot.profile
+
+    const store = await load()
+    const seen = new Set(store.accounts.map(row => sessionIdOf(row.cookieHeader)).filter(value => value !== ''))
+    const created = []
+    let skipped = 0
+    for (const candidate of snapshot.candidates) {
+      const cookieHeader = parseCookieText(candidate?.cookieHeader ?? '')
+      const session = sessionIdOf(cookieHeader)
+      if (!hasSession(cookieHeader) || session === '' || seen.has(session)) {
+        skipped += 1
+        continue
+      }
+      seen.add(session)
+      try {
+        // 走 addAccount 同一条路径：同样校验 sessionid、同样探账号名、
+        // 同样落盘广播 —— 「浏览器直读」和「手动粘贴」存下来的是同一种记录。
+        const saved = await addAccount({ cookie: cookieHeader, name: '' })
+        created.push(saved.account ?? null)
+        if (typeof candidate.profile === 'string' && candidate.profile !== '') lastBrowserProfile = candidate.profile
+      } catch (error) {
+        logger?.warn?.(`[doubao] 浏览器账号入库失败：${String(error?.message ?? error).slice(0, 160)}`)
+        skipped += 1
+      }
+    }
+    if (created.length > 0) {
+      logger?.info?.(`[doubao] 从本机浏览器接入 ${created.length} 条账号（跳过 ${skipped} 条）`)
+    }
+    return { created: created.length, skipped, accounts: created.filter(row => row !== null), error: '' }
+  }
+
   async function removeAccount(id) {
     const store = await load()
     const next = await save({ ...store, accounts: store.accounts.filter(row => row.id !== id) })
@@ -248,6 +313,8 @@ export function createDoubao({ home, logger, env = process.env, onChange } = {})
 
   // 签到只有一种成功判据：活动详情里那条 daily_checkin 变成「今天已签」。
   // landing 回执的 checked_in 只是「请求被接受」，不能当完成。
+  // 现役无入口（2026-11-20 T7 清理）：面板按钮已删、/doubao/checkin 路由与后台定时器
+  // 都已移除，checkin / checkinAll 只剩函数体，保留待恢复（要恢复就重接路由+定时器）。
   async function checkin(id, { dryRun = false } = {}) {
     const { account } = await requireAccount(id)
     const steps = []
@@ -328,13 +395,13 @@ export function createDoubao({ home, logger, env = process.env, onChange } = {})
 
   // 面板的「续期 / 刷新余额 / 刷新模型」三个按钮映射到 part：
   // probe 只重新确认登录态，quota 只重拉额度，models 只重拉目录。
-  async function refresh({ id = '', part = 'all' } = {}) {
+  async function refresh({ id = '', part = 'all', force = false } = {}) {
     const store = await load()
     const disabled = disabledSet(store)
     const rows = id === '' ? store.accounts : store.accounts.filter(account => account.id === id)
     const accounts = []
     for (const account of rows) {
-      accounts.push(view(account, await refreshAccount(account, { only: part }), disabled))
+      accounts.push(view(account, await refreshAccount(account, { only: part, force }), disabled))
     }
     // 刷新模型之后目录要落到快照里，否则下一次挂载又回到「面板有、选择器没有」。
     if (part === 'models' || part === 'all') {
@@ -382,6 +449,7 @@ export function createDoubao({ home, logger, env = process.env, onChange } = {})
   }
 
   async function checkinAll({ dryRun = false } = {}) {
+    // 现役无入口（理由见 checkin 上方注释）：只剩实现，供恢复时复用。
     const store = await load()
     const rows = []
     for (const account of store.accounts) {
@@ -520,13 +588,79 @@ export function createDoubao({ home, logger, env = process.env, onChange } = {})
     if (rows.length === 0) return null
     const account = rows[cursor % rows.length]
     cursor += 1
-    return account
+    return await healAccount(account)
+  }
+
+  // 存的 cookie 会安静地烂掉：网页端每次开页重铸 s_v_web_id、续期换 sessionid，
+  // 插件里那份过几小时就成旧号，请求照样 200，但首帧就 710022004（用户看到的
+  // 是「该内容涉嫌违反豆包使用规范」）。这里在真正发请求前对齐一次浏览器里的
+  // 当前那份，读不到浏览器就维持原样。
+  const HEAL_INTERVAL_MS = 60_000
+  const healedAt = new Map()
+  async function healAccount(account, { force = false } = {}) {
+    const last = healedAt.get(account.id) ?? 0
+    if (!force && Date.now() - last < HEAL_INTERVAL_MS) return account
+    healedAt.set(account.id, Date.now())
+    let snapshot = null
+    try {
+      const session = sessionIdOf(account.cookieHeader)
+      snapshot = await browserCookieSnapshot({ preferSessionId: session, preferredProfile: lastBrowserProfile })
+    } catch (error) {
+      logger?.warn?.(`[doubao] 读浏览器 cookie 失败：${String(error?.message ?? error).slice(0, 160)}`)
+      return account
+    }
+    if (snapshot === null) return account
+    lastBrowserProfile = snapshot.profile
+    const merged = mergeCookie(account.cookieHeader, snapshot)
+    if (!merged.changed) return account
+    try {
+      const store = await load()
+      const accounts = store.accounts.map(row => (row.id === account.id ? { ...row, cookieHeader: merged.cookieHeader } : row))
+      await save({ ...store, accounts })
+      cache.delete(account.id)
+    } catch (error) {
+      logger?.warn?.(`[doubao] 同步 cookie 落盘失败：${String(error?.message ?? error).slice(0, 160)}`)
+    }
+    logger?.info?.(`[doubao] 已按 ${snapshot.browser} 的当前 cookie 对齐账号 ${account.name}（${merged.reason}）`)
+    return { ...account, cookieHeader: merged.cookieHeader }
   }
 
   // 登录流：开一个干净的浏览器，用户登完就抓 cookie。抓到的 cookie 走
   // addAccount 同一条路径（同样校验 sessionid、同样探测账号名），
   // 所以「点按钮登录」和「手动粘贴」存下来的是同一种记录。
   const login = createLoginFlow({ logger, addAccount: input => addAccount(input) })
+
+  // 直读命中时 POST 直接回 done，但卡片是靠 GET /doubao/login 轮询收尾的 ——
+  // 这里把那次 done 记下来挂给轮询，否则卡片会白等十分钟。
+  // 两分钟后作废：之后该显示的是登录窗的真实状态，不是一条陈旧的成功。
+  let directLogin = null
+  function rememberDirectLogin(result) {
+    if (!result || Number(result.created) < 1) return null
+    directLogin = {
+      status: 'done',
+      at: Date.now(),
+      account: result.accounts?.[0] ?? null,
+      error: null,
+      browser: '',
+      steps: [],
+      accounts: result.accounts ?? [],
+      created: Number(result.created) || 0,
+      skipped: Number(result.skipped) || 0,
+    }
+    return directLogin
+  }
+  function loginStatus() {
+    if (directLogin !== null && Date.now() - directLogin.at < 120_000) return { ...directLogin, steps: [...directLogin.steps] }
+    directLogin = null
+    return login.status()
+  }
+  const loginBridge = {
+    start: () => login.start(),
+    status: loginStatus,
+    cancel: () => login.cancel(),
+    remember: result => rememberDirectLogin(result),
+    get busy() { return login.busy },
+  }
 
   return {
     home: dir,
@@ -544,6 +678,8 @@ export function createDoubao({ home, logger, env = process.env, onChange } = {})
     modelsSnapshot,
     needsRoster,
     pickAccount,
-    login,
+    healAccount,
+    importFromBrowser,
+    login: loginBridge,
   }
 }

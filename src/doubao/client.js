@@ -54,6 +54,9 @@ export const ERROR = {
   SESSION_EXPIRED: '710012001',
   RISK_CONTROL: '710022004',
   RUNTIME_UNAVAILABLE: '710010702',
+  // 拍平后的输入超过网页版字符硬顶（实测 26.5 万字符必炸，见 adapter.js 的
+  // PROMPT_CHAR_BUDGET）。它不是风控、也不是形状问题，改小输入就能过。
+  INVALID_PARAM: '710020202',
 }
 
 // device_id / web_id / tea_uuid 是页面自己生成的一串 19 位数字，只要在同一份
@@ -619,7 +622,11 @@ export async function chat(cookieHeader, options = {}) {
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   const startedAt = Date.now()
   const msToken = msTokenOf(cookieHeader)
-  const url = `${HOST}${CHAT_PATH}?${buildQuery(msToken === '' ? {} : { msToken })}`
+  // 这里原来把 `{ msToken }` 当成第一个实参传给 buildQuery，于是 cookieHeader
+  // 位置拿到的是一张对象表：seed 退回 'anon'，device_id/web_id/tea_uuid 全成了
+  // 匿名号，fp 也没有来源。面板上的「测一测」和「智商检测」都走这条路，等于
+  // 每次都被上游按脚本挡回 710022004。真正的 cookie 要传第一个位置。
+  const url = `${HOST}${CHAT_PATH}?${buildQuery(cookieHeader, msToken === '' ? {} : { msToken })}`
   const headers = { ...buildHeaders(cookieHeader), Accept: 'text/event-stream' }
   const body = JSON.stringify(buildChatBody(prompt, options))
   try {

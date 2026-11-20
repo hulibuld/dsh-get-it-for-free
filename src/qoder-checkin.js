@@ -132,7 +132,7 @@ function hasBenefitEver(rows) {
 
 /**
  * 单个账号签到。返回的 `status` 是给调度器用的单词，不是文案：
- *   claimed / already / not-refreshed / not-offered / not-activated / failed
+ *   claimed / already / not-refreshed / not-offered / not-activated / ineligible / failed
  */
 export async function checkinAccount({ credential, product, now = Date.now(), fetchImpl = fetch }) {
   const token = bearerOf(credential)
@@ -152,9 +152,21 @@ export async function checkinAccount({ credential, product, now = Date.now(), fe
     }
     if (!hasBenefitEver(rows)) {
       const usage = await requestJson(fetchImpl, `${product.openApiBase}${USAGE_PATH}`, { method: 'GET', headers })
-      const addOn = usage.ok && usage.body?.qoderUsage !== null && typeof usage.body?.qoderUsage === 'object'
-        ? usage.body.qoderUsage.addOnQuota
-        : undefined
+      const qoderUsage = usage.ok && usage.body?.qoderUsage !== null && typeof usage.body?.qoderUsage === 'object'
+        ? usage.body.qoderUsage
+        : null
+      // 2026-11-19 10:00 起每日 100 Credits 只对试用期、个人付费订阅（专业/高级/旗舰）
+      // 与会员卡开放：体验版（personal_standard）号的活动列表里连 CLAIM_BENEFIT 行都
+      // 没有。这不是「今天还没刷新」，也不是插件坏了，服务端按订阅状态判资格 ——
+      // 所以单独标一个 ineligible，别让用户照着「没活动」反复点重试。
+      if (qoderUsage !== null && qoderUsage.userType === 'personal_standard') {
+        return {
+          status: 'ineligible',
+          // 文案与渠道包 QODER_INELIGIBLE_HINT 对齐：面板、日志、RPC 三处说的是同一件事。
+          message: '体验版（免费）账号自 2026-11-19 起不再开放每日领取（官方公告 docs.qoder.cn/events/100credits）；开通试用/专业版/会员卡后可领。这不是插件故障，重试不会改变结果',
+        }
+      }
+      const addOn = qoderUsage !== null ? qoderUsage.addOnQuota : undefined
       // 从来没有活动 + 没有赠送额度 → 这个号在 Qoder 侧没开通过每日领取。
       if (usage.ok && addOn === undefined) {
         return {
@@ -187,7 +199,16 @@ async function claimOne({ token, product, campaignId, fetchImpl }) {
     body: '',
   })
   if (!posted.ok) return { status: 'failed', message: posted.message ?? '领取请求失败' }
-  if (posted.body?.replayed === true) return { status: 'already', amount: amountOf(posted.body) }
+  if (posted.body?.replayed === true) {
+    // replayed 的响应体顶层没有 amount（只有 replayed 标记），照顶层读会恒得 0，
+    // 界面上「今天已领」就显示 +0。金额得回活动行取证，和下面 BLOCKED 那条路复用。
+    const replay = await requestJson(fetchImpl, `${product.openApiBase}${CAMPAIGNS_PATH}`, {
+      method: 'GET',
+      headers: headersOf(token, product),
+    })
+    const row = replay.ok ? readCampaigns(replay.body).find(item => item.campaignId === campaignId) : undefined
+    return { status: 'already', amount: row?.amount ?? 0, campaignId: row?.campaignId ?? campaignId }
+  }
   const status = typeof posted.body?.status === 'string' ? posted.body.status : ''
   if (status === '' || status === 'CLAIMED') return { status: 'claimed', amount: amountOf(posted.body) }
 
@@ -225,7 +246,7 @@ export async function sweepQoderCheckin({
     ? state.accounts
     : {}
   const next = {}
-  const result = { at: new Date(now).toISOString(), date: today, checked: 0, claimed: 0, totalCredit: 0, already: 0, pending: 0, failed: 0, accounts: [] }
+  const result = { at: new Date(now).toISOString(), date: today, checked: 0, claimed: 0, totalCredit: 0, already: 0, pending: 0, ineligible: 0, failed: 0, accounts: [] }
 
   let rows = []
   try {
@@ -240,10 +261,13 @@ export async function sweepQoderCheckin({
     const id = String(row.id ?? '')
     if (product === undefined || id === '') continue
     const cached = previous[id]
-    if (!force && cached !== undefined && (cached.status === 'claimed' || cached.status === 'already')) {
+    // ineligible 也认缓存：资格是订阅状态决定的，同一天里不会自己变回来，
+    // 没必要每轮再打一次接口（force 仍然穿透）。
+    if (!force && cached !== undefined && (cached.status === 'claimed' || cached.status === 'already' || cached.status === 'ineligible')) {
       next[id] = cached
-      result.already += 1
-      result.accounts.push({ id, nickname: row.nickname, provider: row.provider, action: cached.status, amount: cached.amount ?? 0, cached: true })
+      if (cached.status === 'ineligible') result.ineligible += 1
+      else result.already += 1
+      result.accounts.push({ id, nickname: row.nickname, provider: row.provider, action: cached.status, amount: cached.amount ?? 0, ...cached.status === 'ineligible' ? { message: cached.message } : {}, cached: true })
       continue
     }
     let credential
@@ -262,14 +286,18 @@ export async function sweepQoderCheckin({
     }
     result.checked += 1
     const outcome = await checkinAccount({ credential, product, now, fetchImpl })
-    const entry = { status: outcome.status, amount: outcome.amount ?? 0, at: now }
-    if (outcome.status === 'claimed' || outcome.status === 'already') next[id] = entry
+    const entry = { status: outcome.status, amount: outcome.amount ?? 0, at: now, ...outcome.message === undefined ? {} : { message: outcome.message } }
+    if (outcome.status === 'claimed' || outcome.status === 'already' || outcome.status === 'ineligible') next[id] = entry
     if (outcome.status === 'claimed') {
       result.claimed += 1
       result.totalCredit += outcome.amount ?? 0
       log(`${row.nickname ?? id} +${outcome.amount ?? 0} 积分`)
     } else if (outcome.status === 'already') {
       result.already += 1
+    } else if (outcome.status === 'ineligible') {
+      // 不是「待领」：服务端已经不给这个号发活动了，计到单独一档，别再当待处理。
+      result.ineligible += 1
+      log(`${row.nickname ?? id} 无领取资格（体验版）：${outcome.message ?? ''}`)
     } else if (outcome.status === 'not-refreshed' || outcome.status === 'not-offered' || outcome.status === 'not-activated') {
       result.pending += 1
     } else {

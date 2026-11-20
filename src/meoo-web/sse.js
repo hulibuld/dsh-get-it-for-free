@@ -8,22 +8,33 @@
  * `choices[].delta`，所以这里把上游事件翻成 OpenAI chunk 再交出去。
  *
  * 两种正文语义必须分开处理，混起来就会重复输出：
- *   - **增量**（`*_delta` / `*_text_stream`）：直接接在已发内容后面。
- *   - **快照**（`ui:add_agent_message`、`ui:agent_message_update`、
- *     `ui:sync_assistant_update`）：带的是到目前为止的完整正文，要和已发的比前缀，
+ *   - **增量**（`*_delta` / `*_text_stream` / `ui:agent_message_update`）：直接接在
+ *     已发内容后面。
+ *   - **快照**（`ui:add_agent_message`、`ui:sync_assistant_update`、
+ *     `ui:sync_messages_update`）：带的是到目前为止的完整正文，要和已发的比前缀，
  *     只补差集。
  *   - **终稿**（`task_complete.text`）：同样是快照；已经流完了就一条都不再发。
+ *
+ * `ui:agent_message_update` 曾经被当成快照，实测（docs/诊断-秒悟无输出-2026-11-20.md）
+ * 它给的是增量片段（`，`、`钱禹舟`、`！` 各自成帧），按快照处理会把正文全丢。
  *
  * @module dsh-get-it-for-free/meoo-web/sse
  */
 
-/** 上游事件里代表「正文结束」的类型。 */
-const TERMINAL_EVENTS = new Set(['ui:agent_task_end', 'ui:agent_finish_reason'])
+/**
+ * 上游事件里代表「正文结束」的类型。
+ *
+ * `ui:agent_finish_reason` 不在其中：它比终稿先到，上游之后还会发
+ * `token_usage → state_change → agent_task_end → task_complete`，
+ * 把它当终点会提前断流，`task_complete.text` 永远读不到。
+ */
+const TERMINAL_EVENTS = new Set(['ui:agent_task_end'])
 
 /** 上游事件里带增量正文的类型。 */
 const DELTA_EVENTS = new Set([
   'ui:agent_sub_task_text_delta',
   'ui:agent_synthesis_text_delta',
+  'ui:agent_message_update',
   'ui:swarms_text_stream',
   'ui:btw_text_stream',
   'ui:enhance_text_stream',
@@ -32,9 +43,21 @@ const DELTA_EVENTS = new Set([
 /** 上游事件里带快照正文的类型。 */
 const SNAPSHOT_EVENTS = new Set([
   'ui:add_agent_message',
-  'ui:agent_message_update',
   'ui:sync_assistant_update',
   'ui:sync_messages_update',
+])
+
+/**
+ * 已知但「本来就没有正文」的事件。
+ *
+ * 上游每轮都会发这几个，它们不带文字、也不代表出事。诊断时要把它们和真正没见过
+ * 的新事件分开：前者只记档不报警，后者才是需要人看的线索。
+ */
+export const QUIET_EVENTS = new Set([
+  'ui:agent_chat_state',
+  'ui:agent_context_source',
+  'ui:register_message_id',
+  'ui:agent_token_usage',
 ])
 
 /**
@@ -42,6 +65,12 @@ const SNAPSHOT_EVENTS = new Set([
  *
  * 上游同一个字段在不同版本里换过名字（`text` / `content` / `delta` /
  * `message.content`），所以按顺序都试一遍，拿到第一个非空字符串就走。
+ *
+ * 上游还换过**层级**：正文有时再包一层
+ * （`{type:'ui_event', data:{type:'ui:agent_message_update', data:{messageId, delta}}}`）。
+ * 所以第一层候选全落空时，再对 `data.data` 跑同一套候选 —— 顺序必须是「先第一层
+ * 再第二层」，真正快照事件的正文仍在第一层。`delta: ''` 这种空串继续落到
+ * `undefined`（候选里都有 `!== ''` 判断）。
  *
  * @param data - 上游事件对象。
  * @returns 正文，或 undefined。
@@ -61,6 +90,11 @@ function textOf(data) {
       if (typeof value === 'string' && value !== '') return value
     }
   }
+  const nested = data.data
+  if (nested !== null && typeof nested === 'object') {
+    const inner = textOf(nested)
+    if (inner !== undefined) return inner
+  }
   return undefined
 }
 
@@ -71,9 +105,12 @@ function textOf(data) {
  * 内容决定。
  *
  * @param payload - SSE 帧里的 JSON。
+ * @param onUnknown - 可选：认不出来的 `ui_event` 子类型回调，参数是那个子类型。
+ *   「认不出来」不等于出错 —— 上游随时会加新事件，这里只是把它交出去记档，
+ *   正文该不该有仍然由调用方判断。
  * @returns {{taskId?: string, text?: string, snapshot?: string, reasoning?: string, final?: string, done?: boolean, error?: string}}
  */
-export function translateEvent(payload) {
+export function translateEvent(payload, onUnknown) {
   if (payload === null || typeof payload !== 'object') return {}
   const type = payload.type
 
@@ -111,6 +148,10 @@ export function translateEvent(payload) {
     const snapshot = textOf(data)
     return snapshot === undefined ? {} : { snapshot }
   }
+  // 走到这里就是这个版本没见过的子类型。上游加事件是常态（`ui:agent_chat_state`、
+  // `ui:register_message_id` …），它们本来就不带正文，所以不能当错误；但也不能
+  // 就这么丢进黑洞 —— 有时候「整轮没输出」正是因为正文换了新事件名发过来。
+  if (typeof onUnknown === 'function') onUnknown(inner)
   return {}
 }
 
@@ -141,6 +182,17 @@ export class MeooSseTranslator {
   #closed = false
   /** 上游给的任务 id（诊断用，不进正文）。 */
   #taskId = ''
+  /** 这个版本没见过的子类型（去重，诊断用）。 */
+  #unknownTypes = []
+  /** 外部给的认不出来回调。 */
+  #onUnknown
+
+  /**
+   * @param options - `{onUnknown}`：认不出来的子类型回调，参数是子类型名。
+   */
+  constructor(options = {}) {
+    this.#onUnknown = typeof options?.onUnknown === 'function' ? options.onUnknown : undefined
+  }
 
   /** 上游任务 id，收到 `task_id` 之后才有。 */
   get taskId() {
@@ -153,21 +205,45 @@ export class MeooSseTranslator {
   }
 
   /**
+   * 已经发出去的正文。
+   *
+   * 调用方（provider）靠它判「这一轮到底有没有内容」：收尾 chunk 无论如何都会发，
+   * 但正文为空就不是成功，是上游没给东西。
+   */
+  get text() {
+    return this.#sent
+  }
+
+  /** 这个版本没见过的子类型，去重后的清单。 */
+  get unknownTypes() {
+    return [...this.#unknownTypes]
+  }
+
+  /**
    * 吞一个事件，吐出要推给宿主的 chunk。
    *
    * @param payload - SSE 帧里的 JSON。
    * @returns chunk 字符串数组（可能为空）。
    */
   handle(payload) {
-    const event = translateEvent(payload)
+    const event = translateEvent(payload, inner => this.#noteUnknown(inner))
     const out = []
     if (event.taskId !== undefined) this.#taskId = event.taskId
 
     if (event.reasoning !== undefined) out.push(deltaChunk({ reasoning: event.reasoning }))
 
     if (event.text !== undefined) {
-      this.#sent += event.text
-      out.push(deltaChunk({ content: event.text }))
+      // 增量为主，但留一条自愈：上游某天若把增量帧换成累计快照（新片段以已发内容
+      // 为前缀且更长），直接追加会变成「你好你好，你好，钱禹舟…」。这种情况按快照
+      // 补差集即可，语义也对。`#diff` 本身不放宽 —— 非前缀的重写仍旧不重发。
+      if (this.#sent !== '' && event.text.length > this.#sent.length && event.text.startsWith(this.#sent)) {
+        const delta = event.text.slice(this.#sent.length)
+        this.#sent += delta
+        out.push(deltaChunk({ content: delta }))
+      } else {
+        this.#sent += event.text
+        out.push(deltaChunk({ content: event.text }))
+      }
     }
 
     if (event.snapshot !== undefined) {
@@ -192,6 +268,20 @@ export class MeooSseTranslator {
       out.push(finishChunk())
     }
     return out
+  }
+
+  /**
+   * 记一个本版本不认识的子类型。
+   *
+   * 已知的「本来就没有正文」那几类不记（每轮都发，记了只是噪声）。
+   *
+   * @param inner - 子类型名。
+   */
+  #noteUnknown(inner) {
+    if (inner === '' || QUIET_EVENTS.has(inner)) return
+    if (this.#unknownTypes.includes(inner)) return
+    this.#unknownTypes.push(inner)
+    this.#onUnknown?.(inner)
   }
 
   /**

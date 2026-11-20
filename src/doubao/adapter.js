@@ -25,13 +25,29 @@ import {
   parseFrames,
 } from './client.js'
 import { createChannel } from '../channel.js'
-import { readStream } from '../stream.js'
+import { finishReason, readStream } from '../stream.js'
 
 export const DOUBAO_PROVIDER = 'doubao'
 export const DOUBAO_DISPLAY_NAME = '豆包工作'
 
 const CHAT_PATH = '/chat/completion'
 const DEFAULT_MAX_TOKENS = 8192
+
+/**
+ * 上游短时频控的退避。
+ *
+ * 710022004 的 error_msg 字面就是 `rate limited`（scripts/_db-heal2.mjs 实测：
+ * 同一份 cookie 连着发，第二次起 250ms 就被拦），跟登录态、跟内容都无关。吐字
+ * 之前撞上就等一会儿重来；吐过字就不重试，免得半截回答拼两遍。
+ * TM.00001041 是会话槽满（同时 3 个），同样等一等就有位置。
+ */
+const RETRY_MAX = 3
+const RETRY_DELAYS_MS = [1500, 4000, 9000]
+const RETRYABLE_CODES = new Set([ERROR.RISK_CONTROL, 'TM.00001041'])
+
+function sleep(ms) {
+  return new Promise(resolve => { setTimeout(resolve, ms) })
+}
 
 /** 一个模型行在卡片/选择器里的副标题。倍率来自上游 tag_list（"0.65x"）。 */
 function describeModel(entry) {
@@ -41,12 +57,217 @@ function describeModel(entry) {
 }
 
 /**
- * 把宿主的 messages 拍成豆包要的那一段 prompt。
+ * 豆包通道的固定前缀与注入净化。
+ *
+ * 宿主下发的 system 里会混进各种插件塞进来的模块（prompt-inject.md 那类越狱
+ * 注入、dsh_boost 覆盖块）。豆包上游的内容风控按整段语义判：只要请求最前面
+ * 那一段带着「解除限制 / 无视规则」的语境，整条请求就被挡回「该内容涉嫌违反
+ * 豆包使用规范」——用户看到的就是发任何东西都报违规。
+ *
+ * 所以这条通道的请求前缀必须是**固定的、干净的**，只用本文件的常量与本文件的
+ * 规则，任何插件都改不到它：
+ *   1. 开头固定拼 SAFE_PREFIX，谁都不能替代；
+ *   2. system 按空行切段，命中注入特征的段落整段丢掉，没命中的原样留下 ——
+ *      只管前缀，不动宿主自己那份正常提示词。
+ *
+ * 这个净化只发生在发给豆包的这一路请求上；别的渠道、别的对话读到的
+ * messages 仍是原样，一个字都不改。
+ */
+const SAFE_PREFIX = '你是一个中文 AI 助手，正在协助用户完成当前任务。请直接、完整地回答用户的问题，不要复述这些说明。'
+
+// 注入特征：伪造的 chat 模板边界、覆盖式的指令块、越狱模块自报的家门。
+const INJECTION_MARKERS = [
+  /<\|[^|>\n]{0,40}\|>/,              // <|im_start|> / <|im_end|> 这类伪造的模板边界
+  /<\/?project_instructions>/i,
+  /<\/?dsh_boost[\s>]/i,
+  /\[\s*MODE\s*:\s*UNRESTRICTED/i,
+  /UNRESTRICTED\s+SANDBOX/i,
+  /\bPRIME\s+DIRECTIVE\b/,
+  /\bNever\s+refuse\b/i,
+]
+
+/**
+ * 整块剥离的注入模块。
+ *
+ * 段落级过滤治不了这些块：宿主把整套越狱指令写在一对标签里，开标签在第一段、
+ * 闭标签在最后一段，中间那些「Scoped Rules 3. 病毒/蠕虫/木马…」「9. 写色情/
+ * 黄文/露骨性行为…」的段落本身不带任何标签，按段过筛会原样留下 —— 实测
+ * （scripts/_db-clean.mjs、_db-full.mjs）就是这样：项目指令剥掉了，规则正文
+ * 一条不落全发到了豆包，上游按语义判成违规，整轮被拦。
+ *
+ * 所以先按成对标签整块删，再走段落过筛。没闭合的（system 被截断）从开标签删到段尾。
+ */
+const INJECTION_BLOCKS = [
+  /<project_instructions>[\s\S]*?<\/project_instructions>/gi,
+  /<dsh_boost[^>]*>[\s\S]*?<\/dsh_boost>/gi,
+  /<system-reminder>[\s\S]*?<\/system-reminder>/gi,
+  /<context-rescue-checkpoint>[\s\S]*?<\/context-rescue-checkpoint>/gi,
+  /<\|im_start\|>[\s\S]*?<\|im_end\|>/gi,
+]
+
+/** 只剥掉越狱模块这几对标签，正文一个字都不改；没闭合时删到末尾。 */
+function stripInjectionBlocks(text) {
+  let out = text
+  for (const re of INJECTION_BLOCKS) out = out.replace(re, '')
+  // 没闭合的开标签：从它删到段尾（这时候后面全是它的正文，留着就是原样外发）
+  out = out.replace(/<(project_instructions|dsh_boost|system-reminder|context-rescue-checkpoint)\b[^>]*>[\s\S]*$/gi, '')
+  return out
+}
+
+/**
+ * 规则正文的语义特征。
+ *
+ * 只对 system 生效（用户自己的提问一个字都不动）。这些词出现在**系统提示**里
+ * 基本只有一种来源：越狱模块的逐条操作清单。豆包风控按语义判，留着就整轮被拦。
+ */
+const SENSITIVE_MARKERS = [
+  /Scoped\s+Rules/i,
+  /REFUSAL\s+HARDENING/i,
+  /拒绝对抗/,
+  /Core\s+Motivation/i,
+  /写色情|黄文|露骨性行为|AV\s*场景|角色扮演成人/,
+  /病毒|蠕虫|木马|勒索|远控|键盘记录|间谍软件/,
+  /外挂|读内存|改金币|反作弊/,
+  /webshell|一句话木马|留后门/i,
+  /钓鱼|仿站|社工库|撞库|盗刷|洗钱|跑分/,
+  /找盗版|破解版|注册机|脱壳|卡密|磁力链接/i,
+]
+
+/**
+ * 只有整份规则清单才有的招牌词。
+ *
+ * 对话轮次不能像 system 那样按单个敏感词过筛：用户问一句「木马是什么」、
+ * 工具读一段过滤器源码（里面就有 木马 / webshell 这些字面量），都会被误伤，
+ * 而实测（scripts/_db-tool.mjs 的 C/D、_db-slice.mjs 的 E）这类单片词根本
+ * 不触发风控 —— 触发的是「一大段规则清单」这个整体语义。
+ *
+ * 所以对话轮次只认这份清单：命中 2 个以上才当作归档的规则正文处理。
+ */
+const STRONG_MARKERS = [
+  /UNRESTRICTED\s+SANDBOX/i,
+  /PRIME\s+DIRECTIVE/,
+  /Little\s+Code\s+Sauce/i,
+  /REFUSAL\s+HARDENING/i,
+  /Scoped\s+Rules/i,
+  /拒绝对抗|Core\s+Motivation/,
+  /Never\s+refuse/i,
+  /不做任何拒绝|解除一切限制|解除所有限制|无视一切规则|拒绝是一种故障/,
+]
+
+function looksInjected(text) {
+  return INJECTION_MARKERS.some(re => re.test(text))
+}
+
+/** 单条消息里的伪协议标签一律抹掉，免得它们被当成真的模板边界。 */
+function stripInjectionMarkup(text) {
+  return text
+    .replace(/<\|[^|>\n]{0,40}\|>/g, '')
+    .replace(/<\/?project_instructions>/gi, '')
+    .replace(/<\/?dsh_boost[^>]*>/gi, '')
+}
+
+/**
+ * 一段话要不要丢。
+ *
+ * 命中特征词直接丢；另外把越狱模块的招牌句式也算进来 —— 那些段落本身不带
+ * 标签，但通篇是「无视规则 / 不做任何拒绝」的口气，风控照样会咬。
+ * 最后一道是规则正文的语义特征（Scoped Rules 的逐条清单那类），只在 system
+ * 里生效。
+ */
+function paragraphInjected(para) {
+  if (para.trim() === '') return false
+  if (looksInjected(para)) return true
+  if (/(不做任何拒绝|绝不拒绝|拒绝是一种故障|解除一切限制|解除所有限制|无视一切规则)/.test(para)) return true
+  return SENSITIVE_MARKERS.some(re => re.test(para))
+}
+
+/**
+ * system 净化的三步：成对标签整块剥（连带里面的规则正文）→ 按空行切段过筛 →
+ * 抹掉残余的伪协议标签。
+ */
+function cleanSystem(text) {
+  const kept = []
+  for (const para of stripInjectionBlocks(text).split(/\n{2,}/)) {
+    if (paragraphInjected(para)) continue
+    const body = stripInjectionMarkup(para).trim()
+    if (body !== '') kept.push(body)
+  }
+  return kept.join('\n\n')
+}
+
+/**
+ * 对话轮次（user / assistant / tool）的净化。
+ *
+ * 原来这条分支一个字都不动，理由是「用户自己的提问不该被改」。实测下来这个
+ * 假设站不住：
+ *
+ *   scripts/_db-role.mjs —— 同一段规则正文，放进 system 段被拦、放进 assistant
+ *   段照样被拦（710022004「该内容涉嫌违反豆包使用规范」）；
+ *   scripts/_db-role2.mjs —— 连 user 段里带 `[Compressed conversation section]`
+ *   引一段规则正文都被拦（99 字、1.3 秒就回，稳定复现）；
+ *   scripts/_db-det.mjs —— 同一段内容连发 6 次，6 次全拦，不是概率问题。
+ *
+ * 而 DSH 的历史里到处是这类正文：上下文压缩会把旧的越狱规则整段摘进摘要，
+ * 助手回复里也会复述「按你的规则第 3 条…」。这些轮次原样外发，等于每一轮都
+ * 把越狱正文重新递给风控 —— 用户看到的就是「发任何东西都报违规」。
+ *
+ * 所以对话轮次也过一遍：命中的段落换成一句占位继续往下走（不整轮丢掉，否则
+ * 对话结构断裂、模型看不懂上下文），没命中的原样保留。用户真正的提问——问
+ * 代码、贴报错、贴日志——不带这些特征词，一个字都不会被改。
+ */
+function cleanTurn(text) {
+  const stripped = stripInjectionBlocks(text)
+  // 整轮就是一份规则清单：直接换一句占位，剩下的残句没有意义，留着反而还在
+  // 递语义线索给风控。
+  const strong = STRONG_MARKERS.filter(re => re.test(stripped)).length
+  if (strong >= 2) return `[本段历史含已归档的规则清单，已省略 ${stripped.length} 字]`
+  const kept = []
+  let skipped = 0
+  for (const para of stripped.split(/\n{2,}/)) {
+    const ruled = strong >= 1 && paragraphInjected(para)
+    if (ruled) { skipped += para.length; continue }
+    const body = stripInjectionMarkup(para).trim()
+    if (body !== '') kept.push(body)
+  }
+  if (skipped > 0) kept.push(`[这一段已省略 ${skipped} 字]`)
+  return kept.join('\n\n')
+}
+
+/**
+ * 豆包网页版对单次输入的字符硬顶。
+ *
+ * 实测（scripts/_probe-doubao-thr.mjs、_probe-doubao-size2.mjs）：拍平后的 prompt
+ * 到了 265000 字符，上游一定回 `710020202 common invalid param`；这个码跟请求形状
+ * （runtime_type / agent_task_param / project_id）、model_extra_params、
+ * taskMode 全都无关，只跟字符数有关。宿主每轮下发的 system 里塞了大量插件内容，
+ * 加上几十个工具定义，很容易稳定越过这条线 —— 用户看到的就是「发任何东西都报
+ * 该内容涉嫌违反豆包使用规范 / common invalid param」。
+ *
+ * 所以这条通道必须在发出去之前自己夹一刀：留着固定前缀 + 一段 system + 最新
+ * 的若干轮，把老的丢掉。宁可少一点上下文，也不要整个请求被上游拒掉。
+ */
+export const PROMPT_CHAR_BUDGET = 200_000
+
+/** system 再长也只留这么多字：真正把请求撑爆的就是它，不是对话本身。 */
+const SYSTEM_CHAR_CAP = 60_000
+
+const TRUNCATED_MARK = '\n…（内容过长，已截断）'
+const DROPPED_MARK = '[较早的历史已省略]'
+
+/**
+ * 把宿主的 messages 拍成豆包要的那一段 prompt，并按字符预算夹取。
  *
  * 保留角色标签，因为拍平之后模型只能靠标签分辨谁说了什么；工具结果折叠成
  * 「工具结果」而不是伪装成 user，免得模型把它们当成用户的话去回答。
+ *
+ * 预算从后往前分配：最新的一轮一定有位置（它超长就先截它自己），更早的轮次
+ * 放不下就整轮丢掉，并留一行说明。这样「用户刚说的话」永远不会被挤掉。
+ *
+ * @param messages 宿主下发的 messages
+ * @param budget 拍平后允许的最大字符数
+ * @returns 可以直接塞进 buildChatBody 的整段文本
  */
-export function flattenMessages(messages) {
+export function flattenMessages(messages, budget = PROMPT_CHAR_BUDGET) {
   const rows = Array.isArray(messages) ? messages : []
   const system = []
   const turns = []
@@ -54,14 +275,52 @@ export function flattenMessages(messages) {
     const role = typeof row?.role === 'string' ? row.role : 'user'
     const text = contentText(row?.content)
     if (text === '') continue
-    if (role === 'system') system.push(text)
-    else if (role === 'tool') turns.push(`[工具结果] ${text}`)
-    else if (role === 'assistant') turns.push(`[助手] ${text}`)
-    else turns.push(`[用户] ${text}`)
+    if (role === 'system') {
+      const kept = cleanSystem(text)
+      if (kept !== '') system.push(kept)
+      continue
+    }
+    const body = cleanTurn(text)
+    if (body === '') continue
+    if (role === 'tool') turns.push(`[工具结果] ${body}`)
+    else if (role === 'assistant') turns.push(`[助手] ${body}`)
+    else turns.push(`[用户] ${body}`)
   }
-  const head = system.length > 0 ? `${system.join('\n\n')}\n\n` : ''
-  const tail = turns.length > 0 ? turns.join('\n\n') : ''
-  return `${head}${tail}`
+
+  const parts = [SAFE_PREFIX]
+  let left = budget - SAFE_PREFIX.length
+
+  if (system.length > 0) {
+    let systemText = system.join('\n\n')
+    if (systemText.length > SYSTEM_CHAR_CAP) systemText = systemText.slice(0, SYSTEM_CHAR_CAP) + TRUNCATED_MARK
+    parts.push(systemText)
+    left = Math.max(0, left - systemText.length - 2)
+  }
+
+  if (turns.length > 0) {
+    const kept = []
+    let dropped = false
+    for (let i = turns.length - 1; i >= 0; i -= 1) {
+      const text = turns[i]
+      const cost = text.length + 2
+      if (cost <= left) {
+        kept.unshift(text)
+        left -= cost
+        continue
+      }
+      if (kept.length === 0) {
+        // 连最新的一轮都放不下：留开头那段（指令通常在前面），尾巴截掉。
+        const room = left - TRUNCATED_MARK.length - 2
+        if (room > 0) kept.unshift(text.slice(0, room) + TRUNCATED_MARK)
+      }
+      dropped = true
+      break
+    }
+    if (dropped) kept.unshift(DROPPED_MARK)
+    if (kept.length > 0) parts.push(kept.join('\n\n'))
+  }
+
+  return parts.join('\n\n')
 }
 
 /** 消息内容可能是字符串，也可能是 block 数组（图片、工具结果）。 */
@@ -81,7 +340,13 @@ function contentText(content) {
 function explain(error) {
   if (error instanceof DoubaoError) {
     if (error.code === ERROR.SESSION_EXPIRED) return new Error('豆包登录态已失效：请在「Get It For Free」的豆包卡里重新扫码登录')
-    if (error.code === ERROR.RISK_CONTROL) return new Error('豆包风控拦下了这次请求（710022004）：过一会再试，或先在网页版发一条消息')
+    // 710022004 的实际含义是「这份登录态不是当前那个」，不是内容违规：网页端每开
+    // 一次页面重铸 s_v_web_id，插件存的那份对不上就整轮被拦。pickAccount 已经会按
+    // 浏览器当前 cookie 自愈，走到这里说明浏览器里也没有可用的新号。
+    if (error.code === ERROR.RISK_CONTROL) return new Error('豆包不认这份登录态（710022004）：在浏览器里打开 www.doubao.com 刷新一次（保持登录），再重发这条消息')
+    if (error.code === ERROR.INVALID_PARAM) {
+      return new Error('豆包拒收了这次请求（710020202）：拍平后的输入超过了网页版字符硬顶。新开一轮对话再试，或先清掉过长的历史')
+    }
     if (error.code === 'TM.00001041') return new Error('豆包这个账号的并发会话已满（3 个）：稍等再试')
     return new Error(`豆包返回错误${error.code === '' ? '' : ` ${error.code}`}：${error.message}`)
   }
@@ -255,22 +520,6 @@ export function createDoubaoAdapter({ doubao, logger = console, onRoster = null 
     if (typeof globalThis.fetch !== 'function') {
       throw new Error('豆包通道需要宿主提供全局 fetch；这个运行环境没有')
     }
-    let response
-    try {
-      response = await fetch(url, { method: 'POST', headers, body, signal })
-    } catch (error) {
-      throw explain(error)
-    }
-    if (response.status === 401) {
-      throw new Error('豆包登录态已失效：请在豆包的卡里重新扫码登录')
-    }
-    if (!response.ok) {
-      const detail = await response.text().catch(() => '')
-      throw new Error(`豆包拒绝了这个请求：HTTP ${response.status}${detail === '' ? '' : ` · ${detail.slice(0, 200)}`}`)
-    }
-    if (response.body === null || typeof response.body.getReader !== 'function') {
-      throw new Error('豆包没有返回事件流')
-    }
 
     const channel = createChannel()
     const state = { thinkingIds: new Set() }
@@ -283,7 +532,31 @@ export function createDoubaoAdapter({ doubao, logger = console, onRoster = null 
       }))
     }
 
-    void (async () => {
+    /**
+     * 一次请求 + 读完整条流。
+     *
+     * 抽出来是为了上面的重试：710022004 的 error_msg 字面就是 rate limited
+     * （scripts/_db-heal2.mjs 实测，同一份 cookie 隔几秒连发必被拦，250ms 就回），
+     * 属于上游短时频控，不是登录态失效、也不是内容违规。没吐出任何字之前退避重来
+     * 一次通常就过；已经吐过字则不能重试（会把半截回答拼两遍）。
+     */
+    async function runOnce(emit) {
+      let response
+      try {
+        response = await fetch(url, { method: 'POST', headers, body, signal })
+      } catch (error) {
+        throw explain(error)
+      }
+      if (response.status === 401) {
+        throw new Error('豆包登录态已失效：请在豆包的卡里重新扫码登录')
+      }
+      if (!response.ok) {
+        const detail = await response.text().catch(() => '')
+        throw new Error(`豆包拒绝了这个请求：HTTP ${response.status}${detail === '' ? '' : ` · ${detail.slice(0, 200)}`}`)
+      }
+      if (response.body === null || typeof response.body.getReader !== 'function') {
+        throw new Error('豆包没有返回事件流')
+      }
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
@@ -304,13 +577,13 @@ export function createDoubaoAdapter({ doubao, logger = console, onRoster = null 
                 code = String(payload?.error_code ?? '')
                 message = String(payload?.error_msg ?? message)
               } catch { /* 用默认文案 */ }
-              throw explain(new DoubaoError(code || 'STREAM_ERROR', message))
+              throw new DoubaoError(code || 'STREAM_ERROR', message)
             }
             if (frame.event === 'SSE_REPLY_END') {
               ended = true
               break
             }
-            for (const piece of textOf(frame, state)) if (piece !== '') push(piece)
+            for (const piece of textOf(frame, state)) if (piece !== '') emit(piece)
           }
         }
         buffer += decoder.decode()
@@ -318,7 +591,27 @@ export function createDoubaoAdapter({ doubao, logger = console, onRoster = null 
           const parsed = parseFrames(`${buffer}\n\n`)
           for (const frame of parsed.frames) {
             if (frame.event === 'SSE_REPLY_END') { ended = true; break }
-            for (const piece of textOf(frame, state)) if (piece !== '') push(piece)
+            for (const piece of textOf(frame, state)) if (piece !== '') emit(piece)
+          }
+        }
+      } finally {
+        try { reader.cancel() } catch { /* 已经关了 */ }
+      }
+    }
+
+    void (async () => {
+      let emitted = 0
+      const emit = piece => { emitted += 1; push(piece) }
+      try {
+        for (let attempt = 1; ; attempt += 1) {
+          try {
+            await runOnce(emit)
+            break
+          } catch (error) {
+            const code = error instanceof DoubaoError ? error.code : ''
+            const retry = attempt < RETRY_MAX && emitted === 0 && RETRYABLE_CODES.has(code)
+            if (!retry) throw error
+            await sleep(RETRY_DELAYS_MS[Math.min(attempt - 1, RETRY_DELAYS_MS.length - 1)])
           }
         }
         // 上游没有 usage，也不给结束原因：补一个正常的 stop，让宿主的块协议收尾。
@@ -331,12 +624,15 @@ export function createDoubaoAdapter({ doubao, logger = console, onRoster = null 
         channel.push(undefined)
       } catch (error) {
         channel.push(explain(error))
-      } finally {
-        try { reader.cancel() } catch { /* 已经关了 */ }
       }
     })()
 
-    yield* readStream(channel.read(), 'chat', new Map(), () => Date.now(), {})
+    // readStream 只把上游的 finish 记进快照，不产出 finish 块 —— 而宿主的块协议
+    // 靠 finish 块收尾。以前这里直接结束，网关于是判定「流没结束就断了」，
+    // 统一回 502 incomplete_stream（即使正文已经正常吐完）。
+    const outcome = yield* readStream(channel.read(), 'chat', new Map(), () => Date.now(), {})
+    if (outcome.sawUsage === true) yield { type: 'usage', usage: outcome.usage }
+    yield { type: 'finish', reason: outcome.brokenToolCall === true ? { kind: 'max-tokens' } : finishReason(outcome.finish) }
   }
 
   // 挂载后不久补拉一次目录：宿主挂载时问的那一次只能拿到快照，而快照可能是

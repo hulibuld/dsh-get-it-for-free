@@ -153,7 +153,7 @@ export function dayKey(at = Date.now()) {
 
 /** 3.3.0 拆掉免登录车道（匿名清单 / Kilo / 免费池）后，这四个键不再有任何
  *  读者。留在文件里只会让人以为它们还有用，所以在读取时清掉一次。 */
-export const RETIRED_SETTINGS = ['freePool', 'freeChannelsEnabled', 'hideAllModels', 'hideFreeModels']
+export const RETIRED_SETTINGS = ['freePool', 'freeChannelsEnabled', 'hideAllModels', 'hideFreeModels', 'chanGateway']
 
 /** 删掉已退役的键；返回同一个对象（就地改），供 JsonStore.edit 使用。 */
 export function migrateSettings(settings) {
@@ -197,12 +197,6 @@ export const SETTINGS_INITIAL = {
    *  'client'` dials one http/https/socks5/socks5h URL directly. Off by
    *  default — requests go straight out until this is turned on. */
   egress: { enabled: false, mode: 'subscription', url: '', mihomoPath: '' },
-  /** Expose the absorbed channels' OpenAI gateway (the pack's loopback
-   *  listener) to other machines under this plugin's own key. Off by default:
-   *  a LAN listener is a door, and doors stay shut until asked for. */
-  chanGateway: {
-    relay: { enabled: false, host: '127.0.0.1', port: 18326, key: '' },
-  },
   /** Cap a turn's output so a slow lane cannot run away. */
   defaultMaxTokens: 32768,
   /** 所有模型默认允许一次纯推理检查点续写，false 可关闭。 */

@@ -33394,6 +33394,21 @@ function codeArtsDefaultMaxTokens() {
   const raw = Number(process.env.GET_IT_FOR_FREE_CODEARTS_MAX_TOKENS ?? "");
   return Number.isSafeInteger(raw) && raw >= 1024 ? raw : 65536;
 }
+// 输出上限硬顶（2026-11-19 实测：两个账号 x 9 个模型交叉验证）：
+//   同一份请求体 max_tokens=131072 → 200 正常出流；
+//   131073 / 200000 / 1000000 → 一律 SSE 内嵌 InferHub.001001005.400
+//   "The request param is invalid, Please check it"，且不说哪个参数不对。
+// 也就是 131072（=128k）是这个网关的单次输出硬顶，超一就拒。宿主侧 maxTokens
+// 有多条来源（设置页 defaultMaxTokens、会话覆写、registerModelDiscovery 的
+// maxTokens: entry.maxOutput、续写段 continuationBudget），任何一条越界都会让
+// 整轮请求 400，而错误文案里半个字都没提 max_tokens —— 之前三级「参数退让」
+// 每次都要连退三档才报错，就是因为前两档根本没碰这个真正越界的字段。故在此夹死。
+var CODEARTS_MAX_OUTPUT_CEILING = 131072;
+function clampCodeArtsMaxTokens(requested) {
+  const value = Number(requested);
+  const base = Number.isSafeInteger(value) && value > 0 ? value : codeArtsDefaultMaxTokens();
+  return Math.min(base, CODEARTS_MAX_OUTPUT_CEILING);
+}
 // 2026-11-10 实测（两个账号 x 两个模型交叉验证）：带 `maas_type: benefit` 的请求会收到
 // SSE 内嵌的 `InferHub.APIG.0101.404 / The API does not exist or has not been published`，
 // 而同一账号、同一模型**不带该头**立刻 200 正常出流。也就是说那条 0101 是我们自己
@@ -33619,6 +33634,16 @@ class SseGatewayRoutingError extends Error {
   constructor(code, message) {
     super(message);
     this.name = "SseGatewayRoutingError";
+    this.code = code;
+  }
+}
+// TM.00001024：华为云内容审核在流内拦掉了本轮请求（"感谢您的提问，我无法协助完成
+// 这个请求"）。它回落成 INVALID_REQUEST 会让 DSH 直接判死本轮，而审核判定带会话
+// 上下文、换个账号常常就过了 —— 单独立一个类型，外层循环才有机会先换号。
+class SseContentModerationError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "SseContentModerationError";
     this.code = code;
   }
 }
@@ -34197,9 +34222,10 @@ var CodeArtsAdapter = class extends LlmAdapter {
       // 大文件 write 工具参数（如 1000-2000+ 行文档）需要数万 token 的生成空间，
       // 若沿用后端默认输出上限，参数 JSON 会在中途被截断成非法 JSON，harness
       // 工具校验报 `invalid arguments: "arguments" must be an object`。
-      // 参考实现 e2e 实测：65536 可用，131072 反而触发空流被后端拒绝；
-      // 显式传入的 options.maxTokens 优先，未设置时默认 65536。
-      max_tokens: degradeStage >= 3 ? 8192 : options.maxTokens ?? codeArtsDefaultMaxTokens(),
+      // 参考实现 e2e 实测：65536 可用；131072 是硬顶（见 clampCodeArtsMaxTokens：
+      // 131073 起必回 001001005）。显式传入的 options.maxTokens 优先，未设置时
+      // 默认 65536，两条路都过一遍夹取。
+      max_tokens: degradeStage >= 3 ? 8192 : clampCodeArtsMaxTokens(options.maxTokens),
       ...wireTools !== void 0 && wireTools.length > 0 ? { tools: wireTools } : {}
     });
     const url = `${CHAT_API_BASE}/chat/completions`;
@@ -34314,6 +34340,35 @@ var CodeArtsAdapter = class extends LlmAdapter {
             }
             throw new LlmError2(
               `codearts: 华为云网关暂时找不到这个接口（${error.code}）—— 平台侧发布状态异常（常见于华为云故障窗口），不是密钥或请求的问题`,
+              "RATE_LIMIT",
+              { status: 200 }
+            );
+          }
+          if (error instanceof SseContentModerationError) {
+            // 审核判定带会话上下文，同账号原地重试大概率再被拦：换号才有意义。
+            // 换号上限由 rateLimitTried 自然收敛（每个号只试一次），换不到就抛出口。
+            logCodeArtsFailure({
+              status: 200,
+              phase: "sse-moderation",
+              body: String(error.message ?? "").slice(0, 300),
+              accountId: currentAccountId ?? null,
+              model: options.model
+            });
+            if (this.options.accountPool) {
+              const nextModerated = await this.options.accountPool.getAvailableAccount("codearts", options.model, rateLimitTried);
+              if (nextModerated && !rateLimitTried.has(nextModerated.entry.id)) {
+                rateLimitTried.add(nextModerated.entry.id);
+                credential = nextModerated.credential;
+                currentAccountId = nextModerated.entry.id;
+                this.pinSession(credential.access_key_id);
+                authRefreshed = false;
+                continue;
+              }
+            }
+            // 用 RATE_LIMIT 而不是 QUOTA_EXCEEDED：账号是好的，标额度耗尽会把它
+            // 拉黑到明天。文案要能动手：不是密钥问题、可换说法、可换渠道。
+            throw new LlmError2(
+              `codearts: 上游内容审核拦截了本轮请求（${error.code}）—— 已尝试全部可用账号仍被拦。这不是密钥问题；可换个说法重发，或切换到 buddy 等其它渠道的同名模型。`,
               "RATE_LIMIT",
               { status: 200 }
             );
@@ -34673,6 +34728,9 @@ var CodeArtsAdapter = class extends LlmAdapter {
               accountId: null,
               model: options.model
             });
+            if (errorCode === "TM.00001024" || /无法协助完成这个请求|内容审核|content.?moderation|risk.?control/i.test(message2)) {
+              throw new SseContentModerationError(errorCode, message2);
+            }
             if (/not registered|002002009|The model is not registered/i.test(errorCode + " " + message2)) {
               throw new SseBenefitProbeRequired(errorCode, message2);
             }
@@ -39388,6 +39446,13 @@ var QODER_CN_FALLBACK_MODELS = [
   // CN 独有：Qwen3.7-Flash（国际版目录无此 key）
   // ⚠️ 目录里**完全没有 `thinking_config`** → 不可选档位（IDE 显示「不支持」）。
   { id: "q37fmodel", name: "Qwen3.7-Flash", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 0.1 },
+  // CN 独有：Qwen4-Max 预览（本机 `com.qodercn.app.stable/main.sqlite` 的
+  // `chat_model_preferences` 里有 `qmodel_latest_preview` 一行，visible=1、
+  // context_window=400000；用量接口 `/sash/api/v1/me/usages/big_model_credits/histories`
+  // 对这些会话回的 `model_category` 是 `Qwen4-Max-Preview`，且 `chat_sessions.model`
+  // 正是这个 key —— 三者对上，故展示名取官方的 Qwen4-Max-Preview）。
+  // ⚠️ 目录里没有 `thinking_config` 证据 → 与 q37fmodel 同口径，不给 efforts。
+  { id: "qmodel_latest_preview", name: "Qwen4-Max-Preview", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 0.2 },
   // ⚠️ CN 的 `max_input_tokens` 是 96000，但档位表与其它模型一样有 1M 档；
   // 官方客户端只认档位表 → **填 1M**（用户 2026-09-27 定：档位表有 1M 就填 1M）。
   // 实测只探到 800,000 目标 → 服务端计入 **852,951** 通过，985,000 时越界且
@@ -40162,12 +40227,16 @@ var QoderAdapter = class extends LlmAdapter4 {
    * （用户报障：「关闭的就没有显示倍率」）。详见 `model.list` 端点的注释。
    */
   /**
-   * 本机补充的模型（`~/.dsh/get-it-for-free/model-overrides.json`，按渠道 id 分组）。
+   * 「刷新模型」按钮对本适配器的入口。
    *
-   * 为什么需要：Qoder 的模型目录端点要 WASM 签名，本插件没实现，上游上新模型时
-   * 列表不会自己变。这个文件是唯一不用改代码的补入口。文件不存在 / 解析失败 /
-   * 条目缺 id 都按「没有补充」处理，不影响原表。
+   * Qoder 系目录 = 兜底表 + `model-overrides.json`，**不吃** `remoteModels` 等四个
+   * 远端缓存字段（见 `refreshModelCatalog`），所以通用刷新对 qodercn 是空操作。
+   * 这里把本机补充的 15 秒缓存清掉，让下一次 `allModels()` 立刻重读文件。
    */
+  refreshCatalog() {
+    this.extraModelsCache = void 0;
+    this.extraModelsAt = 0;
+  }
   extraModels() {
     const now = Date.now();
     if (this.extraModelsCache !== void 0 && now - this.extraModelsAt < 15e3) return this.extraModelsCache;
@@ -58665,6 +58734,17 @@ function hasQoderCampaignRefreshedToday(nowMs = Date.now()) {
 }
 var QODER_CREDITS_TIMEOUT_MS = 15e3;
 var NOT_ACTIVATED_HINT = "\u8BE5\u8D26\u53F7\u5C1A\u672A\u5728 Qoder \u4FA7\u5F00\u901A\u6BCF\u65E5\u9886\u53D6\uFF08\u6BCF\u65E5 100 Credits\uFF09\u3002\u8BF7\u5148\u7528 Qoder \u5B98\u65B9\u5BA2\u6237\u7AEF\u767B\u5F55\u4E00\u6B21\u8BE5\u8D26\u53F7\uFF0C\u5F00\u901A\u540E\u518D\u56DE\u6765\u9886\u53D6\u3002";
+var QODER_INELIGIBLE_HINT = "体验版（免费）账号自 2026-11-19 起不再开放每日领取（官方公告 docs.qoder.cn/events/100credits）；开通试用/专业版/会员卡后可领。这不是插件故障，重试不会改变结果";
+// 官方 2026-11-19 政策收紧：每日 100 Credits 只对试用期/付费订阅/会员卡开放。
+// 体验版号的活动列表里连 CLAIM_BENEFIT 行都没有，须按订阅状态判资格，
+// 别落进「未开通/没活动」误导用户反复重试（与 src/qoder-checkin.js 同一裁决）。
+function isQoderFreeTierIneligible(campaigns, usageBody) {
+  if (campaigns === void 0) return false;
+  if (campaigns.campaigns.some((c) => c.actionType === "CLAIM_BENEFIT")) return false;
+  if (typeof usageBody !== "object" || usageBody === null) return false;
+  const usage = usageBody.qoderUsage;
+  return typeof usage === "object" && usage !== null && usage.userType === "personal_standard";
+}
 var NOT_REFRESHED_YET_HINT = `\u4ECA\u5929\u7684\u6BCF\u65E5\u6D3B\u52A8\u5C1A\u672A\u5237\u65B0\uFF08\u6BCF\u65E5 ${QODER_CAMPAIGN_REFRESH_HOUR_UTC8}:00\uFF08UTC+8\uFF09\u5237\u65B0\uFF09\uFF0C\u5F53\u524D\u770B\u5230\u7684\u662F\u6628\u5929\u90A3\u4E00\u8F6E\uFF0C\u8BF7\u7A0D\u540E\u518D\u6765\u9886\u53D6\u3002`;
 function isQoderNotActivated(campaigns, usageBody) {
   if (campaigns === void 0) return false;
@@ -58927,6 +59007,9 @@ async function claimQoderDailyCheckin(credential, product, fetcher = sanitizingF
       return { kind: "already-claimed", message: "\u4ECA\u5929\u5DF2\u9886\u53D6" };
     }
     const usage = await fetchQoderUsageRaw(credential, product, fetcher);
+    if (isQoderFreeTierIneligible(parsed, usage)) {
+      return { kind: "ineligible", message: QODER_INELIGIBLE_HINT, coversToday: true };
+    }
     if (isQoderNotActivated(parsed, usage)) {
       return { kind: "inactive", message: NOT_ACTIVATED_HINT, actionRequired: true };
     }
@@ -58949,7 +59032,14 @@ async function fetchQoderCheckinStatus(credential, product, fetcher = sanitizing
   const parsed = await loadCampaigns(credential, product, fetcher);
   if (parsed === void 0) return null;
   const benefits = parsed.campaigns.filter((c) => c.actionType === "CLAIM_BENEFIT");
-  if (benefits.length === 0) return { active: false, todayCheckedIn: false, todayCredit: 0 };
+  if (benefits.length === 0) {
+    // 体验版被官方政策取消资格：不是「活动未开启」，把原因带到面板上。
+    const usage = await fetchQoderUsageRaw(credential, product, fetcher);
+    if (isQoderFreeTierIneligible(parsed, usage)) {
+      return { active: false, todayCheckedIn: false, todayCredit: 0, ineligible: true, message: QODER_INELIGIBLE_HINT };
+    }
+    return { active: false, todayCheckedIn: false, todayCredit: 0 };
+  }
   const refreshed = hasQoderCampaignRefreshedToday(nowMs);
   const claimed = benefits.every((c) => c.claimStatus === "CLAIMED");
   const credit = benefits.reduce((sum, c) => sum + (Number.isFinite(c.amount) ? c.amount : 0), 0);
@@ -61726,7 +61816,7 @@ function createAutoCheckinStore(ctx) {
   return new FileAutoCheckinStore(join7(home, "channel-pack", AUTO_CHECKIN_FILE), ctx.logger);
 }
 function emptyTotals2() {
-  return { providers: 0, claimed: 0, totalCredit: 0, totalByUnit: { token: 0, credit: 0 }, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0, skipped: 0, errors: 0 };
+  return { providers: 0, claimed: 0, totalCredit: 0, totalByUnit: { token: 0, credit: 0 }, alreadyClaimed: 0, inactive: 0, ineligible: 0, failed: 0, coversToday: 0, skipped: 0, errors: 0 };
 }
 function isUnsupportedCheckin(message2) {
   return message2.includes("\u4E0D\u652F\u6301\u6BCF\u65E5\u7B7E\u5230") || message2.includes("unsupported provider");
@@ -61741,6 +61831,7 @@ function describeRun(totals) {
     parts.push(`${totals.claimed} \u4E2A\u8D26\u53F7\u9886\u53D6\u6210\u529F${amounts === null ? "" : `\uFF08${amounts}\uFF09`}`);
   }
   if (totals.alreadyClaimed > 0) parts.push(`${totals.alreadyClaimed} \u4E2A\u4ECA\u5929\u5DF2\u9886`);
+  if (totals.ineligible > 0) parts.push(`${totals.ineligible} 个无领取资格（官方政策收紧）`);
   if (totals.failed > 0) parts.push(`${totals.failed} \u4E2A\u5931\u8D25`);
   if (totals.errors > 0) parts.push(`${totals.errors} \u4E2A\u6E20\u9053\u51FA\u9519`);
   if (totals.skipped > 0) parts.push(`${totals.skipped} \u4E2A\u6E20\u9053\u4E0D\u652F\u6301\u7B7E\u5230`);
@@ -61786,6 +61877,7 @@ function describeChannel(summary) {
   if (summary.alreadyClaimed > 0) parts.push(`${summary.alreadyClaimed} \u4E2A\u4ECA\u5929\u5DF2\u9886`);
   if (summary.failed > 0) parts.push(`${summary.failed} \u4E2A\u5931\u8D25`);
   if (summary.inactive > 0) parts.push(`${summary.inactive} \u4E2A\u672A\u5F00\u542F`);
+  if (summary.ineligible > 0) parts.push(`${summary.ineligible} 个无领取资格（官方政策收紧）`);
   if (parts.length === 0) return "\u65E0\u53EF\u9886";
   const coversToday = summary.coversToday ?? summary.claimed + summary.alreadyClaimed;
   if (coversToday === 0 && summary.claimed + summary.alreadyClaimed > 0) {
@@ -61885,6 +61977,7 @@ function createAutoCheckin(deps) {
       totals.totalByUnit.token += Number(byUnit.token) || 0;
       totals.alreadyClaimed += summary.alreadyClaimed;
       totals.inactive += summary.inactive;
+      totals.ineligible += summary.ineligible ?? 0;
       totals.failed += summary.failed;
       totals.coversToday += summary.coversToday ?? summary.claimed + summary.alreadyClaimed;
       // 只留「几个失败」看不出是哪个号、为什么，第二天照样得重跑一遍才知道。
@@ -62099,6 +62192,7 @@ function computeClaimSummary(outcomes) {
     totalCredit: 0,
     alreadyClaimed: 0,
     inactive: 0,
+    ineligible: 0,
     failed: 0,
     coversToday: 0,
     totalByUnit: { token: 0, credit: 0 }
@@ -62117,6 +62211,12 @@ function computeClaimSummary(outcomes) {
         break;
       case "inactive":
         summary.inactive += 1;
+        break;
+      case "ineligible":
+        // 官方政策取消资格：终态，不是失败也不是待领。coversToday 记上，
+        // 免得自动签到把「今天已处理完」误判成没跑完而整天空转重试。
+        summary.ineligible += 1;
+        if (outcome.coversToday !== false) summary.coversToday += 1;
         break;
       case "failed":
         summary.failed += 1;
@@ -62186,7 +62286,9 @@ async function collectClaimResults(accounts, product, deps) {
           outcome = await claim(credential, product, entry);
         } else {
           const status = await fetchStatus(credential, product);
-          if (status !== null && !status.active) {
+          if (status !== null && status.ineligible === true) {
+            outcome = { kind: "ineligible", message: typeof status.message === "string" && status.message !== "" ? status.message : "该账号无领取资格（官方政策收紧）", coversToday: true };
+          } else if (status !== null && !status.active) {
             outcome = { kind: "inactive", message: "\u7B7E\u5230\u6D3B\u52A8\u672A\u5F00\u542F" };
           } else if (status !== null && status.todayCheckedIn) {
             outcome = { kind: "already-claimed", message: "\u4ECA\u5929\u5DF2\u7B7E\u5230" };
@@ -62344,6 +62446,15 @@ function refreshModelCatalog(provider) {
   for (const id of targets) {
     const adapter = MODEL_ADAPTERS_BY_PROVIDER.get(id);
     if (adapter === void 0 || adapter === null) continue;
+    // 适配器自带刷新钩子优先：Qoder 系的目录来自兜底表 + model-overrides.json，
+    // 不吃下面这四个远端字段，只清它们等于「点了没反应」（用户报障原话）。
+    if (typeof adapter.refreshCatalog === "function") {
+      try {
+        adapter.refreshCatalog();
+      } catch (error) {
+        void error;
+      }
+    }
     for (const field of MODEL_CACHE_FIELDS) {
       try {
         if (field in adapter) adapter[field] = void 0;
@@ -64338,6 +64449,12 @@ async function handleMethod(method, payload, signal) {
           models = await llm.listModels(req.provider);
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error);
+          // 用户报障「读取模型列表失败：Cannot read properties of undefined (reading 'get')」
+          // 只有 message 没有栈，静态审计全链路无裸 .get，定位不到肇事帧。
+          // 这里把完整堆栈落日志（仅失败路径），下一次报障直接看栈修根因。
+          ctx.logger?.warn?.(
+            `[channel-pack] model.list(${req.provider}) failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`
+          );
           return { ok: false, error: { code: "bad-request", message: `\u8BFB\u53D6\u6A21\u578B\u5217\u8868\u5931\u8D25\uFF1A${reason}` } };
         }
         const disabledMap = pool.listDisabledModels(req.provider);
@@ -69810,7 +69927,7 @@ function primeOpencodeCapabilities() {
   loadDiskCacheSync();
   void ensureDiskLoaded().then(() => {
     if (memory.length === 0) refreshOpencodeCapabilities();
-  });
+  }).catch(() => {});
 }
 function supportsOpencodeImage(capability) {
   return capability?.modalities.includes("image") === true;
