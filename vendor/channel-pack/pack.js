@@ -33381,12 +33381,42 @@ function registerAdapterIdempotent(llm, providers, adapter, warn) {
 
 // vendor/channel-pack/src/llm-adapter.ts
 var CHAT_API_BASE = "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2";
-// CodeArts 哪些模型真能读图，我们手里没有实测证据。默认一律按纯文本声明；
-// 需要时用 GET_IT_FOR_FREE_CODEARTS_VISION_MODELS（逗号分隔的模型 id）打开。
-// 贸然对所有模型声明 image，用户一贴图就会收到上游 400，比不支持更难解释。
-var CODEARTS_VISION_MODELS = new Set(
-  String(process.env.GET_IT_FOR_FREE_CODEARTS_VISION_MODELS ?? "").split(",").map((id) => id.trim()).filter((id) => id.length > 0)
-);
+// CodeArts 哪些模型真能读图。
+//
+// 默认集合只放**实测为真**的模型（2026-11-21，账号 codearts-887eca65，
+// 真实凭据直连上游 /api/v2/chat/completions）：
+//
+//   glm-5.3                  ❌ 上游硬拒 InferHub.001001020.406
+//                              "The request model is not multimodal"
+//   glm-5.3-flash            ✅ 三图全对，空白图负控答 BLANK
+//   deepseek-v4.1-flash-1017 ✅ 三图全对，空白图负控答 BLANK
+//   kimi-k3.1-pro            ✅ 三图全对，空白图负控答 BLANK
+//   GLM-5.2                  ✅ 纯红图答出「红色」，但上游 supports_images 标 false
+//
+// 三图 = 纯红图 / 左右分色图(左红右蓝) / 绿圆白底图，三项全对才算"能看图"。
+// 空白图负控是必要的：模型对没看见的图也能编出合理颜色，只有在纯白图上如实
+// 答 BLANK 才能证明它真的读到了像素 —— 缺这一步就会把幻觉当成能力。
+//
+// 上游 /v1/model/builtin 的 supports_images 字段**不可信**（GLM-5.2 标 false
+// 但实测能看图），所以默认集合以实测为准，不读该字段。
+//
+// 图片只能走 base64 data URI：URL 形式三个视觉模型全废（glm-flash 报
+// "图片输入格式/解析错误"，deepseek 504 超时，kimi 明确拒 "unsupported image url"）。
+//
+// 环境变量 GET_IT_FOR_FREE_CODEARTS_VISION_MODELS 仍可覆盖（逗号分隔 model id）；
+// 置为 "none" 可完全关闭视觉声明，回到 3.5.4 及以前的纯文本行为。
+var CODEARTS_VISION_DEFAULT = "glm-5.3-flash,deepseek-v4.1-flash-1017,kimi-k3.1-pro";
+var CODEARTS_VISION_MODELS = (() => {
+  const raw = String(process.env.GET_IT_FOR_FREE_CODEARTS_VISION_MODELS ?? "").trim();
+  // 未设置或为空串 -> 用实测默认值；"none" -> 显式关闭（回到纯文本）。
+  const spec = raw === "none" ? "" : raw.length > 0 ? raw : CODEARTS_VISION_DEFAULT;
+  return new Set(
+    spec
+      .split(",")
+      .map((id) => id.trim())
+      .filter((id) => id.length > 0)
+  );
+})();
 function codeArtsSupportsImage(model) {
   return CODEARTS_VISION_MODELS.has(String(model ?? ""));
 }

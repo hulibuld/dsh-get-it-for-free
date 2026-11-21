@@ -131,6 +131,7 @@ CodeArts 的临时令牌大约两小时一换。以前面板上的余额、签�
 | `hideFreeModels` / `hideEacModels` | 按来源分组隐藏 |
 | `probeIntervalMinutes` | 模型目录探测周期，默认 15 分钟 |
 | `autoReloadWatch` | 改插件目录后自动热重载 |
+| `GET_IT_FOR_FREE_CODEARTS_VISION_MODELS`（环境变量）| CodeArts 哪些模型声明能读图，逗号分隔。默认 `glm-5.3-flash,deepseek-v4.1-flash-1017,kimi-k3.1-pro`（均为实测）。置 `none` 回到全纯文本 |
 
 ## 隐私
 
